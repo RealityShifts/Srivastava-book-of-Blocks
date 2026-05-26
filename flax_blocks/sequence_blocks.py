@@ -12,6 +12,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +27,11 @@ class RNNCell(nnx.Module):
         self.W_ih = nnx.Linear(in_dim, hidden, rngs=rngs)
         self.W_hh = nnx.Linear(hidden, hidden, use_bias=False, rngs=rngs)
 
-    def __call__(self, x: jax.Array, h: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B D_in"],
+        h: Float[Array, "B D_hidden"],
+    ) -> Float[Array, "B D_hidden"]:
         return jnp.tanh(self.W_ih(x) + self.W_hh(h))
 
 
@@ -37,8 +42,11 @@ class LSTMCell(nnx.Module):
         self.hidden = hidden
         self.W = nnx.Linear(in_dim + hidden, 4 * hidden, rngs=rngs)
 
-    def __call__(self, x: jax.Array,
-                 state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+    def __call__(
+        self,
+        x: Float[Array, "B D_in"],
+        state: tuple[Float[Array, "B D_hidden"], Float[Array, "B D_hidden"]],
+    ) -> tuple[Float[Array, "B D_hidden"], Float[Array, "B D_hidden"]]:
         h, c = state
         gates = self.W(jnp.concatenate([x, h], axis=-1))
         i, f, g, o = jnp.split(gates, 4, axis=-1)
@@ -57,7 +65,11 @@ class GRUCell(nnx.Module):
         self.x2h = nnx.Linear(in_dim, 3 * hidden, rngs=rngs)
         self.h2h = nnx.Linear(hidden, 3 * hidden, rngs=rngs)
 
-    def __call__(self, x: jax.Array, h: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B D_in"],
+        h: Float[Array, "B D_hidden"],
+    ) -> Float[Array, "B D_hidden"]:
         xz, xr, xn = jnp.split(self.x2h(x), 3, axis=-1)
         hz, hr, hn = jnp.split(self.h2h(h), 3, axis=-1)
         z = nnx.sigmoid(xz + hz)
@@ -66,8 +78,11 @@ class GRUCell(nnx.Module):
         return (1 - z) * n + z * h
 
 
-def run_recurrent(cell: nnx.Module, x: jax.Array,
-                  state: Optional[object] = None) -> jax.Array:
+def run_recurrent(
+    cell: nnx.Module,
+    x: Float[Array, "B T D_in"],
+    state: Optional[object] = None,
+) -> Float[Array, "B T D_hidden"]:
     """Apply ``cell`` along the time dimension of ``x: (B, T, D)``."""
     B, T, _ = x.shape
     if isinstance(cell, LSTMCell):
@@ -104,7 +119,9 @@ class StateSpaceModel(nnx.Module):
         self.D = nnx.Param(jnp.zeros((dim,)))
         self.log_dt = nnx.Param(jnp.zeros((dim,)))
 
-    def __call__(self, u: jax.Array) -> jax.Array:
+    def __call__(
+        self, u: Float[Array, "B T D"]
+    ) -> Float[Array, "B T D"]:
         B, T, D = u.shape
         dt = jnp.exp(self.log_dt.value)
         A = -jnp.exp(self.A_log.value)
@@ -126,8 +143,13 @@ class StateSpaceModel(nnx.Module):
 # Selective scan (Mamba)
 # ---------------------------------------------------------------------------
 
-def selective_scan(u: jax.Array, delta: jax.Array, A: jax.Array,
-                   B: jax.Array, C: jax.Array) -> jax.Array:
+def selective_scan(
+    u: Float[Array, "B T D"],
+    delta: Float[Array, "B T D"],
+    A: Float[Array, "D N"],
+    B: Float[Array, "B T N"],
+    C: Float[Array, "B T N"],
+) -> Float[Array, "B T D"]:
     """Selective scan: ``x_t = exp(d * A) x_{t-1} + d * B u_t``.
 
     Shapes: u (B,T,D); delta (B,T,D); A (D,N); B,C (B,T,N).
@@ -172,7 +194,9 @@ class MambaBlock(nnx.Module):
         self.D = nnx.Param(jnp.ones((inner,)))
         self.out_proj = nnx.Linear(inner, dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B T D"]
+    ) -> Float[Array, "B T D"]:
         x_in, gate = jnp.split(self.in_proj(x), 2, axis=-1)
         x_conv = self.conv(x_in)
         x_act = nnx.silu(x_conv)

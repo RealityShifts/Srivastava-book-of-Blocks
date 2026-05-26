@@ -22,10 +22,11 @@ from typing import Any, Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int, PyTree
 
 
-Params = Any            # arbitrary jax pytree
-Grads = Any
+Params = PyTree[Float[Array, "..."]]     # nested jax pytree of float arrays
+Grads = PyTree[Float[Array, "..."]]
 State = Any
 
 
@@ -60,7 +61,7 @@ def sgd_update(grads: Grads, params: Params, state: SGDState,
 # ---------------------------------------------------------------------------
 
 class AdamState(NamedTuple):
-    step: jax.Array
+    step: Int[Array, ""]
     m: Any
     v: Any
 
@@ -218,8 +219,9 @@ def one_cycle_schedule(max_lr: float, total_steps: int,
 # Gradient clipping
 # ---------------------------------------------------------------------------
 
-def clip_grad_norm(grads: Grads, max_norm: float = 1.0
-                   ) -> tuple[Grads, jax.Array]:
+def clip_grad_norm(
+    grads: Grads, max_norm: float = 1.0,
+) -> tuple[Grads, Float[Array, ""]]:
     """Globally clip gradients so their L2 norm is at most ``max_norm``."""
     leaves = jax.tree.leaves(grads)
     total_sq = sum(jnp.sum(g * g) for g in leaves)
@@ -270,7 +272,7 @@ class LossScaler:
         self.growth_factor = growth_factor
         self.backoff = backoff
 
-    def scale_loss(self, loss: jax.Array) -> jax.Array:
+    def scale_loss(self, loss: Float[Array, ""]) -> Float[Array, ""]:
         return loss * self.scale
 
     def unscale_grads(self, grads: Grads) -> tuple[Grads, bool]:

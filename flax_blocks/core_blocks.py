@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +48,9 @@ class ConvBlock(nnx.Module):
         self.norm = build_norm(norm, out_ch, rngs=rngs)
         self.act = get_activation(activation)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         return self.act(self.norm(self.conv(x)))
 
 
@@ -63,7 +66,9 @@ class DepthwiseSeparableConv(nnx.Module):
         )
         self.pointwise = nnx.Conv(in_ch, out_ch, (1, 1), use_bias=False, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         return self.pointwise(self.depthwise(x))
 
 
@@ -92,11 +97,11 @@ class GroupConv(nnx.Conv):
 # Activations
 # ---------------------------------------------------------------------------
 
-def _mish(x: jax.Array) -> jax.Array:
+def _mish(x: Float[Array, "..."]) -> Float[Array, "..."]:
     return x * jnp.tanh(jax.nn.softplus(x))
 
 
-_ACTIVATIONS: dict[str, Callable[[jax.Array], jax.Array]] = {
+_ACTIVATIONS: dict[str, Callable[[Float[Array, "..."]], Float[Array, "..."]]] = {
     "relu": nnx.relu,
     "leaky_relu": lambda x: nnx.leaky_relu(x, 0.2),
     "gelu": nnx.gelu,
@@ -111,7 +116,9 @@ _ACTIVATIONS: dict[str, Callable[[jax.Array], jax.Array]] = {
 }
 
 
-def get_activation(name: str) -> Callable[[jax.Array], jax.Array]:
+def get_activation(
+    name: str,
+) -> Callable[[Float[Array, "..."]], Float[Array, "..."]]:
     """Look up an activation function by short string name."""
     name = name.lower()
     if name not in _ACTIVATIONS:
@@ -134,7 +141,9 @@ class InstanceNorm(nnx.Module):
         self.norm = nnx.GroupNorm(num_features, num_groups=num_features,
                                   epsilon=epsilon, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H W C"]:
         return self.norm(x)
 
 
@@ -154,7 +163,7 @@ class WeightNorm(nnx.Module):
             kernel.reshape(-1, kernel.shape[-1]), axis=0))
         self.norm_axis = norm_axis
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         v = self.base.kernel.value
         norm = jnp.sqrt(jnp.sum(v * v, axis=self.norm_axis, keepdims=True) + 1e-12)
         self.base.kernel.value = v * self.g.value / norm.squeeze()
@@ -174,7 +183,9 @@ class SpectralNorm(nnx.Module):
         self.u = nnx.Variable(
             jax.random.normal(rngs.params(), (out_features,)))
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B D_in"]
+    ) -> Float[Array, "B D_out"]:
         w = self.base.kernel.value
         u = self.u.value
         v = w @ u
@@ -194,7 +205,11 @@ class AdaIN(nnx.Module):
         self.norm = InstanceNorm(num_features, rngs=rngs)
         self.fc = nnx.Linear(style_dim, num_features * 2, rngs=rngs)
 
-    def __call__(self, x: jax.Array, style: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C"],
+        style: Float[Array, "B D_style"],
+    ) -> Float[Array, "B H W C"]:
         gamma, beta = jnp.split(self.fc(style), 2, axis=-1)
         return (1 + gamma[:, None, None]) * self.norm(x) + beta[:, None, None]
 
@@ -210,7 +225,11 @@ class SPADE(nnx.Module):
         self.gamma = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
         self.beta = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
 
-    def __call__(self, x: jax.Array, segmap: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C"],
+        segmap: Float[Array, "B H_seg W_seg C_seg"],
+    ) -> Float[Array, "B H W C"]:
         seg = jax.image.resize(
             segmap, x.shape[:-1] + (segmap.shape[-1],), method="nearest")
         actv = nnx.relu(self.shared(seg))
@@ -246,7 +265,7 @@ def _gn_groups(channels: int, target: int = 32) -> int:
 
 
 class _Identity(nnx.Module):
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         return x
 
 
@@ -272,7 +291,9 @@ class ResidualBlock(nnx.Module):
         else:
             self.shortcut = _Identity()
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         return self.act(self.conv2(self.conv1(x)) + self.shortcut(x))
 
 
@@ -285,6 +306,6 @@ class SkipConnection(nnx.Module):
         self.fn = fn
         self.mode = mode
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         y = self.fn(x)
         return x + y if self.mode == "add" else jnp.concatenate([x, y], axis=-1)

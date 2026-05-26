@@ -14,24 +14,37 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int
 
 
 # ---------------------------------------------------------------------------
 # Message passing
 # ---------------------------------------------------------------------------
 
-def scatter_sum(msg: jax.Array, dst: jax.Array, num_nodes: int) -> jax.Array:
+def scatter_sum(
+    msg: Float[Array, "E D"],
+    dst: Int[Array, "E"],
+    num_nodes: int,
+) -> Float[Array, "N D"]:
     out = jnp.zeros((num_nodes, msg.shape[-1]), dtype=msg.dtype)
     return out.at[dst].add(msg)
 
 
-def scatter_mean(msg: jax.Array, dst: jax.Array, num_nodes: int) -> jax.Array:
+def scatter_mean(
+    msg: Float[Array, "E D"],
+    dst: Int[Array, "E"],
+    num_nodes: int,
+) -> Float[Array, "N D"]:
     summed = scatter_sum(msg, dst, num_nodes)
     counts = jnp.zeros((num_nodes,), dtype=msg.dtype).at[dst].add(1.0)
     return summed / jnp.maximum(counts, 1)[:, None]
 
 
-def scatter_max(msg: jax.Array, dst: jax.Array, num_nodes: int) -> jax.Array:
+def scatter_max(
+    msg: Float[Array, "E D"],
+    dst: Int[Array, "E"],
+    num_nodes: int,
+) -> Float[Array, "N D"]:
     init = jnp.full((num_nodes, msg.shape[-1]), -jnp.inf, dtype=msg.dtype)
     out = init.at[dst].max(msg)
     return jnp.where(jnp.isinf(out), 0.0, out)
@@ -42,15 +55,27 @@ class MessagePassing(nnx.Module):
 
     aggregator: str = "sum"
 
-    def message(self, x_src: jax.Array, x_dst: jax.Array,
-                edge_attr: Optional[jax.Array] = None) -> jax.Array:
+    def message(
+        self,
+        x_src: Float[Array, "E D"],
+        x_dst: Float[Array, "E D"],
+        edge_attr: Optional[Float[Array, "E D_edge"]] = None,
+    ) -> Float[Array, "E D_msg"]:
         return x_src
 
-    def update(self, aggr: jax.Array, x: jax.Array) -> jax.Array:
+    def update(
+        self,
+        aggr: Float[Array, "N D_msg"],
+        x: Float[Array, "N D"],
+    ) -> Float[Array, "N D_out"]:
         return aggr
 
-    def aggregate(self, msg: jax.Array, dst: jax.Array,
-                  num_nodes: int) -> jax.Array:
+    def aggregate(
+        self,
+        msg: Float[Array, "E D"],
+        dst: Int[Array, "E"],
+        num_nodes: int,
+    ) -> Float[Array, "N D"]:
         if self.aggregator == "sum":
             return scatter_sum(msg, dst, num_nodes)
         if self.aggregator == "mean":
@@ -59,8 +84,12 @@ class MessagePassing(nnx.Module):
             return scatter_max(msg, dst, num_nodes)
         raise ValueError(self.aggregator)
 
-    def __call__(self, x: jax.Array, edge_index: jax.Array,
-                 edge_attr: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "N D"],
+        edge_index: Int[Array, "2 E"],
+        edge_attr: Optional[Float[Array, "E D_edge"]] = None,
+    ) -> Float[Array, "N D_out"]:
         src, dst = edge_index
         msg = self.message(x[src], x[dst], edge_attr)
         aggr = self.aggregate(msg, dst, x.shape[0])
@@ -77,7 +106,11 @@ class GraphConv(nnx.Module):
     def __init__(self, in_dim: int, out_dim: int, *, rngs: nnx.Rngs) -> None:
         self.lin = nnx.Linear(in_dim, out_dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array, edge_index: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "N D_in"],
+        edge_index: Int[Array, "2 E"],
+    ) -> Float[Array, "N D_out"]:
         x = self.lin(x)
         src, dst = edge_index
         deg = jnp.zeros(x.shape[0]).at[dst].add(1.0)
@@ -105,7 +138,11 @@ class GraphAttention(nnx.Module):
             jax.random.normal(rngs.params(), (1, heads, out_dim)) * 0.1)
         self.slope = negative_slope
 
-    def __call__(self, x: jax.Array, edge_index: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "N D_in"],
+        edge_index: Int[Array, "2 E"],
+    ) -> Float[Array, "N D_out_times_H"]:
         N = x.shape[0]
         h = self.lin(x).reshape(N, self.heads, self.out_dim)
         src, dst = edge_index

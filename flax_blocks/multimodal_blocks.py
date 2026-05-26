@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from .attention_blocks import CrossAttention, MultiHeadAttention
 from .transformer_blocks import FeedForward
@@ -34,11 +35,15 @@ class CLIPEncoder(nnx.Module):
         self.text_proj = nnx.Linear(text_dim, embed_dim,
                                     use_bias=False, rngs=rngs)
 
-    def encode_image(self, image: jax.Array) -> jax.Array:
+    def encode_image(
+        self, image: Float[Array, "B H W C"]
+    ) -> Float[Array, "B D_embed"]:
         z = self.vision_proj(self.vision_encoder(image))
         return z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
 
-    def encode_text(self, text: jax.Array) -> jax.Array:
+    def encode_text(
+        self, text: Float[Array, "B T D_text"]
+    ) -> Float[Array, "B D_embed"]:
         z = self.text_proj(self.text_encoder(text))
         return z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
 
@@ -66,7 +71,9 @@ class PerceiverResampler(nnx.Module):
         self.layers = layers
         self.norm = nnx.LayerNorm(dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B T D"]
+    ) -> Float[Array, "B K D"]:
         B = x.shape[0]
         latents = jnp.broadcast_to(self.latents.value,
                                    (B, *self.latents.value.shape[1:]))
@@ -104,7 +111,9 @@ class QFormer(nnx.Module):
         self.norm = nnx.LayerNorm(dim, rngs=rngs)
         self.proj = nnx.Linear(dim, llm_dim, rngs=rngs)
 
-    def __call__(self, image_feats: jax.Array) -> jax.Array:
+    def __call__(
+        self, image_feats: Float[Array, "B T D_img"]
+    ) -> Float[Array, "B K D_llm"]:
         B = image_feats.shape[0]
         q = jnp.broadcast_to(self.queries.value,
                              (B, *self.queries.value.shape[1:]))
@@ -157,5 +166,9 @@ class MemoryAttention(nnx.Module):
         self.norm_q = nnx.LayerNorm(dim, rngs=rngs)
         self.norm_kv = nnx.LayerNorm(mem_dim or dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array, memory: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B Tq D"],
+        memory: Float[Array, "B Tm D_mem"],
+    ) -> Float[Array, "B Tq D"]:
         return x + self.attn(self.norm_q(x), self.norm_kv(memory))

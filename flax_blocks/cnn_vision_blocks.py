@@ -12,6 +12,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from .core_blocks import ConvBlock
 
@@ -32,7 +33,9 @@ class InceptionBlock(nnx.Module):
         self.b5b = ConvBlock(c5, c5, 5, rngs=rngs)
         self.bp = ConvBlock(in_ch, pool, 1, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
         b1 = self.b1(x)
         b3 = self.b3b(self.b3a(x))
         b5 = self.b5b(self.b5a(x))
@@ -52,7 +55,9 @@ class _DenseLayer(nnx.Module):
         self.conv2 = nnx.Conv(4 * growth, growth, (3, 3),
                               padding="SAME", use_bias=False, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
         h = self.conv1(nnx.relu(self.bn1(x)))
         h = self.conv2(nnx.relu(self.bn2(h)))
         return jnp.concatenate([x, h], axis=-1)
@@ -71,7 +76,9 @@ class DenseBlock(nnx.Module):
         self.layers = layers
         self.out_channels = c
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
         for layer in self.layers:
             x = layer(x)
         return x
@@ -90,7 +97,9 @@ class SqueezeExcitation(nnx.Module):
         self.fc1 = nnx.Conv(channels, hidden, (1, 1), rngs=rngs)
         self.fc2 = nnx.Conv(hidden, channels, (1, 1), rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H W C"]:
         s = jnp.mean(x, axis=(1, 2), keepdims=True)
         s = nnx.sigmoid(self.fc2(nnx.relu(self.fc1(s))))
         return x * s
@@ -107,7 +116,9 @@ class CBAM(nnx.Module):
         self.spatial = nnx.Conv(2, 1, (kernel, kernel),
                                 padding="SAME", rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H W C"]:
         avg = jnp.mean(x, axis=(1, 2))
         mx = jnp.max(x, axis=(1, 2))
         ch = nnx.sigmoid(self.fc2(nnx.relu(self.fc1(avg))) +
@@ -128,7 +139,9 @@ class SpatialPyramidPooling(nnx.Module):
     def __init__(self, output_sizes: Sequence[int] = (1, 2, 4)) -> None:
         self.output_sizes = tuple(output_sizes)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B D_out"]:
         B, H, W, C = x.shape
         outs = []
         for s in self.output_sizes:
@@ -148,7 +161,9 @@ class FeaturePyramidNetwork(nnx.Module):
         self.smooth = [nnx.Conv(out_ch, out_ch, (3, 3),
                                 padding="SAME", rngs=rngs) for _ in in_channels]
 
-    def __call__(self, feats: Sequence[jax.Array]) -> list[jax.Array]:
+    def __call__(
+        self, feats: Sequence[Float[Array, "B H W C"]]
+    ) -> list[Float[Array, "B H W C_out"]]:
         lats = [lat(f) for lat, f in zip(self.lat, feats)]
         outs = [lats[-1]]
         for i in range(len(lats) - 2, -1, -1):
@@ -175,7 +190,9 @@ class ASPP(nnx.Module):
         self.project = ConvBlock(out_ch * (len(dilations) + 1), out_ch, 1,
                                  rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
         feats = [b(x) for b in self.branches]
         gp = jnp.mean(x, axis=(1, 2), keepdims=True)
         gp = self.image_pool_conv(gp)
@@ -188,7 +205,9 @@ class ASPP(nnx.Module):
 # Pixel shuffle upsampler
 # ---------------------------------------------------------------------------
 
-def pixel_shuffle(x: jax.Array, scale: int) -> jax.Array:
+def pixel_shuffle(
+    x: Float[Array, "B H W C_packed"], scale: int
+) -> Float[Array, "B H_out W_out C_out"]:
     """ESPCN sub-pixel rearrange. Input ``(B, H, W, C*scale^2)``."""
     B, H, W, C = x.shape
     if C % (scale * scale):
@@ -208,7 +227,9 @@ class PixelShuffleUpsample(nnx.Module):
         self.conv = nnx.Conv(channels, channels * scale * scale, (3, 3),
                              padding="SAME", rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H_out W_out C"]:
         return pixel_shuffle(self.conv(x), self.scale)
 
 
@@ -216,8 +237,11 @@ class PixelShuffleUpsample(nnx.Module):
 # Deformable conv & deformable attention (simplified)
 # ---------------------------------------------------------------------------
 
-def _bilinear_sample(image: jax.Array, sample_y: jax.Array,
-                     sample_x: jax.Array) -> jax.Array:
+def _bilinear_sample(
+    image: Float[Array, "B H W C"],
+    sample_y: Float[Array, "B *spatial"],
+    sample_x: Float[Array, "B *spatial"],
+) -> Float[Array, "B *spatial C"]:
     """Bilinear sample ``image`` (B, H, W, C) at given (y, x) coords.
 
     ``sample_y`` and ``sample_x`` may have any shape ``(B, *spatial)``.
@@ -258,7 +282,9 @@ class DeformableConv2d(nnx.Module):
                                bias_init=nnx.initializers.zeros, rngs=rngs)
         self.proj = nnx.Linear(in_ch * kernel_size * kernel_size, out_ch, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         B, H, W, C = x.shape
         k = self.k
         offset = self.offset(x)                                          # (B,Hout,Wout,2k^2)
@@ -306,7 +332,11 @@ class DeformableAttention(nnx.Module):
         self.weight = nnx.Linear(dim, num_heads * num_points, rngs=rngs)
         self.out = nnx.Linear(dim, dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array, hw: tuple[int, int]) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B T D"],
+        hw: tuple[int, int],
+    ) -> Float[Array, "B T D"]:
         B, T, _ = x.shape
         H, W = hw
         v = self.value(x).reshape(B, H, W, self.num_heads, self.head_dim)

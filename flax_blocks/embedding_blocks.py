@@ -11,6 +11,7 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,9 @@ class LearnedPositionalEmbedding(nnx.Module):
     def __init__(self, max_len: int, dim: int, *, rngs: nnx.Rngs) -> None:
         self.embed = nnx.Embed(max_len, dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B T D"]
+    ) -> Float[Array, "B T D"]:
         T = x.shape[1]
         pos = jnp.arange(T)
         return x + self.embed(pos)
@@ -47,7 +50,9 @@ class SinusoidalPositionalEmbedding(nnx.Module):
         pe = pe.at[:, 1::2].set(jnp.cos(pos * div))
         self.pe = pe[None]
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B T D"]
+    ) -> Float[Array, "B T D"]:
         return x + self.pe[:, : x.shape[1]]
 
 
@@ -64,12 +69,17 @@ class ProjectionHead(nnx.Module):
         self.bn = nnx.BatchNorm(hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, out_dim, use_bias=False, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B D_in"]
+    ) -> Float[Array, "B D_out"]:
         return self.fc2(nnx.relu(self.bn(self.fc1(x))))
 
 
-def info_nce(z1: jax.Array, z2: jax.Array,
-             temperature: float = 0.07) -> jax.Array:
+def info_nce(
+    z1: Float[Array, "B D"],
+    z2: Float[Array, "B D"],
+    temperature: float = 0.07,
+) -> Float[Array, ""]:
     """Symmetric InfoNCE / NT-Xent loss used by SimCLR & CLIP."""
     z1 = z1 / (jnp.linalg.norm(z1, axis=-1, keepdims=True) + 1e-8)
     z2 = z2 / (jnp.linalg.norm(z2, axis=-1, keepdims=True) + 1e-8)
@@ -79,7 +89,10 @@ def info_nce(z1: jax.Array, z2: jax.Array,
         _cross_entropy(logits, labels) + _cross_entropy(logits.T, labels))
 
 
-def _cross_entropy(logits: jax.Array, labels: jax.Array) -> jax.Array:
+def _cross_entropy(
+    logits: Float[Array, "B C"],
+    labels: Int[Array, "B"],
+) -> Float[Array, ""]:
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return -jnp.mean(jnp.take_along_axis(log_probs, labels[:, None], axis=-1))
 
@@ -91,8 +104,11 @@ class CLIPLoss(nnx.Module):
         self.logit_scale = nnx.Param(
             jnp.log(jnp.array(1.0 / init_temperature)))
 
-    def __call__(self, image_emb: jax.Array,
-                 text_emb: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        image_emb: Float[Array, "B D"],
+        text_emb: Float[Array, "B D"],
+    ) -> Float[Array, ""]:
         image_emb = image_emb / (jnp.linalg.norm(image_emb, axis=-1,
                                                  keepdims=True) + 1e-8)
         text_emb = text_emb / (jnp.linalg.norm(text_emb, axis=-1,

@@ -8,11 +8,12 @@ re-export, minibatch standard-deviation, progressive growing helper.
 from __future__ import annotations
 
 import math
-from typing import Optional, Union
+from typing import Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, PRNGKeyArray
 
 from .core_blocks import AdaIN  # noqa: F401  re-exported for completeness
 
@@ -38,7 +39,9 @@ class EqualLinear(nnx.Module):
         self.scale = gain / math.sqrt(in_features) * lr_mul
         self.lr_mul = lr_mul
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         out = x @ (self.weight.value * self.scale)
         if self.bias is not None:
             out = out + self.bias.value * self.lr_mul
@@ -61,7 +64,9 @@ class EqualConv2d(nnx.Module):
         fan_in = in_ch * kernel_size * kernel_size
         self.scale = gain / math.sqrt(fan_in)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         out = jax.lax.conv_general_dilated(
             x, self.weight.value * self.scale,
             window_strides=self.strides, padding=self.padding,
@@ -84,7 +89,9 @@ class GeneratorBlock(nnx.Module):
         self.conv = nnx.Conv(in_ch, out_ch, (3, 3), padding="SAME", rngs=rngs)
         self.norm = nnx.BatchNorm(out_ch, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         B, H, W, C = x.shape
         x = jax.image.resize(x, (B, H * self.scale, W * self.scale, C),
                              method="nearest")
@@ -101,7 +108,9 @@ class DiscriminatorBlock(nnx.Module):
         self.norm = (nnx.GroupNorm(out_ch, num_groups=out_ch, rngs=rngs)
                      if use_norm else None)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         h = self.conv(x)
         if self.norm is not None:
             h = self.norm(h)
@@ -120,7 +129,9 @@ class MappingNetwork(nnx.Module):
         self.layers = [nnx.Linear(z_dim if i == 0 else w_dim, w_dim, rngs=rngs)
                        for i in range(num_layers)]
 
-    def __call__(self, z: jax.Array) -> jax.Array:
+    def __call__(
+        self, z: Float[Array, "B D_z"]
+    ) -> Float[Array, "B D_w"]:
         z = z * jax.lax.rsqrt(jnp.mean(z * z, axis=-1, keepdims=True) + 1e-8)
         for layer in self.layers:
             z = nnx.leaky_relu(layer(z), 0.2)
@@ -143,7 +154,11 @@ class ModulatedConv2d(nnx.Module):
         self.style = nnx.Linear(w_dim, in_ch, rngs=rngs)
         self.style.bias.value = jnp.ones_like(self.style.bias.value)
 
-    def __call__(self, x: jax.Array, w: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C_in"],
+        w: Float[Array, "B D_w"],
+    ) -> Float[Array, "B H W C_out"]:
         B = x.shape[0]
         s = self.style(w)                                        # (B, in_ch)
         weight = self.weight.value[None] * s[:, None, None, :, None]
@@ -168,8 +183,12 @@ class StyleBlock(nnx.Module):
         self.noise_strength = nnx.Param(jnp.zeros(()))
         self.bias = nnx.Param(jnp.zeros((out_ch,)))
 
-    def __call__(self, x: jax.Array, w: jax.Array,
-                 key: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C_in"],
+        w: Float[Array, "B D_w"],
+        key: PRNGKeyArray,
+    ) -> Float[Array, "B H W C_out"]:
         x = self.conv(x, w)
         noise = jax.random.normal(key, x.shape[:3] + (1,))
         x = x + noise * self.noise_strength.value
@@ -186,7 +205,9 @@ class MinibatchStdDev(nnx.Module):
     def __init__(self, group_size: int = 4) -> None:
         self.group_size = group_size
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H W C_out"]:
         B, H, W, C = x.shape
         g = min(self.group_size, B)
         y = x.reshape(g, -1, H, W, C)
@@ -210,7 +231,9 @@ class ProgressiveGrowing(nnx.Module):
     def set_alpha(self, alpha: float) -> None:
         self.alpha = max(0.0, min(1.0, alpha))
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         lo = self.low(x)
         B, H, W, C = lo.shape
         lo = jax.image.resize(lo, (B, H * 2, W * 2, C), method="nearest")

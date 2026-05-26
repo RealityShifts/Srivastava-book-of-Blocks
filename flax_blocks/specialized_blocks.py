@@ -12,6 +12,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Complex, Float, PRNGKeyArray
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +29,9 @@ class NeuralODE(nnx.Module):
         self.t0 = t0
         self.t1 = t1
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B *features"]
+    ) -> Float[Array, "B *features"]:
         dt = (self.t1 - self.t0) / self.num_steps
         t = jnp.full((x.shape[0],), self.t0, dtype=x.dtype)
         h = x
@@ -62,14 +65,21 @@ class SpectralConv2d(nnx.Module):
         self.w2_re = nnx.Param(jax.random.normal(rngs.params(), shape) * scale)
         self.w2_im = nnx.Param(jax.random.normal(rngs.params(), shape) * scale)
 
-    def _w(self, re: nnx.Param, im: nnx.Param) -> jax.Array:
+    def _w(
+        self, re: nnx.Param, im: nnx.Param,
+    ) -> Complex[Array, "mh mw C_in C_out"]:
         return re.value + 1j * im.value
 
     @staticmethod
-    def _compl_mul(a: jax.Array, b: jax.Array) -> jax.Array:
+    def _compl_mul(
+        a: Complex[Array, "B mh mw C_in"],
+        b: Complex[Array, "mh mw C_in C_out"],
+    ) -> Complex[Array, "B mh mw C_out"]:
         return jnp.einsum("bxyi,xyio->bxyo", a, b)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
         B, H, W, _ = x.shape
         x_ft = jnp.fft.rfft2(x, axes=(1, 2), norm="ortho")
         out_ft = jnp.zeros((B, H, W // 2 + 1, self.out_ch), dtype=jnp.complex64)
@@ -91,7 +101,9 @@ class FNOBlock(nnx.Module):
                                        rngs=rngs)
         self.skip = nnx.Conv(channels, channels, (1, 1), rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H W C"]:
         return nnx.gelu(self.spectral(x) + self.skip(x))
 
 
@@ -120,11 +132,15 @@ class KANLayer(nnx.Module):
             jax.random.normal(rngs.params(), (in_dim, out_dim)) * 0.1)
         self.sigma = (grid_range[1] - grid_range[0]) / (num_grid - 1)
 
-    def _basis(self, x: jax.Array) -> jax.Array:
+    def _basis(
+        self, x: Float[Array, "B D_in"]
+    ) -> Float[Array, "B D_in G"]:
         d = (x[..., None] - self.grid) / self.sigma
         return jnp.exp(-0.5 * d ** 2)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B D_in"]
+    ) -> Float[Array, "B D_out"]:
         base = nnx.silu(x) @ self.base_w.value
         rbf = self._basis(x)                                                 # (B, in_dim, G)
         spline = jnp.einsum("bif,oif->bo", rbf, self.coeff.value)
@@ -135,7 +151,9 @@ class KANLayer(nnx.Module):
 # Capsule networks
 # ---------------------------------------------------------------------------
 
-def squash(s: jax.Array, axis: int = -1, eps: float = 1e-8) -> jax.Array:
+def squash(
+    s: Float[Array, "..."], axis: int = -1, eps: float = 1e-8,
+) -> Float[Array, "..."]:
     """Sabour et al. 2017 - non-linear "squash" preserving direction but compressing norm."""
     norm_sq = jnp.sum(s * s, axis=axis, keepdims=True)
     norm = jnp.sqrt(norm_sq) + eps
@@ -158,7 +176,9 @@ class CapsuleLayer(nnx.Module):
             jax.random.normal(rngs.params(),
                               (num_out, num_in, dim_out, dim_in)) * 0.1)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B N_in D_in"]
+    ) -> Float[Array, "B N_out D_out"]:
         u_hat = jnp.einsum("oidp,bip->boid", self.W.value, x)
         b = jnp.zeros((x.shape[0], self.num_out, self.num_in))
         v = None
@@ -170,7 +190,9 @@ class CapsuleLayer(nnx.Module):
         return v
 
 
-def dynamic_routing(votes: jax.Array, num_iter: int = 3) -> jax.Array:
+def dynamic_routing(
+    votes: Float[Array, "B O I D"], num_iter: int = 3,
+) -> Float[Array, "B O D"]:
     """Standalone dynamic routing on pre-computed votes ``(B, O, I, D)``."""
     B, O, I, _ = votes.shape
     b = jnp.zeros((B, O, I))
@@ -213,7 +235,11 @@ class SlotAttention(nnx.Module):
         self.norm_slots = nnx.LayerNorm(dim, rngs=rngs)
         self.norm_pre_ff = nnx.LayerNorm(dim, rngs=rngs)
 
-    def __call__(self, x: jax.Array, key: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B T D"],
+        key: PRNGKeyArray,
+    ) -> Float[Array, "B K D"]:
         B, _, D = x.shape
         x = self.norm_input(x)
         k, v = self.to_k(x), self.to_v(x)

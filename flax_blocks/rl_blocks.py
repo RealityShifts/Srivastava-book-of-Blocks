@@ -14,6 +14,7 @@ from typing import Iterable, Sequence
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, PRNGKeyArray
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +29,9 @@ class _MLP(nnx.Module):
         self.layers = [nnx.Linear(dims[i], dims[i + 1], rngs=rngs)
                        for i in range(len(dims) - 1)]
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i < len(self.layers) - 1:
@@ -51,17 +54,27 @@ class PolicyNetwork(nnx.Module):
         if not discrete:
             self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
-    def logits_or_mean(self, s: jax.Array) -> jax.Array:
+    def logits_or_mean(
+        self, s: Float[Array, "B D_state"]
+    ) -> Float[Array, "B D_action"]:
         return self.body(s)
 
-    def sample(self, s: jax.Array, key: jax.Array) -> jax.Array:
+    def sample(
+        self,
+        s: Float[Array, "B D_state"],
+        key: PRNGKeyArray,
+    ) -> Float[Array, "B *action"]:
         out = self.logits_or_mean(s)
         if self.discrete:
             return jax.random.categorical(key, out)
         std = jnp.exp(self.log_std.value)
         return out + std * jax.random.normal(key, out.shape)
 
-    def __call__(self, s: jax.Array, key: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        s: Float[Array, "B D_state"],
+        key: PRNGKeyArray,
+    ) -> Float[Array, "B *action"]:
         return self.sample(s, key)
 
 
@@ -72,7 +85,9 @@ class ValueNetwork(nnx.Module):
                  *, rngs: nnx.Rngs) -> None:
         self.net = _MLP([state_dim, *hidden, 1], rngs=rngs)
 
-    def __call__(self, s: jax.Array) -> jax.Array:
+    def __call__(
+        self, s: Float[Array, "B D_state"]
+    ) -> Float[Array, "B"]:
         return self.net(s).squeeze(-1)
 
 
@@ -84,7 +99,9 @@ class QNetwork(nnx.Module):
                  *, rngs: nnx.Rngs) -> None:
         self.net = _MLP([state_dim, *hidden, action_dim], rngs=rngs)
 
-    def __call__(self, s: jax.Array) -> jax.Array:
+    def __call__(
+        self, s: Float[Array, "B D_state"]
+    ) -> Float[Array, "B D_action"]:
         return self.net(s)
 
 
@@ -101,7 +118,9 @@ class ActorCritic(nnx.Module):
         if not discrete:
             self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
-    def __call__(self, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(
+        self, s: Float[Array, "B D_state"]
+    ) -> tuple[Float[Array, "B D_action"], Float[Array, "B"]]:
         h = nnx.tanh(self.torso(s))
         return self.actor_head(h), self.critic_head(h).squeeze(-1)
 
@@ -125,7 +144,7 @@ class ReplayBuffer:
     def extend(self, transitions: Iterable[tuple]) -> None:
         self.buffer.extend(transitions)
 
-    def sample(self, batch: int) -> tuple[jax.Array, ...]:
+    def sample(self, batch: int) -> tuple[Float[Array, "..."], ...]:
         items = random.sample(self.buffer, batch)
         cols = list(zip(*items))
         return tuple(jnp.asarray(c) for c in cols)

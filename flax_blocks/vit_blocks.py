@@ -11,6 +11,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, PRNGKeyArray
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +27,9 @@ class PatchEmbedding(nnx.Module):
         self.proj = nnx.Conv(in_ch, dim, (patch_size, patch_size),
                              strides=patch_size, padding="VALID", rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B N D"]:
         x = self.proj(x)                                       # (B, H/p, W/p, D)
         B, Hp, Wp, D = x.shape
         return x.reshape(B, Hp * Wp, D)
@@ -39,7 +42,9 @@ class CLSToken(nnx.Module):
         self.token = nnx.Param(
             jax.random.truncated_normal(rngs.params(), -2, 2, (1, 1, dim)) * 0.02)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B N D"]
+    ) -> Float[Array, "B N_plus_1 D"]:
         cls = jnp.broadcast_to(self.token.value,
                                (x.shape[0], 1, self.token.value.shape[-1]))
         return jnp.concatenate([cls, x], axis=1)
@@ -49,7 +54,9 @@ class CLSToken(nnx.Module):
 # Swin window attention
 # ---------------------------------------------------------------------------
 
-def _window_partition(x: jax.Array, w: int) -> jax.Array:
+def _window_partition(
+    x: Float[Array, "B H W C"], w: int
+) -> Float[Array, "BnW WW C"]:
     """``(B, H, W, C) -> (B*nW, w*w, C)``."""
     B, H, W, C = x.shape
     x = x.reshape(B, H // w, w, W // w, w, C)
@@ -57,7 +64,9 @@ def _window_partition(x: jax.Array, w: int) -> jax.Array:
     return x.reshape(-1, w * w, C)
 
 
-def _window_reverse(windows: jax.Array, w: int, H: int, W: int) -> jax.Array:
+def _window_reverse(
+    windows: Float[Array, "BnW WW C"], w: int, H: int, W: int
+) -> Float[Array, "B H W C"]:
     B = windows.shape[0] // (H * W // (w * w))
     x = windows.reshape(B, H // w, W // w, w, w, -1)
     x = jnp.transpose(x, (0, 1, 3, 2, 4, 5))
@@ -87,8 +96,11 @@ class SwinWindowAttention(nnx.Module):
         rel = rel.at[..., 0].multiply(2 * window - 1)
         self.rel_index = rel.sum(-1)
 
-    def __call__(self, x: jax.Array,
-                 mask: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B N D"],
+        mask: Optional[Float[Array, "..."]] = None,
+    ) -> Float[Array, "B N D"]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = jnp.moveaxis(qkv, 2, 0)
@@ -135,7 +147,9 @@ class ShiftedWindowAttention(nnx.Module):
         else:
             self.attn_mask = None
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B N D"]
+    ) -> Float[Array, "B N D"]:
         B, N, C = x.shape
         H, W = self.input_resolution
         x = x.reshape(B, H, W, C)
@@ -163,8 +177,13 @@ class MaskedImageModeling(nnx.Module):
             jax.random.truncated_normal(rngs.params(), -2, 2, (1, 1, dim)) * 0.02)
         self.decoder = nnx.Linear(dim, patch_size * patch_size * in_ch, rngs=rngs)
 
-    def random_masking(self, x: jax.Array,
-                       key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def random_masking(
+        self,
+        x: Float[Array, "B N D"],
+        key: PRNGKeyArray,
+    ) -> tuple[Float[Array, "B N_keep D"],
+               Float[Array, "B N"],
+               Float[Array, "B N"]]:
         """Returns ``(visible_tokens, restore_indices, mask)``."""
         B, N, _ = x.shape
         keep = int(N * (1 - self.mask_ratio))
@@ -178,8 +197,11 @@ class MaskedImageModeling(nnx.Module):
         mask = jnp.take_along_axis(mask, ids_restore, axis=1)
         return x_visible, ids_restore, mask
 
-    def reconstruct(self, encoded: jax.Array,
-                    ids_restore: jax.Array) -> jax.Array:
+    def reconstruct(
+        self,
+        encoded: Float[Array, "B N_keep D"],
+        ids_restore: Float[Array, "B N"],
+    ) -> Float[Array, "B N P_sq_C"]:
         B, N = ids_restore.shape
         n_mask = N - encoded.shape[1]
         tokens = jnp.concatenate(

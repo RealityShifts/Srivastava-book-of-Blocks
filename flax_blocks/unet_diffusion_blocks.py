@@ -13,6 +13,7 @@ from typing import Optional, Sequence
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int
 
 from .attention_blocks import CrossAttention
 
@@ -34,7 +35,9 @@ class SinusoidalTimeEmbedding(nnx.Module):
     def __init__(self, dim: int) -> None:
         self.dim = dim
 
-    def __call__(self, t: jax.Array) -> jax.Array:
+    def __call__(
+        self, t: Int[Array, "B"]
+    ) -> Float[Array, "B D"]:
         half = self.dim // 2
         freqs = jnp.exp(
             -math.log(10_000) * jnp.arange(half) / max(half - 1, 1))
@@ -55,7 +58,9 @@ class TimestepMLP(nnx.Module):
         self.fc1 = nnx.Linear(dim, hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, hidden, rngs=rngs)
 
-    def __call__(self, t: jax.Array) -> jax.Array:
+    def __call__(
+        self, t: Int[Array, "B"]
+    ) -> Float[Array, "B D_hidden"]:
         return self.fc2(nnx.silu(self.fc1(self.embed(t))))
 
 
@@ -75,7 +80,9 @@ class DownsampleBlock(nnx.Module):
         elif mode != "avg":
             raise ValueError(mode)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H_out W_out C"]:
         if self.mode == "avg":
             return nnx.avg_pool(x, (2, 2), strides=(2, 2))
         return self.op(x)
@@ -100,7 +107,9 @@ class UpsampleBlock(nnx.Module):
         else:
             raise ValueError(mode)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C"]
+    ) -> Float[Array, "B H_out W_out C"]:
         if self.mode == "interp":
             B, H, W, C = x.shape
             x = jax.image.resize(x, (B, H * 2, W * 2, C), method="nearest")
@@ -128,7 +137,11 @@ class UNetResBlock(nnx.Module):
         self.skip = (nnx.Conv(in_ch, out_ch, (1, 1), rngs=rngs)
                      if in_ch != out_ch else None)
 
-    def __call__(self, x: jax.Array, t_emb: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C_in"],
+        t_emb: Float[Array, "B D_t"],
+    ) -> Float[Array, "B H W C_out"]:
         h = self.conv1(nnx.silu(self.norm1(x)))
         h = h + self.t_proj(nnx.silu(t_emb))[:, None, None]
         h = self.conv2(nnx.silu(self.norm2(h)))
@@ -175,7 +188,11 @@ class UNet(nnx.Module):
         self.out_norm = nnx.GroupNorm(c, num_groups=_gn_groups(c), rngs=rngs)
         self.out_conv = nnx.Conv(c, out_ch, (3, 3), padding="SAME", rngs=rngs)
 
-    def __call__(self, x: jax.Array, t: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B H W C_in"],
+        t: Int[Array, "B"],
+    ) -> Float[Array, "B H W C_out"]:
         t_emb = self.t_embed(t)
         h = self.stem(x)
         skips = [h]
@@ -204,16 +221,22 @@ class NoisePredictor(nnx.Module):
     def __init__(self, backbone: nnx.Module) -> None:
         self.backbone = backbone
 
-    def __call__(self, x_t: jax.Array, t: jax.Array,
-                 cond: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(
+        self,
+        x_t: Float[Array, "B H W C"],
+        t: Int[Array, "B"],
+        cond: Optional[Float[Array, "..."]] = None,
+    ) -> Float[Array, "B H W C"]:
         if cond is None:
             return self.backbone(x_t, t)
         return self.backbone(x_t, t, cond)
 
 
 def classifier_free_guidance(
-    eps_cond: jax.Array, eps_uncond: jax.Array, scale: float = 7.5
-) -> jax.Array:
+    eps_cond: Float[Array, "B H W C"],
+    eps_uncond: Float[Array, "B H W C"],
+    scale: float = 7.5,
+) -> Float[Array, "B H W C"]:
     """``eps = eps_uncond + s * (eps_cond - eps_uncond)``."""
     return eps_uncond + scale * (eps_cond - eps_uncond)
 
@@ -244,7 +267,9 @@ class ControlNetBlock(nnx.Module):
                            padding="SAME", rngs=rngs)
         self.zero = ZeroConv(hidden * 2, out_ch, rngs=rngs)
 
-    def __call__(self, hint: jax.Array) -> jax.Array:
+    def __call__(
+        self, hint: Float[Array, "B H W C_hint"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         h = nnx.silu(self.c1(hint))
         h = nnx.silu(self.c2(h))
         h = nnx.silu(self.c3(h))
@@ -275,7 +300,9 @@ class LoRALinear(nnx.Module):
             jax.random.normal(rngs.params(), (in_f, rank)) * (1.0 / rank ** 0.5))
         self.lora_B = nnx.Param(jnp.zeros((rank, out_f)))
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         return self.base(x) + (x @ self.lora_A.value) @ self.lora_B.value * self.scale
 
 
@@ -294,7 +321,9 @@ class LoRAConv2d(nnx.Module):
         self.up = nnx.Conv(rank, out_ch, (1,) * len(ksize), use_bias=False,
                            kernel_init=nnx.initializers.zeros, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H_out W_out C_out"]:
         return self.base(x) + self.up(self.down(x)) * self.scale
 
 
@@ -312,7 +341,11 @@ class HyperNetwork(nnx.Module):
         self.fc1 = nnx.Linear(code_dim, hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, in_dim * out_dim + out_dim, rngs=rngs)
 
-    def __call__(self, code: jax.Array, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        code: Float[Array, "*B D_code"],
+        x: Float[Array, "*B D_in"],
+    ) -> Float[Array, "*B D_out"]:
         params = self.fc2(nnx.gelu(self.fc1(code)))
         w = params[..., : self.in_dim * self.out_dim].reshape(
             *code.shape[:-1], self.out_dim, self.in_dim)
@@ -334,6 +367,10 @@ class IPAdapterCrossAttention(nnx.Module):
         self.text_attn = CrossAttention(dim, text_dim, num_heads, rngs=rngs)
         self.image_attn = CrossAttention(dim, image_dim, num_heads, rngs=rngs)
 
-    def __call__(self, x: jax.Array, text: jax.Array,
-                 image: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B Tq D"],
+        text: Float[Array, "B T_text D_text"],
+        image: Float[Array, "B T_img D_img"],
+    ) -> Float[Array, "B Tq D"]:
         return self.text_attn(x, text) + self.scale * self.image_attn(x, image)

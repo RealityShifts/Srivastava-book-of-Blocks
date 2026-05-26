@@ -11,6 +11,7 @@ from typing import Callable, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,9 @@ class ExternalMemory(nnx.Module):
         self.values = nnx.Param(
             jax.random.normal(rngs.params(), (num_slots, value_dim)) * 0.02)
 
-    def __call__(self, query: jax.Array) -> jax.Array:
+    def __call__(
+        self, query: Float[Array, "*B D_key"]
+    ) -> Float[Array, "*B D_value"]:
         q = query / (jnp.linalg.norm(query, axis=-1, keepdims=True) + 1e-8)
         k = self.keys.value / (jnp.linalg.norm(self.keys.value, axis=-1,
                                                keepdims=True) + 1e-8)
@@ -43,17 +46,23 @@ class VectorStore:
     """Tiny in-memory vector store with cosine top-k search."""
 
     def __init__(self) -> None:
-        self.embeddings: Optional[jax.Array] = None
+        self.embeddings: Optional[Float[Array, "N D"]] = None
         self.documents: list = []
 
-    def add(self, embeddings: jax.Array, documents: list) -> None:
+    def add(
+        self,
+        embeddings: Float[Array, "N D"],
+        documents: list,
+    ) -> None:
         if self.embeddings is None:
             self.embeddings = embeddings
         else:
             self.embeddings = jnp.concatenate([self.embeddings, embeddings], axis=0)
         self.documents.extend(documents)
 
-    def search(self, query: jax.Array, k: int = 4) -> tuple[jax.Array, list]:
+    def search(
+        self, query: Float[Array, "Q D"], k: int = 4
+    ) -> tuple[Float[Array, "Q K"], list]:
         assert self.embeddings is not None and self.documents
         q = query / (jnp.linalg.norm(query, axis=-1, keepdims=True) + 1e-8)
         e = self.embeddings / (jnp.linalg.norm(self.embeddings, axis=-1,
@@ -71,8 +80,12 @@ class RAGModule:
     (text -> text); this class only orchestrates retrieval.
     """
 
-    def __init__(self, encoder: Callable[[list[str]], jax.Array],
-                 generator: Callable[[str], str], top_k: int = 4) -> None:
+    def __init__(
+        self,
+        encoder: Callable[[list[str]], Float[Array, "N D"]],
+        generator: Callable[[str], str],
+        top_k: int = 4,
+    ) -> None:
         self.encoder = encoder
         self.generator = generator
         self.store = VectorStore()
@@ -103,11 +116,15 @@ class KVCache:
     """
 
     def __init__(self, num_layers: int) -> None:
-        self.k: list[Optional[jax.Array]] = [None] * num_layers
-        self.v: list[Optional[jax.Array]] = [None] * num_layers
+        self.k: list[Optional[Float[Array, "B T H D"]]] = [None] * num_layers
+        self.v: list[Optional[Float[Array, "B T H D"]]] = [None] * num_layers
 
-    def update(self, layer: int, k: jax.Array,
-               v: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def update(
+        self,
+        layer: int,
+        k: Float[Array, "B T H D"],
+        v: Float[Array, "B T H D"],
+    ) -> tuple[Float[Array, "B T_total H D"], Float[Array, "B T_total H D"]]:
         if self.k[layer] is None:
             self.k[layer], self.v[layer] = k, v
         else:

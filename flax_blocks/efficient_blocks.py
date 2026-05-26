@@ -10,18 +10,21 @@ they degrade gracefully so the code is testable without a real cluster.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int8
 
 
 # ---------------------------------------------------------------------------
 # Quantization
 # ---------------------------------------------------------------------------
 
-def quantize_int8(weight: jax.Array) -> tuple[jax.Array, jax.Array]:
+def quantize_int8(
+    weight: Float[Array, "D_in D_out"]
+) -> tuple[Int8[Array, "D_in D_out"], Float[Array, "D_out"]]:
     """Per-output-row symmetric INT8 quantization."""
     scale = jnp.maximum(jnp.max(jnp.abs(weight), axis=0, keepdims=True),
                         1e-8) / 127.0
@@ -29,7 +32,10 @@ def quantize_int8(weight: jax.Array) -> tuple[jax.Array, jax.Array]:
     return q, scale.squeeze(0)
 
 
-def dequantize_int8(qweight: jax.Array, scale: jax.Array) -> jax.Array:
+def dequantize_int8(
+    qweight: Int8[Array, "D_in D_out"],
+    scale: Float[Array, "D_out"],
+) -> Float[Array, "D_in D_out"]:
     return qweight.astype(scale.dtype) * scale[None, :]
 
 
@@ -57,7 +63,9 @@ class QuantizedLinearInt8(nnx.Module):
             layer.bias.value = linear.bias.value
         return layer
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         w = dequantize_int8(self.qweight.value, self.scale.value.astype(x.dtype))
         out = x @ w
         if self.bias is not None:
@@ -94,7 +102,9 @@ class QuantizedLinear4bit(nnx.Module):
             layer.bias.value = linear.bias.value
         return layer
 
-    def _dequantize(self, dtype: jnp.dtype) -> jax.Array:
+    def _dequantize(
+        self, dtype: jnp.dtype
+    ) -> Float[Array, "D_in D_out"]:
         lo = (self.qweight.value & 0x0F).astype(jnp.int8) - 8
         hi = (self.qweight.value >> 4).astype(jnp.int8) - 8
         unpacked = jnp.empty((self.in_features, self.out_features), dtype=dtype)
@@ -102,7 +112,9 @@ class QuantizedLinear4bit(nnx.Module):
         unpacked = unpacked.at[1::2].set(hi.astype(dtype))
         return unpacked * self.scale.value.astype(dtype)[None, :]
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         out = x @ self._dequantize(x.dtype)
         if self.bias is not None:
             out = out + self.bias.value
@@ -123,7 +135,7 @@ class MagnitudePruner:
 
     def __init__(self, sparsity: float = 0.5) -> None:
         self.sparsity = sparsity
-        self.masks: dict[int, jax.Array] = {}
+        self.masks: dict[int, Float[Array, "..."]] = {}
         self.params: dict[int, nnx.Param] = {}
 
     def apply(self, modules: Iterable[nnx.Module]) -> None:
@@ -157,7 +169,11 @@ class TokenPruner(nnx.Module):
             raise ValueError("keep_ratio must be in (0, 1]")
         self.keep_ratio = keep_ratio
 
-    def __call__(self, x: jax.Array, scores: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "B T D"],
+        scores: Float[Array, "B T"],
+    ) -> Float[Array, "B T_kept D"]:
         B, T, C = x.shape
         k = max(1, int(T * self.keep_ratio))
         idx = jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
@@ -189,7 +205,9 @@ class LowRankLinear(nnx.Module):
             layer.up.bias.value = linear.bias.value
         return layer
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_out"]:
         return self.up(self.down(x))
 
 
@@ -218,7 +236,9 @@ class ColumnParallelLinear(nnx.Module):
         self.fc = nnx.Linear(in_features, self.local_out, use_bias=use_bias,
                              rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_in"]
+    ) -> Float[Array, "*B D_local_out"]:
         return self.fc(x)
 
 
@@ -234,7 +254,9 @@ class RowParallelLinear(nnx.Module):
         self.fc = nnx.Linear(self.local_in, out_features, use_bias=use_bias,
                              rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "*B D_local_in"]
+    ) -> Float[Array, "*B D_out"]:
         out = self.fc(x)
         if jax.device_count() > 1:
             out = jax.lax.psum(out, axis_name="tp")
@@ -250,5 +272,5 @@ class PipelineStage(nnx.Module):
         self.stage_id = stage_id
         self.num_stages = num_stages
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         return self.module(x)
