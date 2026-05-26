@@ -11,6 +11,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 from .attention_blocks import CrossAttention, MultiHeadAttention
@@ -70,6 +71,7 @@ class PerceiverResampler(nn.Module):
             ]))
         self.norm = nn.LayerNorm(dim)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B K D"]:
@@ -114,6 +116,7 @@ class QFormer(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, llm_dim)
 
+    @typecheck
     def forward(
         self, image_feats: Float[Tensor, "B T D_img"]
     ) -> Float[Tensor, "B Q D_llm"]:
@@ -144,6 +147,7 @@ class ToolUseBlock(nn.Module):
     def register(self, name: str, fn: Callable[[str], str]) -> None:
         self.tools[name] = fn
 
+    @typecheck
     def __call__(self, text: str) -> str:
         import re
         out, pos = [], 0
@@ -171,6 +175,7 @@ class MemoryAttention(nn.Module):
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(mem_dim or dim)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],

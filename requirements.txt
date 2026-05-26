@@ -2,3 +2,4 @@ torch>=2.0           # for pytorch_blocks/
 jax==0.10.0          # for flax_blocks/
 flax==0.10.2         # for flax_blocks/
 jaxtyping>=0.3.0     # shape/dtype annotations for flax_blocks/ and pytorch_blocks/
+beartype>=0.18       # runtime type checker used when CHECK_TYPES=1 (default)

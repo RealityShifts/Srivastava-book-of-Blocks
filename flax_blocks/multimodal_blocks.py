@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
+from ._typecheck import typecheck
 
 from .attention_blocks import CrossAttention, MultiHeadAttention
 from .transformer_blocks import FeedForward
@@ -71,6 +72,7 @@ class PerceiverResampler(nnx.Module):
         self.layers = layers
         self.norm = nnx.LayerNorm(dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B K D"]:
@@ -111,6 +113,7 @@ class QFormer(nnx.Module):
         self.norm = nnx.LayerNorm(dim, rngs=rngs)
         self.proj = nnx.Linear(dim, llm_dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, image_feats: Float[Array, "B T D_img"]
     ) -> Float[Array, "B K D_llm"]:
@@ -141,6 +144,7 @@ class ToolUseBlock:
     def register(self, name: str, fn: Callable[[str], str]) -> None:
         self.tools[name] = fn
 
+    @typecheck
     def __call__(self, text: str) -> str:
         out, pos = [], 0
         for m in re.finditer(r'<tool name="([^"]+)">([^<]*)</tool>', text):
@@ -166,6 +170,7 @@ class MemoryAttention(nnx.Module):
         self.norm_q = nnx.LayerNorm(dim, rngs=rngs)
         self.norm_kv = nnx.LayerNorm(mem_dim or dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B Tq D"],

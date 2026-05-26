@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from jaxtyping import Float, Int8
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -25,6 +26,7 @@ from torch import Tensor
 # Quantization
 # ---------------------------------------------------------------------------
 
+@typecheck
 def quantize_int8(
     weight: Float[Tensor, "O I"],
 ) -> tuple[Int8[Tensor, "O I"], Float[Tensor, "O"]]:
@@ -34,6 +36,7 @@ def quantize_int8(
     return q, scale.squeeze(-1)
 
 
+@typecheck
 def dequantize_int8(
     qweight: Int8[Tensor, "O I"], scale: Float[Tensor, "O"]
 ) -> Float[Tensor, "O I"]:
@@ -63,6 +66,7 @@ class QuantizedLinearInt8(nn.Module):
             layer.bias.data.copy_(linear.bias.data)
         return layer
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B I"]
     ) -> Float[Tensor, "*B O"]:
@@ -110,6 +114,7 @@ class QuantizedLinear4bit(nn.Module):
         unpacked[:, 1::2] = hi.to(dtype)
         return unpacked * self.scale.to(dtype)[:, None]
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B I"]
     ) -> Float[Tensor, "*B O"]:
@@ -154,6 +159,7 @@ class TokenPruner(nn.Module):
             raise ValueError("keep_ratio must be in (0, 1]")
         self.keep_ratio = keep_ratio
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],
@@ -191,6 +197,7 @@ class LowRankLinear(nn.Module):
             layer.up.bias.data.copy_(linear.bias.data)
         return layer
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B I"]
     ) -> Float[Tensor, "*B O"]:
@@ -226,6 +233,7 @@ class ColumnParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.local_out)) if bias else None
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B I"]
     ) -> Float[Tensor, "*B O_local"]:
@@ -245,6 +253,7 @@ class RowParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B I_local"]
     ) -> Float[Tensor, "*B O"]:
@@ -265,6 +274,7 @@ class PipelineStage(nn.Module):
         self.stage_id = stage_id
         self.num_stages = num_stages
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "..."]
     ) -> Float[Tensor, "..."]:

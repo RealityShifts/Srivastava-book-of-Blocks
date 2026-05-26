@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int, PyTree
+from ._typecheck import typecheck
 
 
 Params = PyTree[Float[Array, "..."]]     # nested jax pytree of float arrays
@@ -38,10 +39,12 @@ class SGDState(NamedTuple):
     momentum: Any
 
 
+@typecheck
 def sgd_init(params: Params, momentum: bool = False) -> SGDState:
     return SGDState(jax.tree.map(jnp.zeros_like, params) if momentum else None)
 
 
+@typecheck
 def sgd_update(grads: Grads, params: Params, state: SGDState,
                lr: float = 1e-2, momentum: float = 0.0,
                weight_decay: float = 0.0) -> tuple[Params, SGDState]:
@@ -66,11 +69,13 @@ class AdamState(NamedTuple):
     v: Any
 
 
+@typecheck
 def adam_init(params: Params) -> AdamState:
     zeros = jax.tree.map(jnp.zeros_like, params)
     return AdamState(jnp.array(0), zeros, deepcopy(zeros))
 
 
+@typecheck
 def adam_update(grads: Grads, params: Params, state: AdamState,
                 lr: float = 1e-3,
                 betas: tuple[float, float] = (0.9, 0.999),
@@ -103,10 +108,12 @@ class LionState(NamedTuple):
     m: Any
 
 
+@typecheck
 def lion_init(params: Params) -> LionState:
     return LionState(jax.tree.map(jnp.zeros_like, params))
 
 
+@typecheck
 def lion_update(grads: Grads, params: Params, state: LionState,
                 lr: float = 1e-4,
                 betas: tuple[float, float] = (0.9, 0.99),
@@ -130,11 +137,13 @@ class SophiaState(NamedTuple):
     h: Any
 
 
+@typecheck
 def sophia_init(params: Params) -> SophiaState:
     zeros = jax.tree.map(jnp.zeros_like, params)
     return SophiaState(zeros, deepcopy(zeros))
 
 
+@typecheck
 def sophia_update_hessian(grads: Grads, state: SophiaState,
                           beta2: float = 0.99) -> SophiaState:
     new_h = jax.tree.map(
@@ -142,6 +151,7 @@ def sophia_update_hessian(grads: Grads, state: SophiaState,
     return SophiaState(state.m, new_h)
 
 
+@typecheck
 def sophia_update(grads: Grads, params: Params, state: SophiaState,
                   lr: float = 1e-4, beta1: float = 0.965,
                   rho: float = 0.04, weight_decay: float = 0.0,
@@ -164,10 +174,12 @@ class RMSPropState(NamedTuple):
     v: Any
 
 
+@typecheck
 def rmsprop_init(params: Params) -> RMSPropState:
     return RMSPropState(jax.tree.map(jnp.zeros_like, params))
 
 
+@typecheck
 def rmsprop_update(grads: Grads, params: Params, state: RMSPropState,
                    lr: float = 1e-3, alpha: float = 0.99,
                    eps: float = 1e-8) -> tuple[Params, RMSPropState]:
@@ -219,6 +231,7 @@ def one_cycle_schedule(max_lr: float, total_steps: int,
 # Gradient clipping
 # ---------------------------------------------------------------------------
 
+@typecheck
 def clip_grad_norm(
     grads: Grads, max_norm: float = 1.0,
 ) -> tuple[Grads, Float[Array, ""]]:

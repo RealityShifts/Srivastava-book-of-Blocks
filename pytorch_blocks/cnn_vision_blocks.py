@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 from .core_blocks import ConvBlock
@@ -42,6 +43,7 @@ class InceptionBlock(nn.Module):
             ConvBlock(in_ch, pool, 1, activation="relu"),
         )
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -61,6 +63,7 @@ class _DenseLayer(nn.Sequential):
             nn.Conv2d(4 * growth, growth, 3, padding=1, bias=False),
         )
 
+    @typecheck
     def forward(                                                       # type: ignore[override]
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -96,6 +99,7 @@ class SqueezeExcitation(nn.Module):
             nn.Conv2d(hidden, channels, 1), nn.Sigmoid(),
         )
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H W"]:
@@ -113,6 +117,7 @@ class CBAM(nn.Module):
             nn.Linear(hidden, channels))
         self.spatial = nn.Conv2d(2, 1, kernel, padding=kernel // 2)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H W"]:
@@ -135,6 +140,7 @@ class SpatialPyramidPooling(nn.Module):
         super().__init__()
         self.pools = nn.ModuleList(nn.AdaptiveAvgPool2d(s) for s in output_sizes)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B D_out"]:
@@ -150,9 +156,10 @@ class FeaturePyramidNetwork(nn.Module):
         self.smooth = nn.ModuleList(nn.Conv2d(out_ch, out_ch, 3, padding=1)
                                     for _ in in_channels)
 
+    @typecheck
     def forward(
-        self, feats: Sequence[Float[Tensor, "B C H W"]]
-    ) -> list[Float[Tensor, "B C_out H_l W_l"]]:
+        self, feats: Sequence[Float[Tensor, "..."]]
+    ) -> list[Float[Tensor, "..."]]:
         lats = [lat(f) for lat, f in zip(self.lat, feats)]
         outs = [lats[-1]]
         for i in range(len(lats) - 2, -1, -1):
@@ -178,6 +185,7 @@ class ASPP(nn.Module):
         )
         self.project = ConvBlock(out_ch * (len(dilations) + 1), out_ch, 1)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -200,6 +208,7 @@ class PixelShuffleUpsample(nn.Module):
         self.conv = nn.Conv2d(channels, channels * scale * scale, 3, padding=1)
         self.shuffle = nn.PixelShuffle(scale)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H_out W_out"]:
@@ -229,6 +238,7 @@ class DeformableConv2d(nn.Module):
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -283,6 +293,7 @@ class DeformableAttention(nn.Module):
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],

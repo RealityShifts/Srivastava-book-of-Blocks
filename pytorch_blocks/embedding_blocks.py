@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -42,6 +43,7 @@ class LearnedPositionalEmbedding(nn.Module):
         self.embed = nn.Embedding(max_len, dim)
         nn.init.trunc_normal_(self.embed.weight, std=0.02)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
@@ -62,6 +64,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
@@ -83,12 +86,14 @@ class ProjectionHead(nn.Module):
             nn.Linear(hidden, out_dim, bias=False),
         )
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B D_in"]
     ) -> Float[Tensor, "B D_out"]:
         return self.net(x)
 
 
+@typecheck
 def info_nce(
     z1: Float[Tensor, "B D"],
     z2: Float[Tensor, "B D"],
@@ -109,6 +114,7 @@ class CLIPLoss(nn.Module):
         super().__init__()
         self.logit_scale = nn.Parameter(torch.tensor(1.0 / init_temperature).log())
 
+    @typecheck
     def forward(
         self,
         image_emb: Float[Tensor, "B D"],

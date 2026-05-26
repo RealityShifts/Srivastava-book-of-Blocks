@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,7 @@ class ExternalMemory(nnx.Module):
         self.values = nnx.Param(
             jax.random.normal(rngs.params(), (num_slots, value_dim)) * 0.02)
 
+    @typecheck
     def __call__(
         self, query: Float[Array, "*B D_key"]
     ) -> Float[Array, "*B D_value"]:
@@ -94,6 +96,7 @@ class RAGModule:
     def index(self, docs: list[str]) -> None:
         self.store.add(self.encoder(docs), docs)
 
+    @typecheck
     def __call__(self, queries: list[str]) -> list[str]:
         emb = self.encoder(queries)
         _, retrieved = self.store.search(emb, k=self.top_k)

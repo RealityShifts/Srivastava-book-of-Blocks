@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
+from ._typecheck import typecheck
 
 from .core_blocks import ConvBlock
 
@@ -33,6 +34,7 @@ class InceptionBlock(nnx.Module):
         self.b5b = ConvBlock(c5, c5, 5, rngs=rngs)
         self.bp = ConvBlock(in_ch, pool, 1, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -55,6 +57,7 @@ class _DenseLayer(nnx.Module):
         self.conv2 = nnx.Conv(4 * growth, growth, (3, 3),
                               padding="SAME", use_bias=False, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -76,6 +79,7 @@ class DenseBlock(nnx.Module):
         self.layers = layers
         self.out_channels = c
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -97,6 +101,7 @@ class SqueezeExcitation(nnx.Module):
         self.fc1 = nnx.Conv(channels, hidden, (1, 1), rngs=rngs)
         self.fc2 = nnx.Conv(hidden, channels, (1, 1), rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C"]:
@@ -116,6 +121,7 @@ class CBAM(nnx.Module):
         self.spatial = nnx.Conv(2, 1, (kernel, kernel),
                                 padding="SAME", rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C"]:
@@ -139,6 +145,7 @@ class SpatialPyramidPooling(nnx.Module):
     def __init__(self, output_sizes: Sequence[int] = (1, 2, 4)) -> None:
         self.output_sizes = tuple(output_sizes)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B D_out"]:
@@ -161,9 +168,10 @@ class FeaturePyramidNetwork(nnx.Module):
         self.smooth = [nnx.Conv(out_ch, out_ch, (3, 3),
                                 padding="SAME", rngs=rngs) for _ in in_channels]
 
+    @typecheck
     def __call__(
-        self, feats: Sequence[Float[Array, "B H W C"]]
-    ) -> list[Float[Array, "B H W C_out"]]:
+        self, feats: Sequence[Float[Array, "..."]]
+    ) -> list[Float[Array, "..."]]:
         lats = [lat(f) for lat, f in zip(self.lat, feats)]
         outs = [lats[-1]]
         for i in range(len(lats) - 2, -1, -1):
@@ -190,6 +198,7 @@ class ASPP(nnx.Module):
         self.project = ConvBlock(out_ch * (len(dilations) + 1), out_ch, 1,
                                  rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -205,6 +214,7 @@ class ASPP(nnx.Module):
 # Pixel shuffle upsampler
 # ---------------------------------------------------------------------------
 
+@typecheck
 def pixel_shuffle(
     x: Float[Array, "B H W C_packed"], scale: int
 ) -> Float[Array, "B H_out W_out C_out"]:
@@ -227,6 +237,7 @@ class PixelShuffleUpsample(nnx.Module):
         self.conv = nnx.Conv(channels, channels * scale * scale, (3, 3),
                              padding="SAME", rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H_out W_out C"]:
@@ -282,6 +293,7 @@ class DeformableConv2d(nnx.Module):
                                bias_init=nnx.initializers.zeros, rngs=rngs)
         self.proj = nnx.Linear(in_ch * kernel_size * kernel_size, out_ch, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -332,6 +344,7 @@ class DeformableAttention(nnx.Module):
         self.weight = nnx.Linear(dim, num_heads * num_points, rngs=rngs)
         self.out = nnx.Linear(dim, dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],

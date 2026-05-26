@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ class PatchEmbedding(nnx.Module):
         self.proj = nnx.Conv(in_ch, dim, (patch_size, patch_size),
                              strides=patch_size, padding="VALID", rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B N D"]:
@@ -42,6 +44,7 @@ class CLSToken(nnx.Module):
         self.token = nnx.Param(
             jax.random.truncated_normal(rngs.params(), -2, 2, (1, 1, dim)) * 0.02)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B N D"]
     ) -> Float[Array, "B N_plus_1 D"]:
@@ -96,6 +99,7 @@ class SwinWindowAttention(nnx.Module):
         rel = rel.at[..., 0].multiply(2 * window - 1)
         self.rel_index = rel.sum(-1)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B N D"],
@@ -147,6 +151,7 @@ class ShiftedWindowAttention(nnx.Module):
         else:
             self.attn_mask = None
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B N D"]
     ) -> Float[Array, "B N D"]:

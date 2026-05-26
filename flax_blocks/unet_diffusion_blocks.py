@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int
+from ._typecheck import typecheck
 
 from .attention_blocks import CrossAttention
 
@@ -35,6 +36,7 @@ class SinusoidalTimeEmbedding(nnx.Module):
     def __init__(self, dim: int) -> None:
         self.dim = dim
 
+    @typecheck
     def __call__(
         self, t: Int[Array, "B"]
     ) -> Float[Array, "B D"]:
@@ -58,6 +60,7 @@ class TimestepMLP(nnx.Module):
         self.fc1 = nnx.Linear(dim, hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, hidden, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, t: Int[Array, "B"]
     ) -> Float[Array, "B D_hidden"]:
@@ -80,6 +83,7 @@ class DownsampleBlock(nnx.Module):
         elif mode != "avg":
             raise ValueError(mode)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H_out W_out C"]:
@@ -107,6 +111,7 @@ class UpsampleBlock(nnx.Module):
         else:
             raise ValueError(mode)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H_out W_out C"]:
@@ -137,6 +142,7 @@ class UNetResBlock(nnx.Module):
         self.skip = (nnx.Conv(in_ch, out_ch, (1, 1), rngs=rngs)
                      if in_ch != out_ch else None)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C_in"],
@@ -188,6 +194,7 @@ class UNet(nnx.Module):
         self.out_norm = nnx.GroupNorm(c, num_groups=_gn_groups(c), rngs=rngs)
         self.out_conv = nnx.Conv(c, out_ch, (3, 3), padding="SAME", rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C_in"],
@@ -221,6 +228,7 @@ class NoisePredictor(nnx.Module):
     def __init__(self, backbone: nnx.Module) -> None:
         self.backbone = backbone
 
+    @typecheck
     def __call__(
         self,
         x_t: Float[Array, "B H W C"],
@@ -232,6 +240,7 @@ class NoisePredictor(nnx.Module):
         return self.backbone(x_t, t, cond)
 
 
+@typecheck
 def classifier_free_guidance(
     eps_cond: Float[Array, "B H W C"],
     eps_uncond: Float[Array, "B H W C"],
@@ -267,6 +276,7 @@ class ControlNetBlock(nnx.Module):
                            padding="SAME", rngs=rngs)
         self.zero = ZeroConv(hidden * 2, out_ch, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, hint: Float[Array, "B H W C_hint"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -300,6 +310,7 @@ class LoRALinear(nnx.Module):
             jax.random.normal(rngs.params(), (in_f, rank)) * (1.0 / rank ** 0.5))
         self.lora_B = nnx.Param(jnp.zeros((rank, out_f)))
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -321,6 +332,7 @@ class LoRAConv2d(nnx.Module):
         self.up = nnx.Conv(rank, out_ch, (1,) * len(ksize), use_bias=False,
                            kernel_init=nnx.initializers.zeros, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -341,6 +353,7 @@ class HyperNetwork(nnx.Module):
         self.fc1 = nnx.Linear(code_dim, hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, in_dim * out_dim + out_dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         code: Float[Array, "*B D_code"],
@@ -367,6 +380,7 @@ class IPAdapterCrossAttention(nnx.Module):
         self.text_attn = CrossAttention(dim, text_dim, num_heads, rngs=rngs)
         self.image_attn = CrossAttention(dim, image_dim, num_heads, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B Tq D"],

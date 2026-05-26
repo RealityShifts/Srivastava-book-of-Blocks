@@ -16,7 +16,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float, Int, Shaped
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -24,11 +25,12 @@ from torch import Tensor
 # Scaled-dot-product helpers
 # ---------------------------------------------------------------------------
 
+@typecheck
 def scaled_dot_product_attention(
     q: Float[Tensor, "B H Tq D"],
     k: Float[Tensor, "B H Tk D"],
     v: Float[Tensor, "B H Tk D"],
-    mask: Optional[Bool[Tensor, "..."]] = None,
+    mask: Optional[Shaped[Tensor, "..."]] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
 ) -> Float[Tensor, "B H Tq D"]:
@@ -61,10 +63,11 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],
-        mask: Optional[Bool[Tensor, "..."]] = None,
+        mask: Optional[Shaped[Tensor, "..."]] = None,
     ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
@@ -108,11 +111,12 @@ class CrossAttention(nn.Module):
         self.kv_proj = nn.Linear(ctx_dim, 2 * dim, bias=False)
         self.out_proj = nn.Linear(dim, dim)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B Tq D"],
         context: Float[Tensor, "B Tk D_ctx"],
-        mask: Optional[Bool[Tensor, "..."]] = None,
+        mask: Optional[Shaped[Tensor, "..."]] = None,
     ) -> Float[Tensor, "B Tq D"]:
         B, Tx, C = x.shape
         Tc = context.shape[1]
@@ -143,6 +147,7 @@ class WindowAttention(nn.Module):
         self.window = window
         self.attn = MultiHeadAttention(dim, num_heads, dropout)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
@@ -174,6 +179,7 @@ class LinearAttention(nn.Module):
     def _phi(x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
         return F.elu(x) + 1.0
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
@@ -211,6 +217,7 @@ class RotaryEmbedding(nn.Module):
         inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv, persistent=False)
 
+    @typecheck
     def forward(
         self,
         seq_len: int,
@@ -223,6 +230,7 @@ class RotaryEmbedding(nn.Module):
         return emb.cos(), emb.sin()
 
 
+@typecheck
 def apply_rotary(
     x: Float[Tensor, "B H T D"],
     cos: Float[Tensor, "T D"],
@@ -266,6 +274,7 @@ class RelativePositionBias(nn.Module):
         ret += torch.where(is_small, rel_pos, large)
         return ret
 
+    @typecheck
     def forward(
         self, q_len: int, k_len: int, device: torch.device,
     ) -> Float[Tensor, "H Tq Tk"]:
@@ -289,6 +298,7 @@ class AttentionPooling(nn.Module):
         self.attn = CrossAttention(dim, dim, num_heads)
         self.norm = nn.LayerNorm(dim)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B D"]:

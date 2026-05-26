@@ -13,12 +13,14 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int, PRNGKeyArray
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
 # VAE
 # ---------------------------------------------------------------------------
 
+@typecheck
 def reparameterize(
     mu: Float[Array, "..."],
     logvar: Float[Array, "..."],
@@ -70,6 +72,7 @@ class VAE(nnx.Module):
             h = nnx.silu(layer(h))
         return self.dec_final(h)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C"],
@@ -111,6 +114,7 @@ class MaskedConv2d(nnx.Module):
         mask = mask.at[kH // 2 + 1:].set(0)
         self.mask = mask
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -125,6 +129,7 @@ class AutoregressiveBlock(nnx.Module):
         self.conv = MaskedConv2d("B", channels, 2 * channels, 3, rngs=rngs)
         self.proj = MaskedConv2d("B", channels, channels, 1, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C"]:
@@ -152,6 +157,7 @@ class AffineCouplingLayer(nnx.Module):
     ) -> Float[Array, "B D_st"]:
         return self.fc3(nnx.relu(self.fc2(nnx.relu(self.fc1(x1)))))
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B D"]
     ) -> tuple[Float[Array, "B D"], Float[Array, "B"]]:
@@ -180,6 +186,7 @@ class EnergyBasedModel(nnx.Module):
     def __init__(self, backbone: nnx.Module) -> None:
         self.backbone = backbone
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B *spatial"]
     ) -> Float[Array, "B"]:

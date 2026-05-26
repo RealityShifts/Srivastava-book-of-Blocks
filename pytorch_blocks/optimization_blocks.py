@@ -14,6 +14,7 @@ from typing import Callable, Iterable
 import torch
 import torch.nn as nn
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
@@ -135,6 +136,7 @@ from torch.optim.lr_scheduler import OneCycleLR  # noqa: E402,F401
 # Gradient clipping
 # ---------------------------------------------------------------------------
 
+@typecheck
 def clip_grad_norm(
     parameters: Iterable[nn.Parameter], max_norm: float = 1.0
 ) -> Float[Tensor, ""]:
@@ -212,6 +214,7 @@ def checkpointed(module: nn.Module, *args, use_reentrant: bool = False, **kwargs
 class CheckpointedSequential(nn.Sequential):
     """Sequential that runs each submodule under :func:`torch.utils.checkpoint`."""
 
+    @typecheck
     def forward(                                                           # type: ignore[override]
         self, x: Float[Tensor, "..."]
     ) -> Float[Tensor, "..."]:

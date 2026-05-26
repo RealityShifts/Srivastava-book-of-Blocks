@@ -11,7 +11,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from jaxtyping import Bool, Float
+from jaxtyping import Float, Shaped
+from ._typecheck import typecheck
 from torch import Tensor
 
 from .attention_blocks import (
@@ -39,6 +40,7 @@ class FeedForward(nn.Module):
             nn.Linear(hidden, dim), nn.Dropout(dropout),
         )
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B D"]
     ) -> Float[Tensor, "*B D"]:
@@ -57,6 +59,7 @@ class SwiGLU(nn.Module):
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.drop = nn.Dropout(dropout)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B D"]
     ) -> Float[Tensor, "*B D"]:
@@ -74,6 +77,7 @@ class GEGLU(nn.Module):
         self.proj_out = nn.Linear(hidden, dim)
         self.drop = nn.Dropout(dropout)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B D"]
     ) -> Float[Tensor, "*B D"]:
@@ -96,10 +100,11 @@ class TransformerEncoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],
-        mask: Optional[Bool[Tensor, "..."]] = None,
+        mask: Optional[Shaped[Tensor, "..."]] = None,
     ) -> Float[Tensor, "B T D"]:
         x = x + self.attn(self.norm1(x), mask=mask)
         x = x + self.mlp(self.norm2(x))
@@ -119,11 +124,12 @@ class TransformerDecoderBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],
         context: Optional[Float[Tensor, "B Tk D_ctx"]] = None,
-        mask: Optional[Bool[Tensor, "..."]] = None,
+        mask: Optional[Shaped[Tensor, "..."]] = None,
     ) -> Float[Tensor, "B T D"]:
         x = x + self.self_attn(self.norm1(x), mask=mask)
         if context is not None:
@@ -154,6 +160,7 @@ class MixtureOfExperts(nn.Module):
         self.experts = nn.ModuleList(
             FeedForward(dim, hidden) for _ in range(num_experts))
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:

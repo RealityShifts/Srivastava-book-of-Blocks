@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,7 @@ class LearnedPositionalEmbedding(nnx.Module):
     def __init__(self, max_len: int, dim: int, *, rngs: nnx.Rngs) -> None:
         self.embed = nnx.Embed(max_len, dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:
@@ -50,6 +52,7 @@ class SinusoidalPositionalEmbedding(nnx.Module):
         pe = pe.at[:, 1::2].set(jnp.cos(pos * div))
         self.pe = pe[None]
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:
@@ -69,12 +72,14 @@ class ProjectionHead(nnx.Module):
         self.bn = nnx.BatchNorm(hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, out_dim, use_bias=False, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B D_in"]
     ) -> Float[Array, "B D_out"]:
         return self.fc2(nnx.relu(self.bn(self.fc1(x))))
 
 
+@typecheck
 def info_nce(
     z1: Float[Array, "B D"],
     z2: Float[Array, "B D"],
@@ -104,6 +109,7 @@ class CLIPLoss(nnx.Module):
         self.logit_scale = nnx.Param(
             jnp.log(jnp.array(1.0 / init_temperature)))
 
+    @typecheck
     def __call__(
         self,
         image_emb: Float[Array, "B D"],

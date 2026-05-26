@@ -16,18 +16,20 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int, Shaped
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
 # Scaled-dot-product attention (functional)
 # ---------------------------------------------------------------------------
 
+@typecheck
 def scaled_dot_product_attention(
     q: Float[Array, "B Tq H D"],
     k: Float[Array, "B Tk H D"],
     v: Float[Array, "B Tk H D"],
-    mask: Optional[Bool[Array, "..."]] = None,
+    mask: Optional[Shaped[Array, "..."]] = None,
     is_causal: bool = False,
 ) -> Float[Array, "B Tq H D"]:
     """``softmax(QK^T / sqrt(d)) V``.  q/k/v are ``(B, T, H, D)``.
@@ -59,10 +61,11 @@ class MultiHeadAttention(nnx.Module):
         self.qkv = nnx.Linear(dim, 3 * dim, use_bias=use_bias, rngs=rngs)
         self.out_proj = nnx.Linear(dim, dim, use_bias=use_bias, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],
-        mask: Optional[Bool[Array, "..."]] = None,
+        mask: Optional[Shaped[Array, "..."]] = None,
     ) -> Float[Array, "B T D"]:
         B, T, _ = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
@@ -101,11 +104,12 @@ class CrossAttention(nnx.Module):
         self.kv_proj = nnx.Linear(ctx_dim, 2 * dim, use_bias=False, rngs=rngs)
         self.out_proj = nnx.Linear(dim, dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B Tq D"],
         context: Float[Array, "B Tk D_ctx"],
-        mask: Optional[Bool[Array, "..."]] = None,
+        mask: Optional[Shaped[Array, "..."]] = None,
     ) -> Float[Array, "B Tq D"]:
         B, Tx, _ = x.shape
         Tc = context.shape[1]
@@ -128,6 +132,7 @@ class WindowAttention(nnx.Module):
         self.window = window
         self.attn = MultiHeadAttention(dim, num_heads, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:
@@ -156,6 +161,7 @@ class LinearAttention(nnx.Module):
     def _phi(x: Float[Array, "..."]) -> Float[Array, "..."]:
         return jax.nn.elu(x) + 1.0
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:
@@ -190,6 +196,7 @@ class RotaryEmbedding(nnx.Module):
         self.head_dim = head_dim
         self.base = base
 
+    @typecheck
     def __call__(
         self, seq_len: int, dtype: jnp.dtype = jnp.float32,
     ) -> tuple[Float[Array, "T D"], Float[Array, "T D"]]:
@@ -201,6 +208,7 @@ class RotaryEmbedding(nnx.Module):
         return jnp.cos(emb), jnp.sin(emb)
 
 
+@typecheck
 def apply_rotary(
     x: Float[Array, "... T D"],
     cos: Float[Array, "T D"],
@@ -243,6 +251,7 @@ class RelativePositionBias(nnx.Module):
         large = jnp.minimum(large, n - 1)
         return ret + jnp.where(is_small, rel_pos, large)
 
+    @typecheck
     def __call__(
         self, q_len: int, k_len: int
     ) -> Float[Array, "H Tq Tk"]:
@@ -266,6 +275,7 @@ class AttentionPooling(nnx.Module):
         self.attn = CrossAttention(dim, dim, num_heads, rngs=rngs)
         self.norm = nnx.LayerNorm(dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B D"]:

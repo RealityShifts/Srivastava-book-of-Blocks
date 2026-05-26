@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -31,6 +32,7 @@ class ExternalMemory(nn.Module):
         self.keys = nn.Parameter(torch.randn(num_slots, key_dim) * 0.02)
         self.values = nn.Parameter(torch.randn(num_slots, value_dim) * 0.02)
 
+    @typecheck
     def forward(
         self, query: Float[Tensor, "*B D_k"]
     ) -> Float[Tensor, "*B D_v"]:
@@ -90,6 +92,7 @@ class RAGModule(nn.Module):
     def index(self, docs: list[str]) -> None:
         self.store.add(self.encoder(docs), docs)
 
+    @typecheck
     def __call__(self, queries: list[str]) -> list[str]:
         emb = self.encoder(queries)
         _, retrieved = self.store.search(emb, k=self.top_k)

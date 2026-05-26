@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -41,6 +42,7 @@ class PolicyNetwork(nn.Module):
         if not discrete:
             self.log_std = nn.Parameter(torch.zeros(action_dim))
 
+    @typecheck
     def forward(
         self, s: Float[Tensor, "B D_s"]
     ) -> torch.distributions.Distribution:
@@ -57,6 +59,7 @@ class ValueNetwork(nn.Module):
         super().__init__()
         self.net = _mlp([state_dim, *hidden, 1])
 
+    @typecheck
     def forward(
         self, s: Float[Tensor, "B D_s"]
     ) -> Float[Tensor, "B"]:
@@ -71,6 +74,7 @@ class QNetwork(nn.Module):
         super().__init__()
         self.net = _mlp([state_dim, *hidden, action_dim])
 
+    @typecheck
     def forward(
         self, s: Float[Tensor, "B D_s"]
     ) -> Float[Tensor, "B D_a"]:
@@ -90,6 +94,7 @@ class ActorCritic(nn.Module):
         if not discrete:
             self.log_std = nn.Parameter(torch.zeros(action_dim))
 
+    @typecheck
     def forward(
         self, s: Float[Tensor, "B D_s"]
     ) -> tuple[torch.distributions.Distribution, Float[Tensor, "B"]]:
@@ -151,5 +156,6 @@ class TargetNetwork(nn.Module):
         for tp, sp in zip(self.target.parameters(), source.parameters()):
             tp.data.mul_(1 - self.tau).add_(self.tau * sp.data)
 
+    @typecheck
     def forward(self, *args, **kwargs):
         return self.target(*args, **kwargs)

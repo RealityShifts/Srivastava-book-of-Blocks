@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ class ConvBlock(nnx.Module):
         self.norm = build_norm(norm, out_ch, rngs=rngs)
         self.act = get_activation(activation)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -66,6 +68,7 @@ class DepthwiseSeparableConv(nnx.Module):
         )
         self.pointwise = nnx.Conv(in_ch, out_ch, (1, 1), use_bias=False, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -141,6 +144,7 @@ class InstanceNorm(nnx.Module):
         self.norm = nnx.GroupNorm(num_features, num_groups=num_features,
                                   epsilon=epsilon, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C"]:
@@ -163,6 +167,7 @@ class WeightNorm(nnx.Module):
             kernel.reshape(-1, kernel.shape[-1]), axis=0))
         self.norm_axis = norm_axis
 
+    @typecheck
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         v = self.base.kernel.value
         norm = jnp.sqrt(jnp.sum(v * v, axis=self.norm_axis, keepdims=True) + 1e-12)
@@ -183,6 +188,7 @@ class SpectralNorm(nnx.Module):
         self.u = nnx.Variable(
             jax.random.normal(rngs.params(), (out_features,)))
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B D_in"]
     ) -> Float[Array, "B D_out"]:
@@ -205,6 +211,7 @@ class AdaIN(nnx.Module):
         self.norm = InstanceNorm(num_features, rngs=rngs)
         self.fc = nnx.Linear(style_dim, num_features * 2, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C"],
@@ -225,6 +232,7 @@ class SPADE(nnx.Module):
         self.gamma = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
         self.beta = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C"],
@@ -265,6 +273,7 @@ def _gn_groups(channels: int, target: int = 32) -> int:
 
 
 class _Identity(nnx.Module):
+    @typecheck
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         return x
 
@@ -291,6 +300,7 @@ class ResidualBlock(nnx.Module):
         else:
             self.shortcut = _Identity()
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -306,6 +316,7 @@ class SkipConnection(nnx.Module):
         self.fn = fn
         self.mode = mode
 
+    @typecheck
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         y = self.fn(x)
         return x + y if self.mode == "add" else jnp.concatenate([x, y], axis=-1)

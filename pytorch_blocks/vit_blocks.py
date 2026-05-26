@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Bool, Float, Int
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -27,6 +28,7 @@ class PatchEmbedding(nn.Module):
         self.patch_size = patch_size
         self.proj = nn.Conv2d(in_ch, dim, patch_size, patch_size)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B N D"]:
@@ -42,6 +44,7 @@ class CLSToken(nn.Module):
         self.token = nn.Parameter(torch.zeros(1, 1, dim))
         nn.init.trunc_normal_(self.token, std=0.02)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B N D"]
     ) -> Float[Tensor, "B N1 D"]:
@@ -95,6 +98,7 @@ class SwinWindowAttention(nn.Module):
         self.register_buffer("rel_index", rel.sum(-1), persistent=False)
         nn.init.trunc_normal_(self.rel_bias, std=0.02)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "BnW N D"],
@@ -149,6 +153,7 @@ class ShiftedWindowAttention(nn.Module):
         else:
             self.attn_mask = None
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B N D"]
     ) -> Float[Tensor, "B N D"]:

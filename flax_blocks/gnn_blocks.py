@@ -15,12 +15,14 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
 # Message passing
 # ---------------------------------------------------------------------------
 
+@typecheck
 def scatter_sum(
     msg: Float[Array, "E D"],
     dst: Int[Array, "E"],
@@ -30,6 +32,7 @@ def scatter_sum(
     return out.at[dst].add(msg)
 
 
+@typecheck
 def scatter_mean(
     msg: Float[Array, "E D"],
     dst: Int[Array, "E"],
@@ -40,6 +43,7 @@ def scatter_mean(
     return summed / jnp.maximum(counts, 1)[:, None]
 
 
+@typecheck
 def scatter_max(
     msg: Float[Array, "E D"],
     dst: Int[Array, "E"],
@@ -84,6 +88,7 @@ class MessagePassing(nnx.Module):
             return scatter_max(msg, dst, num_nodes)
         raise ValueError(self.aggregator)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "N D"],
@@ -106,6 +111,7 @@ class GraphConv(nnx.Module):
     def __init__(self, in_dim: int, out_dim: int, *, rngs: nnx.Rngs) -> None:
         self.lin = nnx.Linear(in_dim, out_dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "N D_in"],
@@ -138,6 +144,7 @@ class GraphAttention(nnx.Module):
             jax.random.normal(rngs.params(), (1, heads, out_dim)) * 0.1)
         self.slope = negative_slope
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "N D_in"],

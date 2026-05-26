@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -66,6 +67,7 @@ class ConvBlock(nn.Module):
         self.norm = _build_norm2d(norm, out_ch)
         self.act = get_activation(activation)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -85,6 +87,7 @@ class DepthwiseSeparableConv2d(nn.Module):
         )
         self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=bias)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -127,6 +130,7 @@ class Conv3d(nn.Conv3d):
 class Mish(nn.Module):
     """Mish activation: ``x * tanh(softplus(x))``."""
 
+    @typecheck
     def forward(  # noqa: D401
         self, x: Float[Tensor, "..."]
     ) -> Float[Tensor, "..."]:
@@ -168,6 +172,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "... D"]
     ) -> Float[Tensor, "... D"]:
@@ -186,6 +191,7 @@ class AdaIN(nn.Module):
         self.norm = nn.InstanceNorm2d(num_features, affine=False)
         self.fc = nn.Linear(style_dim, num_features * 2)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C H W"],
@@ -207,6 +213,7 @@ class SPADE(nn.Module):
         self.gamma = nn.Conv2d(hidden, num_features, 3, padding=1)
         self.beta = nn.Conv2d(hidden, num_features, 3, padding=1)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C H W"],
@@ -266,6 +273,7 @@ class ResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -282,6 +290,7 @@ class SkipConnection(nn.Module):
         self.fn = fn
         self.mode = mode
 
+    @typecheck
     def forward(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
         y = self.fn(x)
         return x + y if self.mode == "add" else torch.cat([x, y], dim=1)

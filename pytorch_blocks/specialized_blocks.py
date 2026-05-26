@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Complex, Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -33,6 +34,7 @@ class NeuralODE(nn.Module):
         self.t0 = t0
         self.t1 = t1
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B ..."]
     ) -> Float[Tensor, "B ..."]:
@@ -75,6 +77,7 @@ class SpectralConv2d(nn.Module):
     ) -> Complex[Tensor, "B C_out M_h M_w"]:
         return torch.einsum("bixy,ioxy->boxy", a, b)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -97,6 +100,7 @@ class FNOBlock(nn.Module):
         self.spectral = SpectralConv2d(channels, channels, modes_h, modes_w)
         self.skip = nn.Conv2d(channels, channels, 1)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H W"]:
@@ -134,6 +138,7 @@ class KANLayer(nn.Module):
         d = (x[..., None] - self.grid) / self.sigma
         return torch.exp(-0.5 * d ** 2)                                     # (..., G)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B D_in"]
     ) -> Float[Tensor, "B D_out"]:
@@ -147,6 +152,7 @@ class KANLayer(nn.Module):
 # Capsule networks
 # ---------------------------------------------------------------------------
 
+@typecheck
 def squash(
     s: Float[Tensor, "..."], dim: int = -1, eps: float = 1e-8
 ) -> Float[Tensor, "..."]:
@@ -171,6 +177,7 @@ class CapsuleLayer(nn.Module):
         self.iters = routing_iters
         self.W = nn.Parameter(torch.randn(num_out, num_in, dim_out, dim_in) * 0.1)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B N_in D_in"]
     ) -> Float[Tensor, "B N_out D_out"]:
@@ -185,6 +192,7 @@ class CapsuleLayer(nn.Module):
         return v
 
 
+@typecheck
 def dynamic_routing(
     votes: Float[Tensor, "B O I D"], num_iter: int = 3
 ) -> Float[Tensor, "B O D"]:
@@ -228,6 +236,7 @@ class SlotAttention(nn.Module):
         self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B N D"]
     ) -> Float[Tensor, "B K D"]:

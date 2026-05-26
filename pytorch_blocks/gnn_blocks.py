@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -67,6 +68,7 @@ class MessagePassing(nn.Module):
             return out.masked_fill(out == float("-inf"), 0.0)
         raise ValueError(self.aggregator)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "N D_in"],
@@ -92,6 +94,7 @@ class GraphConv(MessagePassing):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=True)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "N D_in"],
@@ -129,6 +132,7 @@ class GraphAttention(nn.Module):
         self.slope = negative_slope
         self.drop = nn.Dropout(dropout)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "N D_in"],

@@ -11,7 +11,8 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Float, Shaped
+from ._typecheck import typecheck
 
 from .attention_blocks import (
     MultiHeadAttention,
@@ -34,6 +35,7 @@ class FeedForward(nnx.Module):
         self.fc2 = nnx.Linear(hidden, dim, rngs=rngs)
         self.act = {"gelu": nnx.gelu, "relu": nnx.relu, "silu": nnx.silu}[activation]
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D"]
     ) -> Float[Array, "*B D"]:
@@ -50,6 +52,7 @@ class SwiGLU(nnx.Module):
         self.w2 = nnx.Linear(hidden, dim, use_bias=False, rngs=rngs)
         self.w3 = nnx.Linear(dim, hidden, use_bias=False, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D"]
     ) -> Float[Array, "*B D"]:
@@ -65,6 +68,7 @@ class GEGLU(nnx.Module):
         self.proj_in = nnx.Linear(dim, 2 * hidden, rngs=rngs)
         self.proj_out = nnx.Linear(hidden, dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D"]
     ) -> Float[Array, "*B D"]:
@@ -86,10 +90,11 @@ class TransformerEncoderBlock(nnx.Module):
         self.norm2 = nnx.LayerNorm(dim, rngs=rngs)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],
-        mask: Optional[Bool[Array, "..."]] = None,
+        mask: Optional[Shaped[Array, "..."]] = None,
     ) -> Float[Array, "B T D"]:
         x = x + self.attn(self.norm1(x), mask=mask)
         x = x + self.mlp(self.norm2(x))
@@ -109,11 +114,12 @@ class TransformerDecoderBlock(nnx.Module):
         self.norm3 = nnx.LayerNorm(dim, rngs=rngs)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],
         context: Optional[Float[Array, "B Tk D_ctx"]] = None,
-        mask: Optional[Bool[Array, "..."]] = None,
+        mask: Optional[Shaped[Array, "..."]] = None,
     ) -> Float[Array, "B T D"]:
         x = x + self.self_attn(self.norm1(x), mask=mask)
         if context is not None:
@@ -143,6 +149,7 @@ class MixtureOfExperts(nnx.Module):
         self.experts = [FeedForward(dim, hidden, rngs=rngs)
                         for _ in range(num_experts)]
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:

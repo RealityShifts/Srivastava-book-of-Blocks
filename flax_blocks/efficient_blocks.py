@@ -16,12 +16,14 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int8
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
 # Quantization
 # ---------------------------------------------------------------------------
 
+@typecheck
 def quantize_int8(
     weight: Float[Array, "D_in D_out"]
 ) -> tuple[Int8[Array, "D_in D_out"], Float[Array, "D_out"]]:
@@ -32,6 +34,7 @@ def quantize_int8(
     return q, scale.squeeze(0)
 
 
+@typecheck
 def dequantize_int8(
     qweight: Int8[Array, "D_in D_out"],
     scale: Float[Array, "D_out"],
@@ -63,6 +66,7 @@ class QuantizedLinearInt8(nnx.Module):
             layer.bias.value = linear.bias.value
         return layer
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -112,6 +116,7 @@ class QuantizedLinear4bit(nnx.Module):
         unpacked = unpacked.at[1::2].set(hi.astype(dtype))
         return unpacked * self.scale.value.astype(dtype)[None, :]
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -169,6 +174,7 @@ class TokenPruner(nnx.Module):
             raise ValueError("keep_ratio must be in (0, 1]")
         self.keep_ratio = keep_ratio
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],
@@ -205,6 +211,7 @@ class LowRankLinear(nnx.Module):
             layer.up.bias.value = linear.bias.value
         return layer
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -236,6 +243,7 @@ class ColumnParallelLinear(nnx.Module):
         self.fc = nnx.Linear(in_features, self.local_out, use_bias=use_bias,
                              rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_local_out"]:
@@ -254,6 +262,7 @@ class RowParallelLinear(nnx.Module):
         self.fc = nnx.Linear(self.local_in, out_features, use_bias=use_bias,
                              rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_local_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -272,5 +281,6 @@ class PipelineStage(nnx.Module):
         self.stage_id = stage_id
         self.num_stages = num_stages
 
+    @typecheck
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         return self.module(x)

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
+from ._typecheck import typecheck
 from torch import Tensor
 
 from .attention_blocks import CrossAttention
@@ -38,6 +39,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
 
+    @typecheck
     def forward(
         self, t: Int[Tensor, "B"]
     ) -> Float[Tensor, "B D"]:
@@ -65,6 +67,7 @@ class TimestepMLP(nn.Module):
             nn.Linear(hidden, hidden),
         )
 
+    @typecheck
     def forward(
         self, t: Int[Tensor, "B"]
     ) -> Float[Tensor, "B D_hidden"]:
@@ -87,6 +90,7 @@ class DownsampleBlock(nn.Module):
         else:
             raise ValueError(mode)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H_out W_out"]:
@@ -113,6 +117,7 @@ class UpsampleBlock(nn.Module):
         else:
             raise ValueError(mode)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H_out W_out"]:
@@ -137,6 +142,7 @@ class UNetResBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C_in H W"],
@@ -197,6 +203,7 @@ class UNet(nn.Module):
         self.out_norm = nn.GroupNorm(_gn_groups(c), c)
         self.out_conv = nn.Conv2d(c, out_ch, 3, 1, 1)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C_in H W"],
@@ -229,6 +236,7 @@ class NoisePredictor(nn.Module):
         super().__init__()
         self.backbone = backbone
 
+    @typecheck
     def forward(
         self,
         x_t: Float[Tensor, "B C H W"],
@@ -240,6 +248,7 @@ class NoisePredictor(nn.Module):
         return self.backbone(x_t, t, cond)
 
 
+@typecheck
 def classifier_free_guidance(
     eps_cond: Float[Tensor, "B C H W"],
     eps_uncond: Float[Tensor, "B C H W"],
@@ -276,6 +285,7 @@ class ControlNetBlock(nn.Module):
         )
         self.zero = ZeroConv2d(hidden * 2, out_ch)
 
+    @typecheck
     def forward(
         self, hint: Float[Tensor, "B C_hint H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -302,6 +312,7 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
         self.drop = nn.Dropout(dropout)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B D_in"]
     ) -> Float[Tensor, "*B D_out"]:
@@ -323,6 +334,7 @@ class LoRAConv2d(nn.Module):
         nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
         nn.init.zeros_(self.up.weight)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -345,6 +357,7 @@ class HyperNetwork(nn.Module):
             nn.Linear(hidden, in_dim * out_dim + out_dim),
         )
 
+    @typecheck
     def forward(
         self,
         code: Float[Tensor, "*B D_code"],
@@ -371,6 +384,7 @@ class IPAdapterCrossAttention(nn.Module):
         self.text_attn = CrossAttention(dim, text_dim, num_heads)
         self.image_attn = CrossAttention(dim, image_dim, num_heads)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B T D"],

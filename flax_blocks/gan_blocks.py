@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
+from ._typecheck import typecheck
 
 from .core_blocks import AdaIN  # noqa: F401  re-exported for completeness
 
@@ -39,6 +40,7 @@ class EqualLinear(nnx.Module):
         self.scale = gain / math.sqrt(in_features) * lr_mul
         self.lr_mul = lr_mul
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -64,6 +66,7 @@ class EqualConv2d(nnx.Module):
         fan_in = in_ch * kernel_size * kernel_size
         self.scale = gain / math.sqrt(fan_in)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -89,6 +92,7 @@ class GeneratorBlock(nnx.Module):
         self.conv = nnx.Conv(in_ch, out_ch, (3, 3), padding="SAME", rngs=rngs)
         self.norm = nnx.BatchNorm(out_ch, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -108,6 +112,7 @@ class DiscriminatorBlock(nnx.Module):
         self.norm = (nnx.GroupNorm(out_ch, num_groups=out_ch, rngs=rngs)
                      if use_norm else None)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H_out W_out C_out"]:
@@ -129,6 +134,7 @@ class MappingNetwork(nnx.Module):
         self.layers = [nnx.Linear(z_dim if i == 0 else w_dim, w_dim, rngs=rngs)
                        for i in range(num_layers)]
 
+    @typecheck
     def __call__(
         self, z: Float[Array, "B D_z"]
     ) -> Float[Array, "B D_w"]:
@@ -154,6 +160,7 @@ class ModulatedConv2d(nnx.Module):
         self.style = nnx.Linear(w_dim, in_ch, rngs=rngs)
         self.style.bias.value = jnp.ones_like(self.style.bias.value)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C_in"],
@@ -183,6 +190,7 @@ class StyleBlock(nnx.Module):
         self.noise_strength = nnx.Param(jnp.zeros(()))
         self.bias = nnx.Param(jnp.zeros((out_ch,)))
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B H W C_in"],
@@ -205,6 +213,7 @@ class MinibatchStdDev(nnx.Module):
     def __init__(self, group_size: int = 4) -> None:
         self.group_size = group_size
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C_out"]:
@@ -231,6 +240,7 @@ class ProgressiveGrowing(nnx.Module):
     def set_alpha(self, alpha: float) -> None:
         self.alpha = max(0.0, min(1.0, alpha))
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H_out W_out C_out"]:

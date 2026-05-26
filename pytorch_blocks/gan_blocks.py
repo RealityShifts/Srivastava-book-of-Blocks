@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -38,6 +39,7 @@ class EqualLinear(nn.Module):
         self.scale = gain / math.sqrt(in_features) * lr_mul
         self.lr_mul = lr_mul
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "*B D_in"]
     ) -> Float[Tensor, "*B D_out"]:
@@ -62,6 +64,7 @@ class EqualConv2d(nn.Module):
         fan_in = in_ch * kernel_size * kernel_size
         self.scale = gain / math.sqrt(fan_in)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -82,6 +85,7 @@ class GeneratorBlock(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.norm = nn.BatchNorm2d(out_ch)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -97,6 +101,7 @@ class DiscriminatorBlock(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, 4, stride, 1)
         self.norm = nn.InstanceNorm2d(out_ch, affine=True) if use_norm else nn.Identity()
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
@@ -118,6 +123,7 @@ class MappingNetwork(nn.Module):
                        nn.LeakyReLU(0.2, inplace=True)]
         self.net = nn.Sequential(*layers)
 
+    @typecheck
     def forward(
         self, z: Float[Tensor, "B D_z"]
     ) -> Float[Tensor, "B D_w"]:
@@ -135,6 +141,7 @@ class StyleBlock(nn.Module):
         self.noise_strength = nn.Parameter(torch.zeros(1))
         self.bias = nn.Parameter(torch.zeros(out_ch))
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C_in H W"],
@@ -160,6 +167,7 @@ class ModulatedConv2d(nn.Module):
         self.style = nn.Linear(w_dim, in_ch)
         nn.init.ones_(self.style.bias)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B C_in H W"],
@@ -192,6 +200,7 @@ class MinibatchStdDev(nn.Module):
         super().__init__()
         self.group_size = group_size
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -217,6 +226,7 @@ class ProgressiveGrowing(nn.Module):
     def set_alpha(self, alpha: float) -> None:
         self.alpha = max(0.0, min(1.0, alpha))
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:

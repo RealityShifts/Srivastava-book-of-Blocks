@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Complex, Float, PRNGKeyArray
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ class NeuralODE(nnx.Module):
         self.t0 = t0
         self.t1 = t1
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B *features"]
     ) -> Float[Array, "B *features"]:
@@ -77,6 +79,7 @@ class SpectralConv2d(nnx.Module):
     ) -> Complex[Array, "B mh mw C_out"]:
         return jnp.einsum("bxyi,xyio->bxyo", a, b)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C_in"]
     ) -> Float[Array, "B H W C_out"]:
@@ -101,6 +104,7 @@ class FNOBlock(nnx.Module):
                                        rngs=rngs)
         self.skip = nnx.Conv(channels, channels, (1, 1), rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B H W C"]
     ) -> Float[Array, "B H W C"]:
@@ -138,6 +142,7 @@ class KANLayer(nnx.Module):
         d = (x[..., None] - self.grid) / self.sigma
         return jnp.exp(-0.5 * d ** 2)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B D_in"]
     ) -> Float[Array, "B D_out"]:
@@ -151,6 +156,7 @@ class KANLayer(nnx.Module):
 # Capsule networks
 # ---------------------------------------------------------------------------
 
+@typecheck
 def squash(
     s: Float[Array, "..."], axis: int = -1, eps: float = 1e-8,
 ) -> Float[Array, "..."]:
@@ -176,6 +182,7 @@ class CapsuleLayer(nnx.Module):
             jax.random.normal(rngs.params(),
                               (num_out, num_in, dim_out, dim_in)) * 0.1)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B N_in D_in"]
     ) -> Float[Array, "B N_out D_out"]:
@@ -190,6 +197,7 @@ class CapsuleLayer(nnx.Module):
         return v
 
 
+@typecheck
 def dynamic_routing(
     votes: Float[Array, "B O I D"], num_iter: int = 3,
 ) -> Float[Array, "B O D"]:
@@ -235,6 +243,7 @@ class SlotAttention(nnx.Module):
         self.norm_slots = nnx.LayerNorm(dim, rngs=rngs)
         self.norm_pre_ff = nnx.LayerNorm(dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B T D"],

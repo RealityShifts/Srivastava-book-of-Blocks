@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -21,6 +22,7 @@ from torch import Tensor
 # VAE
 # ---------------------------------------------------------------------------
 
+@typecheck
 def reparameterize(
     mu: Float[Tensor, "..."], logvar: Float[Tensor, "..."]
 ) -> Float[Tensor, "..."]:
@@ -61,6 +63,7 @@ class VAE(nn.Module):
     ) -> Float[Tensor, "B C H W"]:
         return self.decoder(z)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> tuple[
@@ -99,6 +102,7 @@ class MaskedConv2d(nn.Conv2d):
         mask[:, :, kH // 2 + 1:] = 0
         self.register_buffer("mask", mask, persistent=False)
 
+    @typecheck
     def forward(                                                  # type: ignore[override]
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H W"]:
@@ -114,6 +118,7 @@ class AutoregressiveBlock(nn.Module):
         self.conv = MaskedConv2d("B", channels, 2 * channels, 3, padding=1)
         self.proj = MaskedConv2d("B", channels, channels, 1)
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B C H W"]
     ) -> Float[Tensor, "B C H W"]:
@@ -138,6 +143,7 @@ class AffineCouplingLayer(nn.Module):
             nn.Linear(hidden, 2 * (dim - self.half)),
         )
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B D"]
     ) -> tuple[Float[Tensor, "B D"], Float[Tensor, "B"]]:
@@ -167,6 +173,7 @@ class EnergyBasedModel(nn.Module):
         super().__init__()
         self.backbone = backbone
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B ..."]
     ) -> Float[Tensor, "B"]:

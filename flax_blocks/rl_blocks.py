@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ class _MLP(nnx.Module):
         self.layers = [nnx.Linear(dims[i], dims[i + 1], rngs=rngs)
                        for i in range(len(dims) - 1)]
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "*B D_in"]
     ) -> Float[Array, "*B D_out"]:
@@ -70,6 +72,7 @@ class PolicyNetwork(nnx.Module):
         std = jnp.exp(self.log_std.value)
         return out + std * jax.random.normal(key, out.shape)
 
+    @typecheck
     def __call__(
         self,
         s: Float[Array, "B D_state"],
@@ -85,6 +88,7 @@ class ValueNetwork(nnx.Module):
                  *, rngs: nnx.Rngs) -> None:
         self.net = _MLP([state_dim, *hidden, 1], rngs=rngs)
 
+    @typecheck
     def __call__(
         self, s: Float[Array, "B D_state"]
     ) -> Float[Array, "B"]:
@@ -99,6 +103,7 @@ class QNetwork(nnx.Module):
                  *, rngs: nnx.Rngs) -> None:
         self.net = _MLP([state_dim, *hidden, action_dim], rngs=rngs)
 
+    @typecheck
     def __call__(
         self, s: Float[Array, "B D_state"]
     ) -> Float[Array, "B D_action"]:
@@ -118,6 +123,7 @@ class ActorCritic(nnx.Module):
         if not discrete:
             self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
+    @typecheck
     def __call__(
         self, s: Float[Array, "B D_state"]
     ) -> tuple[Float[Array, "B D_action"], Float[Array, "B"]]:
@@ -170,5 +176,6 @@ class TargetNetwork(nnx.Module):
             tgt_state, src_state)
         nnx.update(self.target, new_state)
 
+    @typecheck
     def __call__(self, *args, **kwargs):
         return self.target(*args, **kwargs)

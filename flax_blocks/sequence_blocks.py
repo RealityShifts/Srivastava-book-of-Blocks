@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
+from ._typecheck import typecheck
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ class RNNCell(nnx.Module):
         self.W_ih = nnx.Linear(in_dim, hidden, rngs=rngs)
         self.W_hh = nnx.Linear(hidden, hidden, use_bias=False, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B D_in"],
@@ -42,6 +44,7 @@ class LSTMCell(nnx.Module):
         self.hidden = hidden
         self.W = nnx.Linear(in_dim + hidden, 4 * hidden, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B D_in"],
@@ -65,6 +68,7 @@ class GRUCell(nnx.Module):
         self.x2h = nnx.Linear(in_dim, 3 * hidden, rngs=rngs)
         self.h2h = nnx.Linear(hidden, 3 * hidden, rngs=rngs)
 
+    @typecheck
     def __call__(
         self,
         x: Float[Array, "B D_in"],
@@ -78,6 +82,7 @@ class GRUCell(nnx.Module):
         return (1 - z) * n + z * h
 
 
+@typecheck
 def run_recurrent(
     cell: nnx.Module,
     x: Float[Array, "B T D_in"],
@@ -119,6 +124,7 @@ class StateSpaceModel(nnx.Module):
         self.D = nnx.Param(jnp.zeros((dim,)))
         self.log_dt = nnx.Param(jnp.zeros((dim,)))
 
+    @typecheck
     def __call__(
         self, u: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:
@@ -143,6 +149,7 @@ class StateSpaceModel(nnx.Module):
 # Selective scan (Mamba)
 # ---------------------------------------------------------------------------
 
+@typecheck
 def selective_scan(
     u: Float[Array, "B T D"],
     delta: Float[Array, "B T D"],
@@ -194,6 +201,7 @@ class MambaBlock(nnx.Module):
         self.D = nnx.Param(jnp.ones((inner,)))
         self.out_proj = nnx.Linear(inner, dim, rngs=rngs)
 
+    @typecheck
     def __call__(
         self, x: Float[Array, "B T D"]
     ) -> Float[Array, "B T D"]:

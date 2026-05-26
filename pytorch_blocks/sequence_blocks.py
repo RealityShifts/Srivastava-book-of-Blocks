@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float
+from ._typecheck import typecheck
 from torch import Tensor
 
 
@@ -28,6 +29,7 @@ class RNNCell(nn.Module):
         self.W_ih = nn.Linear(in_dim, hidden)
         self.W_hh = nn.Linear(hidden, hidden, bias=False)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B D_in"],
@@ -44,6 +46,7 @@ class LSTMCell(nn.Module):
         self.hidden = hidden
         self.W = nn.Linear(in_dim + hidden, 4 * hidden)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B D_in"],
@@ -68,6 +71,7 @@ class GRUCell(nn.Module):
         self.x2h = nn.Linear(in_dim, 3 * hidden)
         self.h2h = nn.Linear(hidden, 3 * hidden)
 
+    @typecheck
     def forward(
         self,
         x: Float[Tensor, "B D_in"],
@@ -81,6 +85,7 @@ class GRUCell(nn.Module):
         return (1 - z) * n + z * h
 
 
+@typecheck
 def run_recurrent(
     cell: nn.Module,
     x: Float[Tensor, "B T D"],
@@ -128,6 +133,7 @@ class StateSpaceModel(nn.Module):
         self.D = nn.Parameter(torch.zeros(dim))
         self.log_dt = nn.Parameter(torch.zeros(dim))
 
+    @typecheck
     def forward(
         self, u: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
@@ -150,6 +156,7 @@ class StateSpaceModel(nn.Module):
 # Selective-scan (Mamba)
 # ---------------------------------------------------------------------------
 
+@typecheck
 def selective_scan(
     u: Float[Tensor, "B T D"],
     delta: Float[Tensor, "B T D"],
@@ -200,6 +207,7 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(inner, dim)
         self.state_dim = state_dim
 
+    @typecheck
     def forward(
         self, x: Float[Tensor, "B T D"]
     ) -> Float[Tensor, "B T D"]:
