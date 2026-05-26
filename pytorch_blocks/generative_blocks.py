@@ -13,13 +13,17 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
 # VAE
 # ---------------------------------------------------------------------------
 
-def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+def reparameterize(
+    mu: Float[Tensor, "..."], logvar: Float[Tensor, "..."]
+) -> Float[Tensor, "..."]:
     """``z = mu + sigma * eps``,  ``eps ~ N(0, I)``."""
     std = (0.5 * logvar).exp()
     return mu + std * torch.randn_like(std)
@@ -46,20 +50,32 @@ class VAE(nn.Module):
         dec += [nn.ConvTranspose2d(c, in_ch, 4, 2, 1)]
         self.decoder = nn.Sequential(*dec)
 
-    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> tuple[Float[Tensor, "B Z H_z W_z"], Float[Tensor, "B Z H_z W_z"]]:
         h = self.encoder(x)
         return self.fc_mu(h), self.fc_lv(h)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self, z: Float[Tensor, "B Z H_z W_z"]
+    ) -> Float[Tensor, "B C H W"]:
         return self.decoder(z)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> tuple[
+        Float[Tensor, "B C H W"],
+        Float[Tensor, "B Z H_z W_z"],
+        Float[Tensor, "B Z H_z W_z"],
+    ]:
         mu, lv = self.encode(x)
         z = reparameterize(mu, lv)
         return self.decode(z), mu, lv
 
     @staticmethod
-    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    def kl_loss(
+        mu: Float[Tensor, "..."], logvar: Float[Tensor, "..."]
+    ) -> Float[Tensor, ""]:
         return -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
 
 
@@ -83,7 +99,9 @@ class MaskedConv2d(nn.Conv2d):
         mask[:, :, kH // 2 + 1:] = 0
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:           # type: ignore[override]
+    def forward(                                                  # type: ignore[override]
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         self.weight.data.mul_(self.mask)
         return super().forward(x)
 
@@ -96,7 +114,9 @@ class AutoregressiveBlock(nn.Module):
         self.conv = MaskedConv2d("B", channels, 2 * channels, 3, padding=1)
         self.proj = MaskedConv2d("B", channels, channels, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H W"]:
         a, b = self.conv(x).chunk(2, dim=1)
         return x + self.proj(torch.tanh(a) * torch.sigmoid(b))
 
@@ -118,14 +138,18 @@ class AffineCouplingLayer(nn.Module):
             nn.Linear(hidden, 2 * (dim - self.half)),
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: Float[Tensor, "B D"]
+    ) -> tuple[Float[Tensor, "B D"], Float[Tensor, "B"]]:
         x1, x2 = x[:, :self.half], x[:, self.half:]
         s, t = self.net(x1).chunk(2, dim=-1)
         s = torch.tanh(s)
         y2 = x2 * s.exp() + t
         return torch.cat([x1, y2], dim=-1), s.sum(-1)             # log|det J| = sum s
 
-    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+    def inverse(
+        self, y: Float[Tensor, "B D"]
+    ) -> Float[Tensor, "B D"]:
         y1, y2 = y[:, :self.half], y[:, self.half:]
         s, t = self.net(y1).chunk(2, dim=-1)
         x2 = (y2 - t) * (-torch.tanh(s)).exp()
@@ -143,11 +167,18 @@ class EnergyBasedModel(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B ..."]
+    ) -> Float[Tensor, "B"]:
         return self.backbone(x).flatten(1).sum(-1)
 
-    def langevin_sample(self, x: torch.Tensor, steps: int = 60,
-                        step_size: float = 10.0, noise: float = 0.005) -> torch.Tensor:
+    def langevin_sample(
+        self,
+        x: Float[Tensor, "B ..."],
+        steps: int = 60,
+        step_size: float = 10.0,
+        noise: float = 0.005,
+    ) -> Float[Tensor, "B ..."]:
         """Stochastic gradient Langevin dynamics for sampling."""
         x = x.detach().requires_grad_(True)
         for _ in range(steps):
@@ -176,15 +207,24 @@ class DDPMScheduler(nn.Module):
         self.register_buffer("alpha_bar", alpha_bar)
         self.num_steps = num_steps
 
-    def add_noise(self, x0: torch.Tensor, t: torch.Tensor,
-                  noise: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def add_noise(
+        self,
+        x0: Float[Tensor, "B C H W"],
+        t: Int[Tensor, "B"],
+        noise: Optional[Float[Tensor, "B C H W"]] = None,
+    ) -> tuple[Float[Tensor, "B C H W"], Float[Tensor, "B C H W"]]:
         if noise is None:
             noise = torch.randn_like(x0)
         a = self.alpha_bar[t][:, None, None, None]
         return a.sqrt() * x0 + (1 - a).sqrt() * noise, noise
 
     @torch.no_grad()
-    def step(self, eps: torch.Tensor, t: int, x_t: torch.Tensor) -> torch.Tensor:
+    def step(
+        self,
+        eps: Float[Tensor, "B C H W"],
+        t: int,
+        x_t: Float[Tensor, "B C H W"],
+    ) -> Float[Tensor, "B C H W"]:
         beta = self.betas[t]
         alpha = self.alphas[t]
         alpha_bar = self.alpha_bar[t]
@@ -199,8 +239,14 @@ class DDIMScheduler(DDPMScheduler):
     """Deterministic DDIM step (Song et al. 2020)."""
 
     @torch.no_grad()
-    def step(self, eps: torch.Tensor, t: int, x_t: torch.Tensor,             # type: ignore[override]
-             eta: float = 0.0, prev_t: Optional[int] = None) -> torch.Tensor:
+    def step(                                                                # type: ignore[override]
+        self,
+        eps: Float[Tensor, "B C H W"],
+        t: int,
+        x_t: Float[Tensor, "B C H W"],
+        eta: float = 0.0,
+        prev_t: Optional[int] = None,
+    ) -> Float[Tensor, "B C H W"]:
         prev_t = max(t - 1, 0) if prev_t is None else prev_t
         a_t = self.alpha_bar[t]
         a_p = self.alpha_bar[prev_t] if prev_t >= 0 else torch.tensor(1.0,

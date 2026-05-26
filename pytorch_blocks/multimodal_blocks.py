@@ -10,6 +10,8 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
+from jaxtyping import Float
+from torch import Tensor
 
 from .attention_blocks import CrossAttention, MultiHeadAttention
 from .transformer_blocks import TransformerEncoderBlock, FeedForward
@@ -34,11 +36,15 @@ class CLIPEncoder(nn.Module):
         self.vision_proj = nn.Linear(vision_dim, embed_dim, bias=False)
         self.text_proj = nn.Linear(text_dim, embed_dim, bias=False)
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+    def encode_image(
+        self, image: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B D"]:
         return torch.nn.functional.normalize(
             self.vision_proj(self.vision_encoder(image)), dim=-1)
 
-    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
+    def encode_text(
+        self, text: Tensor
+    ) -> Float[Tensor, "B D"]:
         return torch.nn.functional.normalize(
             self.text_proj(self.text_encoder(text)), dim=-1)
 
@@ -64,7 +70,9 @@ class PerceiverResampler(nn.Module):
             ]))
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B K D"]:
         B = x.shape[0]
         latents = self.latents.expand(B, -1, -1)
         for n1, attn, n2, ffn in self.layers:
@@ -106,7 +114,9 @@ class QFormer(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, llm_dim)
 
-    def forward(self, image_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, image_feats: Float[Tensor, "B T D_img"]
+    ) -> Float[Tensor, "B Q D_llm"]:
         B = image_feats.shape[0]
         q = self.queries.expand(B, -1, -1)
         for n1, sa, n2, ca, n3, ffn in self.layers:
@@ -161,5 +171,9 @@ class MemoryAttention(nn.Module):
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(mem_dim or dim)
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        memory: Float[Tensor, "B M D_mem"],
+    ) -> Float[Tensor, "B T D"]:
         return x + self.attn(self.norm_q(x), self.norm_kv(memory))

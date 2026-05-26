@@ -14,6 +14,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -28,15 +30,27 @@ class MessagePassing(nn.Module):
 
     aggregator: str = "sum"
 
-    def message(self, x_src: torch.Tensor, x_dst: torch.Tensor,
-                edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def message(
+        self,
+        x_src: Float[Tensor, "E D"],
+        x_dst: Float[Tensor, "E D"],
+        edge_attr: Optional[Float[Tensor, "E D_e"]] = None,
+    ) -> Float[Tensor, "E D"]:
         return x_src
 
-    def update(self, aggr: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def update(
+        self,
+        aggr: Float[Tensor, "N D"],
+        x: Float[Tensor, "N D_in"],
+    ) -> Float[Tensor, "N D"]:
         return aggr
 
-    def aggregate(self, msg: torch.Tensor, dst: torch.Tensor,
-                  num_nodes: int) -> torch.Tensor:
+    def aggregate(
+        self,
+        msg: Float[Tensor, "E D"],
+        dst: Int[Tensor, "E"],
+        num_nodes: int,
+    ) -> Float[Tensor, "N D"]:
         out = torch.zeros(num_nodes, msg.shape[-1],
                           device=msg.device, dtype=msg.dtype)
         if self.aggregator == "sum":
@@ -53,8 +67,12 @@ class MessagePassing(nn.Module):
             return out.masked_fill(out == float("-inf"), 0.0)
         raise ValueError(self.aggregator)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
-                edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "N D_in"],
+        edge_index: Int[Tensor, "2 E"],
+        edge_attr: Optional[Float[Tensor, "E D_e"]] = None,
+    ) -> Float[Tensor, "N D"]:
         src, dst = edge_index
         msg = self.message(x[src], x[dst], edge_attr)
         aggr = self.aggregate(msg, dst, x.shape[0])
@@ -74,8 +92,12 @@ class GraphConv(MessagePassing):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=True)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
-                edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "N D_in"],
+        edge_index: Int[Tensor, "2 E"],
+        edge_attr: Optional[Float[Tensor, "E D_e"]] = None,
+    ) -> Float[Tensor, "N D_out"]:
         x = self.lin(x)
         src, dst = edge_index
         deg = torch.zeros(x.shape[0], device=x.device).index_add_(
@@ -107,7 +129,11 @@ class GraphAttention(nn.Module):
         self.slope = negative_slope
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "N D_in"],
+        edge_index: Int[Tensor, "2 E"],
+    ) -> Float[Tensor, "N D_out"]:
         N = x.shape[0]
         h = self.lin(x).view(N, self.heads, self.out_dim)
         src, dst = edge_index

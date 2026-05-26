@@ -12,6 +12,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +28,11 @@ class RNNCell(nn.Module):
         self.W_ih = nn.Linear(in_dim, hidden)
         self.W_hh = nn.Linear(hidden, hidden, bias=False)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B D_in"],
+        h: Float[Tensor, "B D_h"],
+    ) -> Float[Tensor, "B D_h"]:
         return torch.tanh(self.W_ih(x) + self.W_hh(h))
 
 
@@ -38,8 +44,11 @@ class LSTMCell(nn.Module):
         self.hidden = hidden
         self.W = nn.Linear(in_dim + hidden, 4 * hidden)
 
-    def forward(self, x: torch.Tensor,
-                state: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: Float[Tensor, "B D_in"],
+        state: tuple[Float[Tensor, "B D_h"], Float[Tensor, "B D_h"]],
+    ) -> tuple[Float[Tensor, "B D_h"], Float[Tensor, "B D_h"]]:
         h, c = state
         gates = self.W(torch.cat([x, h], dim=-1))
         i, f, g, o = gates.chunk(4, dim=-1)
@@ -59,7 +68,11 @@ class GRUCell(nn.Module):
         self.x2h = nn.Linear(in_dim, 3 * hidden)
         self.h2h = nn.Linear(hidden, 3 * hidden)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B D_in"],
+        h: Float[Tensor, "B D_h"],
+    ) -> Float[Tensor, "B D_h"]:
         xz, xr, xn = self.x2h(x).chunk(3, dim=-1)
         hz, hr, hn = self.h2h(h).chunk(3, dim=-1)
         z = torch.sigmoid(xz + hz)
@@ -68,8 +81,11 @@ class GRUCell(nn.Module):
         return (1 - z) * n + z * h
 
 
-def run_recurrent(cell: nn.Module, x: torch.Tensor,
-                  state: Optional[object] = None) -> torch.Tensor:
+def run_recurrent(
+    cell: nn.Module,
+    x: Float[Tensor, "B T D"],
+    state: Optional[object] = None,
+) -> Float[Tensor, "B T D_h"]:
     """Apply ``cell`` along the time dimension of ``x: (B, T, D)``."""
     outs = []
     for t in range(x.shape[1]):
@@ -112,7 +128,9 @@ class StateSpaceModel(nn.Module):
         self.D = nn.Parameter(torch.zeros(dim))
         self.log_dt = nn.Parameter(torch.zeros(dim))
 
-    def forward(self, u: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, u: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         B, T, D = u.shape
         dt = self.log_dt.exp()                                  # (D,)
         A = -self.A_log.exp()                                   # (D, S)
@@ -132,8 +150,13 @@ class StateSpaceModel(nn.Module):
 # Selective-scan (Mamba)
 # ---------------------------------------------------------------------------
 
-def selective_scan(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor,
-                   B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+def selective_scan(
+    u: Float[Tensor, "B T D"],
+    delta: Float[Tensor, "B T D"],
+    A: Float[Tensor, "D N"],
+    B: Float[Tensor, "B T N"],
+    C: Float[Tensor, "B T N"],
+) -> Float[Tensor, "B T D"]:
     """Sequential selective scan: ``x_t = exp(d*A) x_{t-1} + d*B u_t``.
 
     All tensors are time/batch-dependent (the "selective" part).
@@ -177,7 +200,9 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(inner, dim)
         self.state_dim = state_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         B, T, _ = x.shape
         xz = self.in_proj(x)
         x_in, gate = xz.chunk(2, dim=-1)

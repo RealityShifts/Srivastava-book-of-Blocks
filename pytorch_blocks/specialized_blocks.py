@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Complex, Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +33,9 @@ class NeuralODE(nn.Module):
         self.t0 = t0
         self.t1 = t1
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B ..."]
+    ) -> Float[Tensor, "B ..."]:
         dt = (self.t1 - self.t0) / self.num_steps
         t = torch.full((x.shape[0],), self.t0, device=x.device, dtype=x.dtype)
         h = x
@@ -65,10 +69,15 @@ class SpectralConv2d(nn.Module):
                                                    dtype=torch.cfloat))
 
     @staticmethod
-    def _compl_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def _compl_mul(
+        a: Complex[Tensor, "B C_in M_h M_w"],
+        b: Complex[Tensor, "C_in C_out M_h M_w"],
+    ) -> Complex[Tensor, "B C_out M_h M_w"]:
         return torch.einsum("bixy,ioxy->boxy", a, b)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         B, _, H, W = x.shape
         x_ft = torch.fft.rfft2(x, norm="ortho")
         out_ft = torch.zeros(B, self.out_ch, H, W // 2 + 1,
@@ -88,7 +97,9 @@ class FNOBlock(nn.Module):
         self.spectral = SpectralConv2d(channels, channels, modes_h, modes_w)
         self.skip = nn.Conv2d(channels, channels, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H W"]:
         return F.gelu(self.spectral(x) + self.skip(x))
 
 
@@ -116,12 +127,16 @@ class KANLayer(nn.Module):
         sigma = (grid_range[1] - grid_range[0]) / (num_grid - 1)
         self.register_buffer("sigma", torch.tensor(sigma), persistent=False)
 
-    def _basis(self, x: torch.Tensor) -> torch.Tensor:
+    def _basis(
+        self, x: Float[Tensor, "B D_in"]
+    ) -> Float[Tensor, "B D_in G"]:
         # Gaussian RBF basis - simpler and differentiable substitute for B-splines
         d = (x[..., None] - self.grid) / self.sigma
         return torch.exp(-0.5 * d ** 2)                                     # (..., G)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B D_in"]
+    ) -> Float[Tensor, "B D_out"]:
         base = F.linear(F.silu(x), self.base_w)
         rbf = self._basis(x)                                                # (B, in_dim, G)
         spline = torch.einsum("bif,oif->bo", rbf, self.coeff)
@@ -132,7 +147,9 @@ class KANLayer(nn.Module):
 # Capsule networks
 # ---------------------------------------------------------------------------
 
-def squash(s: torch.Tensor, dim: int = -1, eps: float = 1e-8) -> torch.Tensor:
+def squash(
+    s: Float[Tensor, "..."], dim: int = -1, eps: float = 1e-8
+) -> Float[Tensor, "..."]:
     """Sabour et al. 2017 - non-linear "squash" that keeps direction but compresses norm."""
     norm_sq = s.pow(2).sum(dim=dim, keepdim=True)
     norm = norm_sq.sqrt() + eps
@@ -154,7 +171,9 @@ class CapsuleLayer(nn.Module):
         self.iters = routing_iters
         self.W = nn.Parameter(torch.randn(num_out, num_in, dim_out, dim_in) * 0.1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B N_in D_in"]
+    ) -> Float[Tensor, "B N_out D_out"]:
         B = x.shape[0]
         u_hat = torch.einsum("oidp,bip->boid", self.W, x)                   # (B, O, I, D_out)
         b = torch.zeros(B, self.num_out, self.num_in, device=x.device)
@@ -166,7 +185,9 @@ class CapsuleLayer(nn.Module):
         return v
 
 
-def dynamic_routing(votes: torch.Tensor, num_iter: int = 3) -> torch.Tensor:
+def dynamic_routing(
+    votes: Float[Tensor, "B O I D"], num_iter: int = 3
+) -> Float[Tensor, "B O D"]:
     """Standalone dynamic routing on pre-computed votes ``(B, O, I, D)``."""
     B, O, I, _ = votes.shape
     b = torch.zeros(B, O, I, device=votes.device)
@@ -207,7 +228,9 @@ class SlotAttention(nn.Module):
         self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B N D"]
+    ) -> Float[Tensor, "B K D"]:
         B, N, D = x.shape
         x = self.norm_input(x)
         k, v = self.to_k(x), self.to_v(x)

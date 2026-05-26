@@ -13,6 +13,8 @@ from typing import Iterable, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +41,9 @@ class PolicyNetwork(nn.Module):
         if not discrete:
             self.log_std = nn.Parameter(torch.zeros(action_dim))
 
-    def forward(self, s: torch.Tensor) -> torch.distributions.Distribution:
+    def forward(
+        self, s: Float[Tensor, "B D_s"]
+    ) -> torch.distributions.Distribution:
         out = self.body(s)
         if self.discrete:
             return torch.distributions.Categorical(logits=out)
@@ -53,7 +57,9 @@ class ValueNetwork(nn.Module):
         super().__init__()
         self.net = _mlp([state_dim, *hidden, 1])
 
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, s: Float[Tensor, "B D_s"]
+    ) -> Float[Tensor, "B"]:
         return self.net(s).squeeze(-1)
 
 
@@ -65,7 +71,9 @@ class QNetwork(nn.Module):
         super().__init__()
         self.net = _mlp([state_dim, *hidden, action_dim])
 
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, s: Float[Tensor, "B D_s"]
+    ) -> Float[Tensor, "B D_a"]:
         return self.net(s)
 
 
@@ -82,7 +90,9 @@ class ActorCritic(nn.Module):
         if not discrete:
             self.log_std = nn.Parameter(torch.zeros(action_dim))
 
-    def forward(self, s: torch.Tensor) -> tuple[torch.distributions.Distribution, torch.Tensor]:
+    def forward(
+        self, s: Float[Tensor, "B D_s"]
+    ) -> tuple[torch.distributions.Distribution, Float[Tensor, "B"]]:
         h = self.torso(s)
         logits = self.actor_head(h)
         v = self.critic_head(h).squeeze(-1)
@@ -112,7 +122,7 @@ class ReplayBuffer:
     def extend(self, transitions: Iterable[tuple]) -> None:
         self.buffer.extend(transitions)
 
-    def sample(self, batch: int) -> tuple[torch.Tensor, ...]:
+    def sample(self, batch: int) -> tuple[Tensor, ...]:
         items = random.sample(self.buffer, batch)
         cols = list(zip(*items))
         return tuple(torch.as_tensor(c) for c in cols)

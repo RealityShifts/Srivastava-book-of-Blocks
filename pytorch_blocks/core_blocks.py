@@ -14,6 +14,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +66,9 @@ class ConvBlock(nn.Module):
         self.norm = _build_norm2d(norm, out_ch)
         self.act = get_activation(activation)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.act(self.norm(self.conv(x)))
 
 
@@ -81,7 +85,9 @@ class DepthwiseSeparableConv2d(nn.Module):
         )
         self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.pointwise(self.depthwise(x))
 
 
@@ -121,7 +127,9 @@ class Conv3d(nn.Conv3d):
 class Mish(nn.Module):
     """Mish activation: ``x * tanh(softplus(x))``."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
+    def forward(  # noqa: D401
+        self, x: Float[Tensor, "..."]
+    ) -> Float[Tensor, "..."]:
         return x * torch.tanh(F.softplus(x))
 
 
@@ -160,7 +168,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "... D"]
+    ) -> Float[Tensor, "... D"]:
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return self.weight * (x * rms)
 
@@ -176,7 +186,11 @@ class AdaIN(nn.Module):
         self.norm = nn.InstanceNorm2d(num_features, affine=False)
         self.fc = nn.Linear(style_dim, num_features * 2)
 
-    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C H W"],
+        style: Float[Tensor, "B D_style"],
+    ) -> Float[Tensor, "B C H W"]:
         h = self.fc(style)
         gamma, beta = h.chunk(2, dim=-1)
         return (1 + gamma[:, :, None, None]) * self.norm(x) + beta[:, :, None, None]
@@ -193,7 +207,11 @@ class SPADE(nn.Module):
         self.gamma = nn.Conv2d(hidden, num_features, 3, padding=1)
         self.beta = nn.Conv2d(hidden, num_features, 3, padding=1)
 
-    def forward(self, x: torch.Tensor, segmap: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C H W"],
+        segmap: Float[Tensor, "B C_seg H_seg W_seg"],
+    ) -> Float[Tensor, "B C H W"]:
         seg = F.interpolate(segmap, size=x.shape[-2:], mode="nearest")
         actv = self.shared(seg)
         return self.norm(x) * (1 + self.gamma(actv)) + self.beta(actv)
@@ -248,7 +266,9 @@ class ResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.act(self.conv2(self.conv1(x)) + self.shortcut(x))
 
 
@@ -262,6 +282,6 @@ class SkipConnection(nn.Module):
         self.fn = fn
         self.mode = mode
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
         y = self.fn(x)
         return x + y if self.mode == "add" else torch.cat([x, y], dim=1)

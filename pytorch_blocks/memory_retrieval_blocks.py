@@ -11,6 +11,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +31,9 @@ class ExternalMemory(nn.Module):
         self.keys = nn.Parameter(torch.randn(num_slots, key_dim) * 0.02)
         self.values = nn.Parameter(torch.randn(num_slots, value_dim) * 0.02)
 
-    def forward(self, query: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, query: Float[Tensor, "*B D_k"]
+    ) -> Float[Tensor, "*B D_v"]:
         q = F.normalize(query, dim=-1)
         k = F.normalize(self.keys, dim=-1)
         weights = torch.softmax(q @ k.T, dim=-1)
@@ -44,17 +48,21 @@ class VectorStore:
     """Tiny in-memory vector store with cosine top-k search."""
 
     def __init__(self) -> None:
-        self.embeddings: Optional[torch.Tensor] = None
+        self.embeddings: Optional[Float[Tensor, "N D"]] = None
         self.documents: list = []
 
-    def add(self, embeddings: torch.Tensor, documents: list) -> None:
+    def add(
+        self, embeddings: Float[Tensor, "N D"], documents: list
+    ) -> None:
         if self.embeddings is None:
             self.embeddings = embeddings
         else:
             self.embeddings = torch.cat([self.embeddings, embeddings], dim=0)
         self.documents.extend(documents)
 
-    def search(self, query: torch.Tensor, k: int = 4) -> tuple[torch.Tensor, list]:
+    def search(
+        self, query: Float[Tensor, "Q D"], k: int = 4
+    ) -> tuple[Float[Tensor, "Q K"], list]:
         assert self.embeddings is not None and len(self.documents) > 0
         q = F.normalize(query, dim=-1)
         e = F.normalize(self.embeddings, dim=-1)
@@ -71,7 +79,7 @@ class RAGModule(nn.Module):
     (text -> text) callable; this class only orchestrates retrieval.
     """
 
-    def __init__(self, encoder: Callable[[list[str]], torch.Tensor],
+    def __init__(self, encoder: Callable[[list[str]], Float[Tensor, "Q D"]],
                  generator: Callable[[str], str], top_k: int = 4) -> None:
         super().__init__()
         self.encoder = encoder
@@ -104,11 +112,15 @@ class KVCache:
     """
 
     def __init__(self, num_layers: int) -> None:
-        self.k: list[Optional[torch.Tensor]] = [None] * num_layers
-        self.v: list[Optional[torch.Tensor]] = [None] * num_layers
+        self.k: list[Optional[Float[Tensor, "B H T D"]]] = [None] * num_layers
+        self.v: list[Optional[Float[Tensor, "B H T D"]]] = [None] * num_layers
 
-    def update(self, layer: int, k: torch.Tensor,
-               v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def update(
+        self,
+        layer: int,
+        k: Float[Tensor, "B H T_new D"],
+        v: Float[Tensor, "B H T_new D"],
+    ) -> tuple[Float[Tensor, "B H T D"], Float[Tensor, "B H T D"]]:
         if self.k[layer] is None:
             self.k[layer], self.v[layer] = k, v
         else:

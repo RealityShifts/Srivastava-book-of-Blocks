@@ -13,6 +13,8 @@ from typing import Callable, Iterable
 
 import torch
 import torch.nn as nn
+from jaxtyping import Float
+from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -133,8 +135,9 @@ from torch.optim.lr_scheduler import OneCycleLR  # noqa: E402,F401
 # Gradient clipping
 # ---------------------------------------------------------------------------
 
-def clip_grad_norm(parameters: Iterable[nn.Parameter],
-                   max_norm: float = 1.0) -> torch.Tensor:
+def clip_grad_norm(
+    parameters: Iterable[nn.Parameter], max_norm: float = 1.0
+) -> Float[Tensor, ""]:
     """Thin alias for :func:`torch.nn.utils.clip_grad_norm_`."""
     return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
 
@@ -180,7 +183,9 @@ class MixedPrecisionTrainer:
         self.dtype = dtype
         self.max_grad_norm = max_grad_norm
 
-    def step(self, loss_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+    def step(
+        self, loss_fn: Callable[[], Float[Tensor, ""]]
+    ) -> Float[Tensor, ""]:
         self.optim.zero_grad(set_to_none=True)
         with torch.autocast(device_type=self.device_type, dtype=self.dtype):
             loss = loss_fn()
@@ -207,7 +212,9 @@ def checkpointed(module: nn.Module, *args, use_reentrant: bool = False, **kwargs
 class CheckpointedSequential(nn.Sequential):
     """Sequential that runs each submodule under :func:`torch.utils.checkpoint`."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:                    # type: ignore[override]
+    def forward(                                                           # type: ignore[override]
+        self, x: Float[Tensor, "..."]
+    ) -> Float[Tensor, "..."]:
         for m in self:
             x = torch.utils.checkpoint.checkpoint(m, x, use_reentrant=False)
         return x

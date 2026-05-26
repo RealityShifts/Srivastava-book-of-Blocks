@@ -11,6 +11,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Bool, Float, Int
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +27,9 @@ class PatchEmbedding(nn.Module):
         self.patch_size = patch_size
         self.proj = nn.Conv2d(in_ch, dim, patch_size, patch_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B N D"]:
         x = self.proj(x)                                       # (B, D, H/p, W/p)
         return x.flatten(2).transpose(1, 2)                    # (B, N, D)
 
@@ -38,7 +42,9 @@ class CLSToken(nn.Module):
         self.token = nn.Parameter(torch.zeros(1, 1, dim))
         nn.init.trunc_normal_(self.token, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B N D"]
+    ) -> Float[Tensor, "B N1 D"]:
         cls = self.token.expand(x.shape[0], -1, -1)
         return torch.cat([cls, x], dim=1)
 
@@ -47,14 +53,18 @@ class CLSToken(nn.Module):
 # Swin window attention
 # ---------------------------------------------------------------------------
 
-def _window_partition(x: torch.Tensor, w: int) -> torch.Tensor:
+def _window_partition(
+    x: Float[Tensor, "B H W C"], w: int
+) -> Float[Tensor, "BnW WW C"]:
     """``(B, H, W, C) -> (B*nW, w*w, C)``."""
     B, H, W, C = x.shape
     x = x.view(B, H // w, w, W // w, w, C)
     return x.permute(0, 1, 3, 2, 4, 5).reshape(-1, w * w, C)
 
 
-def _window_reverse(windows: torch.Tensor, w: int, H: int, W: int) -> torch.Tensor:
+def _window_reverse(
+    windows: Float[Tensor, "BnW WW C"], w: int, H: int, W: int
+) -> Float[Tensor, "B H W C"]:
     B = windows.shape[0] // (H * W // (w * w))
     x = windows.view(B, H // w, W // w, w, w, -1)
     return x.permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, -1)
@@ -85,8 +95,11 @@ class SwinWindowAttention(nn.Module):
         self.register_buffer("rel_index", rel.sum(-1), persistent=False)
         nn.init.trunc_normal_(self.rel_bias, std=0.02)
 
-    def forward(self, x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "BnW N D"],
+        mask: Optional[Float[Tensor, "nW N N"]] = None,
+    ) -> Float[Tensor, "BnW N D"]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
@@ -136,7 +149,9 @@ class ShiftedWindowAttention(nn.Module):
         else:
             self.attn_mask = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B N D"]
+    ) -> Float[Tensor, "B N D"]:
         B, N, C = x.shape
         H, W = self.input_resolution
         assert N == H * W
@@ -166,7 +181,13 @@ class MaskedImageModeling(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.decoder = nn.Linear(dim, patch_size * patch_size * in_ch)
 
-    def random_masking(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def random_masking(
+        self, x: Float[Tensor, "B N D"]
+    ) -> tuple[
+        Float[Tensor, "B N_keep D"],
+        Int[Tensor, "B N"],
+        Float[Tensor, "B N"],
+    ]:
         """Returns ``(visible_tokens, restore_indices, mask)``."""
         B, N, _ = x.shape
         keep = int(N * (1 - self.mask_ratio))
@@ -180,8 +201,11 @@ class MaskedImageModeling(nn.Module):
         mask = torch.gather(mask, 1, ids_restore)
         return x_visible, ids_restore, mask
 
-    def reconstruct(self, encoded: torch.Tensor,
-                    ids_restore: torch.Tensor) -> torch.Tensor:
+    def reconstruct(
+        self,
+        encoded: Float[Tensor, "B N_keep D"],
+        ids_restore: Int[Tensor, "B N"],
+    ) -> Float[Tensor, "B N P"]:
         B, N = ids_restore.shape
         n_mask = N - encoded.shape[1]
         tokens = torch.cat([encoded, self.mask_token.expand(B, n_mask, -1)], dim=1)

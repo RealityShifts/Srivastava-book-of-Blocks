@@ -11,6 +11,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Bool, Float
+from torch import Tensor
 
 from .attention_blocks import (
     MultiHeadAttention,
@@ -37,7 +39,9 @@ class FeedForward(nn.Module):
             nn.Linear(hidden, dim), nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B D"]
+    ) -> Float[Tensor, "*B D"]:
         return self.net(x)
 
 
@@ -53,7 +57,9 @@ class SwiGLU(nn.Module):
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B D"]
+    ) -> Float[Tensor, "*B D"]:
         return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
@@ -68,7 +74,9 @@ class GEGLU(nn.Module):
         self.proj_out = nn.Linear(hidden, dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B D"]
+    ) -> Float[Tensor, "*B D"]:
         a, b = self.proj_in(x).chunk(2, dim=-1)
         return self.drop(self.proj_out(a * F.gelu(b)))
 
@@ -88,8 +96,11 @@ class TransformerEncoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
 
-    def forward(self, x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        mask: Optional[Bool[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B T D"]:
         x = x + self.attn(self.norm1(x), mask=mask)
         x = x + self.mlp(self.norm2(x))
         return x
@@ -108,8 +119,12 @@ class TransformerDecoderBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
 
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        context: Optional[Float[Tensor, "B Tk D_ctx"]] = None,
+        mask: Optional[Bool[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B T D"]:
         x = x + self.self_attn(self.norm1(x), mask=mask)
         if context is not None:
             x = x + self.cross_attn(self.norm2(x), context)
@@ -139,7 +154,9 @@ class MixtureOfExperts(nn.Module):
         self.experts = nn.ModuleList(
             FeedForward(dim, hidden) for _ in range(num_experts))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         flat = x.reshape(-1, C)
         logits = self.gate(flat)                                # (N, E)

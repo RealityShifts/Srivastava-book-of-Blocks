@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,9 @@ class LearnedPositionalEmbedding(nn.Module):
         self.embed = nn.Embedding(max_len, dim)
         nn.init.trunc_normal_(self.embed.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         T = x.shape[1]
         pos = torch.arange(T, device=x.device)
         return x + self.embed(pos)
@@ -58,7 +62,9 @@ class SinusoidalPositionalEmbedding(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         return x + self.pe[:, : x.shape[1]]
 
 
@@ -77,12 +83,17 @@ class ProjectionHead(nn.Module):
             nn.Linear(hidden, out_dim, bias=False),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B D_in"]
+    ) -> Float[Tensor, "B D_out"]:
         return self.net(x)
 
 
-def info_nce(z1: torch.Tensor, z2: torch.Tensor,
-             temperature: float = 0.07) -> torch.Tensor:
+def info_nce(
+    z1: Float[Tensor, "B D"],
+    z2: Float[Tensor, "B D"],
+    temperature: float = 0.07,
+) -> Float[Tensor, ""]:
     """Symmetric InfoNCE / NT-Xent loss used by SimCLR & CLIP."""
     z1 = F.normalize(z1, dim=-1)
     z2 = F.normalize(z2, dim=-1)
@@ -98,8 +109,11 @@ class CLIPLoss(nn.Module):
         super().__init__()
         self.logit_scale = nn.Parameter(torch.tensor(1.0 / init_temperature).log())
 
-    def forward(self, image_emb: torch.Tensor,
-                text_emb: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        image_emb: Float[Tensor, "B D"],
+        text_emb: Float[Tensor, "B D"],
+    ) -> Float[Tensor, ""]:
         image_emb = F.normalize(image_emb, dim=-1)
         text_emb = F.normalize(text_emb, dim=-1)
         scale = self.logit_scale.exp().clamp(max=100.0)

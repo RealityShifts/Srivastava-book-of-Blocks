@@ -12,6 +12,8 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 from .core_blocks import ConvBlock
 
@@ -40,7 +42,9 @@ class InceptionBlock(nn.Module):
             ConvBlock(in_ch, pool, 1, activation="relu"),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         return torch.cat([self.b1(x), self.b3(x), self.b5(x), self.bp(x)], dim=1)
 
 
@@ -57,7 +61,9 @@ class _DenseLayer(nn.Sequential):
             nn.Conv2d(4 * growth, growth, 3, padding=1, bias=False),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:                 # type: ignore[override]
+    def forward(                                                       # type: ignore[override]
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         return torch.cat([x, super().forward(x)], dim=1)
 
 
@@ -90,7 +96,9 @@ class SqueezeExcitation(nn.Module):
             nn.Conv2d(hidden, channels, 1), nn.Sigmoid(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H W"]:
         return x * self.fc(x)
 
 
@@ -105,7 +113,9 @@ class CBAM(nn.Module):
             nn.Linear(hidden, channels))
         self.spatial = nn.Conv2d(2, 1, kernel, padding=kernel // 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H W"]:
         avg = F.adaptive_avg_pool2d(x, 1).flatten(1)
         mx = F.adaptive_max_pool2d(x, 1).flatten(1)
         ch = torch.sigmoid(self.mlp(avg) + self.mlp(mx))[:, :, None, None]
@@ -125,7 +135,9 @@ class SpatialPyramidPooling(nn.Module):
         super().__init__()
         self.pools = nn.ModuleList(nn.AdaptiveAvgPool2d(s) for s in output_sizes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B D_out"]:
         return torch.cat([p(x).flatten(1) for p in self.pools], dim=1)
 
 
@@ -138,7 +150,9 @@ class FeaturePyramidNetwork(nn.Module):
         self.smooth = nn.ModuleList(nn.Conv2d(out_ch, out_ch, 3, padding=1)
                                     for _ in in_channels)
 
-    def forward(self, feats: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    def forward(
+        self, feats: Sequence[Float[Tensor, "B C H W"]]
+    ) -> list[Float[Tensor, "B C_out H_l W_l"]]:
         lats = [lat(f) for lat, f in zip(self.lat, feats)]
         outs = [lats[-1]]
         for i in range(len(lats) - 2, -1, -1):
@@ -164,7 +178,9 @@ class ASPP(nn.Module):
         )
         self.project = ConvBlock(out_ch * (len(dilations) + 1), out_ch, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         size = x.shape[-2:]
         feats = [b(x) for b in self.branches]
         ip = F.interpolate(self.image_pool(x), size=size, mode="bilinear",
@@ -184,7 +200,9 @@ class PixelShuffleUpsample(nn.Module):
         self.conv = nn.Conv2d(channels, channels * scale * scale, 3, padding=1)
         self.shuffle = nn.PixelShuffle(scale)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H_out W_out"]:
         return self.shuffle(self.conv(x))
 
 
@@ -211,7 +229,9 @@ class DeformableConv2d(nn.Module):
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         B, C, H, W = x.shape
         k = self.k
         offset = self.offset(x)                                  # (B, 2k^2, Hout, Wout)
@@ -263,7 +283,11 @@ class DeformableAttention(nn.Module):
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
 
-    def forward(self, x: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        hw: tuple[int, int],
+    ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         H, W = hw
         v = self.value(x).transpose(1, 2).view(B, C, H, W)        # value map

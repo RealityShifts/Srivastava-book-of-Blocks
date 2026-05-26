@@ -17,20 +17,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from jaxtyping import Float, Int8
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
 # Quantization
 # ---------------------------------------------------------------------------
 
-def quantize_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8(
+    weight: Float[Tensor, "O I"],
+) -> tuple[Int8[Tensor, "O I"], Float[Tensor, "O"]]:
     """Per-output-row symmetric INT8 quantization, returning ``(qweight, scale)``."""
     scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
     q = torch.round(weight / scale).clamp(-127, 127).to(torch.int8)
     return q, scale.squeeze(-1)
 
 
-def dequantize_int8(qweight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def dequantize_int8(
+    qweight: Int8[Tensor, "O I"], scale: Float[Tensor, "O"]
+) -> Float[Tensor, "O I"]:
     return qweight.to(scale.dtype) * scale[:, None]
 
 
@@ -57,7 +63,9 @@ class QuantizedLinearInt8(nn.Module):
             layer.bias.data.copy_(linear.bias.data)
         return layer
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B I"]
+    ) -> Float[Tensor, "*B O"]:
         w = dequantize_int8(self.qweight, self.scale.to(x.dtype))
         return F.linear(x, w, self.bias)
 
@@ -91,7 +99,9 @@ class QuantizedLinear4bit(nn.Module):
             layer.bias.data.copy_(linear.bias.data)
         return layer
 
-    def _dequantize(self, dtype: torch.dtype) -> torch.Tensor:
+    def _dequantize(
+        self, dtype: torch.dtype
+    ) -> Float[Tensor, "O I"]:
         lo = (self.qweight & 0x0F).to(torch.int8) - 8
         hi = (self.qweight >> 4).to(torch.int8) - 8
         unpacked = torch.empty(self.out_features, self.in_features,
@@ -100,7 +110,9 @@ class QuantizedLinear4bit(nn.Module):
         unpacked[:, 1::2] = hi.to(dtype)
         return unpacked * self.scale.to(dtype)[:, None]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B I"]
+    ) -> Float[Tensor, "*B O"]:
         return F.linear(x, self._dequantize(x.dtype), self.bias)
 
 
@@ -113,7 +125,7 @@ class MagnitudePruner:
 
     def __init__(self, sparsity: float = 0.5) -> None:
         self.sparsity = sparsity
-        self.masks: dict[nn.Parameter, torch.Tensor] = {}
+        self.masks: dict[nn.Parameter, Float[Tensor, "..."]] = {}
 
     def apply(self, modules: Iterable[nn.Module]) -> None:
         for m in modules:
@@ -142,7 +154,11 @@ class TokenPruner(nn.Module):
             raise ValueError("keep_ratio must be in (0, 1]")
         self.keep_ratio = keep_ratio
 
-    def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        scores: Float[Tensor, "B T"],
+    ) -> Float[Tensor, "B T_kept D"]:
         B, T, C = x.shape
         k = max(1, int(T * self.keep_ratio))
         idx = scores.topk(k, dim=-1).indices.sort(-1).values
@@ -175,7 +191,9 @@ class LowRankLinear(nn.Module):
             layer.up.bias.data.copy_(linear.bias.data)
         return layer
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B I"]
+    ) -> Float[Tensor, "*B O"]:
         return self.up(self.down(x))
 
 
@@ -208,7 +226,9 @@ class ColumnParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.local_out)) if bias else None
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B I"]
+    ) -> Float[Tensor, "*B O_local"]:
         return F.linear(x, self.weight, self.bias)
 
 
@@ -225,7 +245,9 @@ class RowParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B I_local"]
+    ) -> Float[Tensor, "*B O"]:
         out = F.linear(x, self.weight)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(out)
@@ -243,5 +265,7 @@ class PipelineStage(nn.Module):
         self.stage_id = stage_id
         self.num_stages = num_stages
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "..."]
+    ) -> Float[Tensor, "..."]:
         return self.module(x)

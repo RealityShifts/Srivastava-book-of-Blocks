@@ -13,6 +13,8 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int
+from torch import Tensor
 
 from .attention_blocks import CrossAttention
 
@@ -36,7 +38,9 @@ class SinusoidalTimeEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, t: Int[Tensor, "B"]
+    ) -> Float[Tensor, "B D"]:
         device = t.device
         half = self.dim // 2
         freqs = torch.exp(
@@ -61,7 +65,9 @@ class TimestepMLP(nn.Module):
             nn.Linear(hidden, hidden),
         )
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, t: Int[Tensor, "B"]
+    ) -> Float[Tensor, "B D_hidden"]:
         return self.net(self.embed(t))
 
 
@@ -81,7 +87,9 @@ class DownsampleBlock(nn.Module):
         else:
             raise ValueError(mode)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H_out W_out"]:
         return self.op(x)
 
 
@@ -105,7 +113,9 @@ class UpsampleBlock(nn.Module):
         else:
             raise ValueError(mode)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C H_out W_out"]:
         return self.op(x)
 
 
@@ -127,7 +137,11 @@ class UNetResBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C_in H W"],
+        t_emb: Float[Tensor, "B D_t"],
+    ) -> Float[Tensor, "B C_out H W"]:
         h = self.conv1(F.silu(self.norm1(x)))
         h = h + self.t_proj(F.silu(t_emb))[:, :, None, None]
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
@@ -183,7 +197,11 @@ class UNet(nn.Module):
         self.out_norm = nn.GroupNorm(_gn_groups(c), c)
         self.out_conv = nn.Conv2d(c, out_ch, 3, 1, 1)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C_in H W"],
+        t: Int[Tensor, "B"],
+    ) -> Float[Tensor, "B C_out H W"]:
         t_emb = self.t_embed(t)
         h = self.stem(x)
         skips = [h]
@@ -211,16 +229,22 @@ class NoisePredictor(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor,
-                cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x_t: Float[Tensor, "B C H W"],
+        t: Int[Tensor, "B"],
+        cond: Optional[Float[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B C H W"]:
         if cond is None:
             return self.backbone(x_t, t)
         return self.backbone(x_t, t, cond)
 
 
 def classifier_free_guidance(
-    eps_cond: torch.Tensor, eps_uncond: torch.Tensor, scale: float = 7.5
-) -> torch.Tensor:
+    eps_cond: Float[Tensor, "B C H W"],
+    eps_uncond: Float[Tensor, "B C H W"],
+    scale: float = 7.5,
+) -> Float[Tensor, "B C H W"]:
     """``eps = eps_uncond + s * (eps_cond - eps_uncond)``."""
     return eps_uncond + scale * (eps_cond - eps_uncond)
 
@@ -252,7 +276,9 @@ class ControlNetBlock(nn.Module):
         )
         self.zero = ZeroConv2d(hidden * 2, out_ch)
 
-    def forward(self, hint: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hint: Float[Tensor, "B C_hint H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.zero(self.encoder(hint))
 
 
@@ -276,7 +302,9 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B D_in"]
+    ) -> Float[Tensor, "*B D_out"]:
         return self.base(x) + self.drop(x) @ self.lora_A.T @ self.lora_B.T * self.scale
 
 
@@ -295,7 +323,9 @@ class LoRAConv2d(nn.Module):
         nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
         nn.init.zeros_(self.up.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.base(x) + self.up(self.down(x)) * self.scale
 
 
@@ -315,7 +345,11 @@ class HyperNetwork(nn.Module):
             nn.Linear(hidden, in_dim * out_dim + out_dim),
         )
 
-    def forward(self, code: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        code: Float[Tensor, "*B D_code"],
+        x: Float[Tensor, "*B D_in"],
+    ) -> Float[Tensor, "*B D_out"]:
         params = self.net(code)
         w = params[..., : self.in_dim * self.out_dim].view(
             *code.shape[:-1], self.out_dim, self.in_dim)
@@ -337,6 +371,10 @@ class IPAdapterCrossAttention(nn.Module):
         self.text_attn = CrossAttention(dim, text_dim, num_heads)
         self.image_attn = CrossAttention(dim, image_dim, num_heads)
 
-    def forward(self, x: torch.Tensor, text: torch.Tensor,
-                image: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        text: Float[Tensor, "B T_txt D_txt"],
+        image: Float[Tensor, "B T_img D_img"],
+    ) -> Float[Tensor, "B T D"]:
         return self.text_attn(x, text) + self.scale * self.image_attn(x, image)

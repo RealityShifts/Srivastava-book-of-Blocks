@@ -16,6 +16,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Bool, Float, Int
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -23,10 +25,13 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 def scaled_dot_product_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0, is_causal: bool = False,
-) -> torch.Tensor:
+    q: Float[Tensor, "B H Tq D"],
+    k: Float[Tensor, "B H Tk D"],
+    v: Float[Tensor, "B H Tk D"],
+    mask: Optional[Bool[Tensor, "..."]] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+) -> Float[Tensor, "B H Tq D"]:
     """``softmax(QK^T / sqrt(d)) V`` - delegating to fused kernels when available.
 
     Shapes: ``(B, H, T, D)`` for q/k/v.
@@ -56,8 +61,11 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B T D"],
+        mask: Optional[Bool[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
@@ -100,8 +108,12 @@ class CrossAttention(nn.Module):
         self.kv_proj = nn.Linear(ctx_dim, 2 * dim, bias=False)
         self.out_proj = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B Tq D"],
+        context: Float[Tensor, "B Tk D_ctx"],
+        mask: Optional[Bool[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B Tq D"]:
         B, Tx, C = x.shape
         Tc = context.shape[1]
         q = self.q_proj(x).view(B, Tx, self.num_heads, self.head_dim).transpose(1, 2)
@@ -131,7 +143,9 @@ class WindowAttention(nn.Module):
         self.window = window
         self.attn = MultiHeadAttention(dim, num_heads, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         W = self.window
         pad = (W - T % W) % W
@@ -157,10 +171,12 @@ class LinearAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
 
     @staticmethod
-    def _phi(x: torch.Tensor) -> torch.Tensor:
+    def _phi(x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
         return F.elu(x) + 1.0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B T D"]:
         B, T, C = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
@@ -195,15 +211,23 @@ class RotaryEmbedding(nn.Module):
         inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv, persistent=False)
 
-    def forward(self, seq_len: int, device: torch.device,
-                dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[Float[Tensor, "T D"], Float[Tensor, "T D"]]:
         t = torch.arange(seq_len, device=device, dtype=dtype)
         freqs = torch.outer(t, self.inv_freq.to(dtype=dtype))
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
 
-def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rotary(
+    x: Float[Tensor, "B H T D"],
+    cos: Float[Tensor, "T D"],
+    sin: Float[Tensor, "T D"],
+) -> Float[Tensor, "B H T D"]:
     """Rotate the last dim of ``x`` by RoPE angles. ``x`` is ``(B,H,T,D)``."""
     x1, x2 = x.chunk(2, dim=-1)
     rotated = torch.cat([-x2, x1], dim=-1)
@@ -221,7 +245,9 @@ class RelativePositionBias(nn.Module):
         self.bidirectional = bidirectional
         self.bias = nn.Embedding(num_buckets, num_heads)
 
-    def _bucket(self, rel_pos: torch.Tensor) -> torch.Tensor:
+    def _bucket(
+        self, rel_pos: Int[Tensor, "Tq Tk"]
+    ) -> Int[Tensor, "Tq Tk"]:
         n = self.num_buckets
         ret = torch.zeros_like(rel_pos)
         if self.bidirectional:
@@ -240,7 +266,9 @@ class RelativePositionBias(nn.Module):
         ret += torch.where(is_small, rel_pos, large)
         return ret
 
-    def forward(self, q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
+    def forward(
+        self, q_len: int, k_len: int, device: torch.device,
+    ) -> Float[Tensor, "H Tq Tk"]:
         qpos = torch.arange(q_len, device=device)
         kpos = torch.arange(k_len, device=device)
         rel = kpos[None, :] - qpos[:, None]
@@ -261,7 +289,9 @@ class AttentionPooling(nn.Module):
         self.attn = CrossAttention(dim, dim, num_heads)
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B T D"]
+    ) -> Float[Tensor, "B D"]:
         B = x.shape[0]
         q = self.query.expand(B, -1, -1)
         return self.norm(self.attn(q, x)).squeeze(1)

@@ -13,6 +13,8 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +38,9 @@ class EqualLinear(nn.Module):
         self.scale = gain / math.sqrt(in_features) * lr_mul
         self.lr_mul = lr_mul
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "*B D_in"]
+    ) -> Float[Tensor, "*B D_out"]:
         bias = self.bias * self.lr_mul if self.bias is not None else None
         return F.linear(x, self.weight * self.scale, bias)
 
@@ -58,7 +62,9 @@ class EqualConv2d(nn.Module):
         fan_in = in_ch * kernel_size * kernel_size
         self.scale = gain / math.sqrt(fan_in)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return F.conv2d(x, self.weight * self.scale, self.bias,
                         stride=self.stride, padding=self.padding)
 
@@ -76,7 +82,9 @@ class GeneratorBlock(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.norm = nn.BatchNorm2d(out_ch)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return F.relu(self.norm(self.conv(self.up(x))))
 
 
@@ -89,7 +97,9 @@ class DiscriminatorBlock(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, 4, stride, 1)
         self.norm = nn.InstanceNorm2d(out_ch, affine=True) if use_norm else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C_in H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         return F.leaky_relu(self.norm(self.conv(x)), 0.2, inplace=True)
 
 
@@ -108,7 +118,9 @@ class MappingNetwork(nn.Module):
                        nn.LeakyReLU(0.2, inplace=True)]
         self.net = nn.Sequential(*layers)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, z: Float[Tensor, "B D_z"]
+    ) -> Float[Tensor, "B D_w"]:
         z = z * z.pow(2).mean(dim=1, keepdim=True).add(1e-8).rsqrt()   # pixel-norm
         return self.net(z)
 
@@ -123,7 +135,11 @@ class StyleBlock(nn.Module):
         self.noise_strength = nn.Parameter(torch.zeros(1))
         self.bias = nn.Parameter(torch.zeros(out_ch))
 
-    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C_in H W"],
+        w: Float[Tensor, "B D_w"],
+    ) -> Float[Tensor, "B C_out H W"]:
         x = self.conv(x, w)
         noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
         x = x + noise * self.noise_strength
@@ -144,7 +160,11 @@ class ModulatedConv2d(nn.Module):
         self.style = nn.Linear(w_dim, in_ch)
         nn.init.ones_(self.style.bias)
 
-    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: Float[Tensor, "B C_in H W"],
+        w: Float[Tensor, "B D_w"],
+    ) -> Float[Tensor, "B C_out H W"]:
         B, C, H, W = x.shape
         s = self.style(w)                                                 # (B, in_ch)
         weight = self.weight[None] * s[:, None, :, None, None]            # modulate
@@ -172,7 +192,9 @@ class MinibatchStdDev(nn.Module):
         super().__init__()
         self.group_size = group_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C_out H W"]:
         B, C, H, W = x.shape
         g = min(self.group_size, B)
         y = x.view(g, -1, C, H, W)
@@ -195,7 +217,9 @@ class ProgressiveGrowing(nn.Module):
     def set_alpha(self, alpha: float) -> None:
         self.alpha = max(0.0, min(1.0, alpha))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: Float[Tensor, "B C H W"]
+    ) -> Float[Tensor, "B C_out H_out W_out"]:
         lo = F.interpolate(self.low(x), scale_factor=2, mode="nearest")
         hi = self.high(x)
         return (1 - self.alpha) * lo + self.alpha * hi
