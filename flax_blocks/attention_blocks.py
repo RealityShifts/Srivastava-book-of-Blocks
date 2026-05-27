@@ -49,7 +49,16 @@ def scaled_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 class MultiHeadAttention(nnx.Module):
-    """Pre-norm-friendly multi-head attention with optional causal masking."""
+    """Pre-norm-friendly multi-head attention with optional causal masking.
+
+    ``__call__(query)``              -> self-attention (Q = K = V = query),
+    ``__call__(query, key)``         -> Q from ``query``, K = V from ``key``,
+    ``__call__(query, key, value)``  -> general MHA with three sources.
+
+    All three tensors must share ``dim``; key and value may differ from query
+    in sequence length. Self-attention uses the fused qkv matmul; otherwise
+    the same ``qkv`` kernel is split into Wq / Wk / Wv (mirrors PyTorch MHA).
+    """
 
     def __init__(self, dim: int, num_heads: int = 8, use_bias: bool = True,
                  causal: bool = False, *, rngs: nnx.Rngs) -> None:
@@ -61,18 +70,51 @@ class MultiHeadAttention(nnx.Module):
         self.qkv = nnx.Linear(dim, 3 * dim, use_bias=use_bias, rngs=rngs)
         self.out_proj = nnx.Linear(dim, dim, use_bias=use_bias, rngs=rngs)
 
+    def _project_qkv(
+        self,
+        query: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Apply Wq/Wk/Wv slices of the fused qkv linear; returns (B,T,H,D) each."""
+        Wq, Wk, Wv = jnp.split(self.qkv.kernel.value, 3, axis=-1)
+        if self.qkv.bias is not None:
+            bq, bk, bv = jnp.split(self.qkv.bias.value, 3, axis=-1)
+        else:
+            bq = bk = bv = None
+        B, Tq, _ = query.shape
+        Tk = key.shape[1]
+        H, D = self.num_heads, self.head_dim
+        q = (query @ Wq + bq).reshape(B, Tq, H, D)
+        k = (key @ Wk + bk).reshape(B, Tk, H, D)
+        v = (value @ Wv + bv).reshape(B, value.shape[1], H, D)
+        return q, k, v
+
     @typecheck
     def __call__(
         self,
-        x: Float[Array, "B T D"],
+        query: Float[Array, "B Tq D"],
+        key: Optional[Float[Array, "B Tk D"]] = None,
+        value: Optional[Float[Array, "B Tk D"]] = None,
         mask: Optional[Shaped[Array, "..."]] = None,
-    ) -> Float[Array, "B T D"]:
-        B, T, _ = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
-        q, k, v = jnp.moveaxis(qkv, 2, 0)                        # (B,T,H,D) each
-        out = scaled_dot_product_attention(q, k, v, mask=mask,
-                                           is_causal=self.causal)
-        out = out.reshape(B, T, self.num_heads * self.head_dim)
+    ) -> Float[Array, "B Tq D"]:
+        B, Tq, C = query.shape
+        H, D = self.num_heads, self.head_dim
+
+        if key is None and value is None:
+            qkv = self.qkv(query).reshape(B, Tq, 3, H, D)
+            q, k, v = jnp.moveaxis(qkv, 2, 0)                    # (B,T,H,D) each
+        else:
+            if key is None:
+                key = query
+            if value is None:
+                value = key
+            q, k, v = self._project_qkv(query, key, value)
+
+        out = scaled_dot_product_attention(
+            q, k, v, mask=mask, is_causal=self.causal,
+        )
+        out = out.reshape(B, Tq, C)
         return self.out_proj(out)
 
 
