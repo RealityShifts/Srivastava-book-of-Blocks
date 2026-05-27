@@ -48,7 +48,17 @@ def scaled_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 class MultiHeadAttention(nn.Module):
-    """Standard multi-head attention with optional causal masking."""
+    """Standard multi-head attention with optional causal masking.
+
+    ``forward(query)``                  -> self-attention (Q = K = V = query),
+    ``forward(query, key)``             -> Q from ``query``, K = V from ``key``,
+    ``forward(query, key, value)``      -> general MHA with three sources.
+
+    All three tensors must share ``dim``; key and value may differ from query
+    in sequence length. The self-attention path keeps the fused qkv matmul as
+    a fast path; the cross / general path slices the same weight into Wq/Wk/Wv
+    so no extra parameters are introduced (mirrors ``torch.nn.MultiheadAttention``).
+    """
 
     def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0,
                  bias: bool = True, causal: bool = False) -> None:
@@ -63,21 +73,36 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
-    @typecheck
-    def forward(
-        self,
-        x: Float[Tensor, "B T D"],
-        mask: Optional[Shaped[Tensor, "..."]] = None,
-    ) -> Float[Tensor, "B T D"]:
-        B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+    def forward(self, query: torch.Tensor,
+                key: Optional[torch.Tensor] = None,
+                value: Optional[torch.Tensor] = None,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, Tq, C = query.shape
+        H, D = self.num_heads, self.head_dim
+
+        if key is None and value is None:
+            qkv = self.qkv(query).view(B, Tq, 3, H, D)
+            q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        else:
+            if key is None:
+                key = query
+            if value is None:
+                value = key
+            Wq, Wk, Wv = self.qkv.weight.chunk(3, dim=0)
+            if self.qkv.bias is not None:
+                bq, bk, bv = self.qkv.bias.chunk(3)
+            else:
+                bq = bk = bv = None
+            q = F.linear(query, Wq, bq).view(B, Tq,             H, D).transpose(1, 2)
+            k = F.linear(key,   Wk, bk).view(B, key.shape[1],   H, D).transpose(1, 2)
+            v = F.linear(value, Wv, bv).view(B, value.shape[1], H, D).transpose(1, 2)
+
         out = scaled_dot_product_attention(
             q, k, v, mask=mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=self.causal,
         )
-        out = out.transpose(1, 2).reshape(B, T, C)
+        out = out.transpose(1, 2).reshape(B, Tq, C)
         return self.out_proj(out)
 
 
