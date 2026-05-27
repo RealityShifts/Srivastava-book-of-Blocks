@@ -73,10 +73,14 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, query: torch.Tensor,
-                key: Optional[torch.Tensor] = None,
-                value: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    @typecheck
+    def forward(
+        self,
+        query: Float[Tensor, "B Tq D"],
+        key: Optional[Float[Tensor, "B Tk D"]] = None,
+        value: Optional[Float[Tensor, "B Tk D"]] = None,
+        mask: Optional[Shaped[Tensor, "..."]] = None,
+    ) -> Float[Tensor, "B Tq D"]:
         B, Tq, C = query.shape
         H, D = self.num_heads, self.head_dim
 
