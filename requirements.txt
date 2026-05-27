@@ -1,3 +1,5 @@
+# Requires Python >=3.11 (jax 0.10.x / flax 0.10.x). System pip3 on macOS is
+# often 3.9 — use: python3.12 -m venv .venv && source .venv/bin/activate
 torch>=2.0           # for pytorch_blocks/
 jax==0.10.0          # for flax_blocks/
 flax==0.10.2         # for flax_blocks/
