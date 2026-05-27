@@ -3,3 +3,4 @@ jax==0.10.0          # for flax_blocks/
 flax==0.10.2         # for flax_blocks/
 jaxtyping>=0.3.0     # shape/dtype annotations for flax_blocks/ and pytorch_blocks/
 beartype>=0.18       # runtime type checker used when CHECK_TYPES=1 (default)
+einops>=0.8          # required by Rearrange built-in node (web UI + shape_runner)
