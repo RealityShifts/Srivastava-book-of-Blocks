@@ -92,8 +92,17 @@ class MaskedConv2d(nn.Conv2d):
     ``mask_type='A'`` blocks the centre pixel; ``'B'`` includes it.
     """
 
-    def __init__(self, mask_type: str, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        mask_type: str,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 0,
+        bias: bool = True,
+    ) -> None:
+        super().__init__(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=bias)
         if mask_type not in {"A", "B"}:
             raise ValueError("mask_type must be 'A' or 'B'")
         _, _, kH, kW = self.weight.shape

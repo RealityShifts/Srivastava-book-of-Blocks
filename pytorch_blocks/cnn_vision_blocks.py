@@ -226,17 +226,18 @@ class DeformableConv2d(nn.Module):
     """
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 stride: int = 1, padding: int = 1) -> None:
+                 stride: int = 1, padding: int = 1, bias: bool = True) -> None:
         super().__init__()
         self.k = kernel_size
         self.stride = stride
         self.padding = padding
         self.offset = nn.Conv2d(in_ch, 2 * kernel_size * kernel_size,
-                                kernel_size, stride, padding)
+                                kernel_size, stride, padding, bias=bias)
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size,
-                              stride=kernel_size, padding=0)
+                              stride=kernel_size, padding=0, bias=bias)
         nn.init.zeros_(self.offset.weight)
-        nn.init.zeros_(self.offset.bias)
+        if self.offset.bias is not None:
+            nn.init.zeros_(self.offset.bias)
 
     @typecheck
     def forward(

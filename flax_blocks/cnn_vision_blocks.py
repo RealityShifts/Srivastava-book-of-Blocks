@@ -281,7 +281,7 @@ class DeformableConv2d(nnx.Module):
     """Deformable convolution v1 (Dai et al. 2017), pure-JAX with bilinear sample."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 strides: int = 1, padding: int = 1,
+                 strides: int = 1, padding: int = 1, use_bias: bool = True,
                  *, rngs: nnx.Rngs) -> None:
         self.k = kernel_size
         self.strides = strides
@@ -289,9 +289,11 @@ class DeformableConv2d(nnx.Module):
         self.offset = nnx.Conv(in_ch, 2 * kernel_size * kernel_size,
                                (kernel_size, kernel_size),
                                strides=strides, padding="SAME",
+                               use_bias=use_bias,
                                kernel_init=nnx.initializers.zeros,
                                bias_init=nnx.initializers.zeros, rngs=rngs)
-        self.proj = nnx.Linear(in_ch * kernel_size * kernel_size, out_ch, rngs=rngs)
+        self.proj = nnx.Linear(in_ch * kernel_size * kernel_size, out_ch,
+                               use_bias=use_bias, rngs=rngs)
 
     @typecheck
     def __call__(

@@ -34,7 +34,7 @@ class ConvBlock(nnx.Module):
         padding: str = "SAME",
         dilation: int = 1,
         groups: int = 1,
-        use_bias: bool = False,
+        use_bias: bool = True,
         norm: str = "batch",
         activation: str = "relu",
         *,
@@ -60,13 +60,14 @@ class DepthwiseSeparableConv(nnx.Module):
     """Depthwise 3x3 -> pointwise 1x1 (MobileNet-style)."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 strides: int = 1, dilation: int = 1, *, rngs: nnx.Rngs) -> None:
+                 strides: int = 1, dilation: int = 1, use_bias: bool = True,
+                 *, rngs: nnx.Rngs) -> None:
         self.depthwise = nnx.Conv(
             in_ch, in_ch, (kernel_size, kernel_size),
             strides=strides, kernel_dilation=dilation,
-            feature_group_count=in_ch, use_bias=False, rngs=rngs,
+            feature_group_count=in_ch, use_bias=use_bias, rngs=rngs,
         )
-        self.pointwise = nnx.Conv(in_ch, out_ch, (1, 1), use_bias=False, rngs=rngs)
+        self.pointwise = nnx.Conv(in_ch, out_ch, (1, 1), use_bias=use_bias, rngs=rngs)
 
     @typecheck
     def __call__(
@@ -79,21 +80,23 @@ class DilatedConv(nnx.Conv):
     """Atrous (dilated) convolution preserving spatial size."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 dilation: int = 2, *, rngs: nnx.Rngs) -> None:
+                 dilation: int = 2, use_bias: bool = True, *, rngs: nnx.Rngs) -> None:
         super().__init__(in_ch, out_ch, (kernel_size, kernel_size),
-                         padding="SAME", kernel_dilation=dilation, rngs=rngs)
+                         padding="SAME", kernel_dilation=dilation,
+                         use_bias=use_bias, rngs=rngs)
 
 
 class GroupConv(nnx.Conv):
     """Grouped convolution - ancestor of depthwise conv."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 groups: int = 4, strides: int = 1, *, rngs: nnx.Rngs) -> None:
+                 groups: int = 4, strides: int = 1, use_bias: bool = True,
+                 *, rngs: nnx.Rngs) -> None:
         if in_ch % groups or out_ch % groups:
             raise ValueError("channels must divide groups")
         super().__init__(in_ch, out_ch, (kernel_size, kernel_size),
                          strides=strides, padding="SAME",
-                         feature_group_count=groups, rngs=rngs)
+                         feature_group_count=groups, use_bias=use_bias, rngs=rngs)
 
 
 # ---------------------------------------------------------------------------

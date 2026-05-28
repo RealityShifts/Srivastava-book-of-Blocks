@@ -53,7 +53,7 @@ class ConvBlock(nn.Module):
         padding: Optional[int] = None,
         dilation: int = 1,
         groups: int = 1,
-        bias: bool = False,
+        bias: bool = True,
         norm: str = "batch",
         activation: str = "relu",
     ) -> None:
@@ -78,7 +78,7 @@ class DepthwiseSeparableConv2d(nn.Module):
     """Depthwise 3x3 followed by pointwise 1x1 (MobileNet-style)."""
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 stride: int = 1, dilation: int = 1, bias: bool = False) -> None:
+                 stride: int = 1, dilation: int = 1, bias: bool = True) -> None:
         super().__init__()
         pad = dilation * (kernel_size - 1) // 2
         self.depthwise = nn.Conv2d(

@@ -103,11 +103,11 @@ class MaskedConv2d(nnx.Module):
     """
 
     def __init__(self, mask_type: str, in_ch: int, out_ch: int,
-                 kernel_size: int = 3, *, rngs: nnx.Rngs) -> None:
+                 kernel_size: int = 3, use_bias: bool = True, *, rngs: nnx.Rngs) -> None:
         if mask_type not in {"A", "B"}:
             raise ValueError("mask_type must be 'A' or 'B'")
         self.conv = nnx.Conv(in_ch, out_ch, (kernel_size, kernel_size),
-                             padding="SAME", rngs=rngs)
+                             padding="SAME", use_bias=use_bias, rngs=rngs)
         kH, kW = kernel_size, kernel_size
         mask = jnp.ones((kH, kW, in_ch, out_ch))
         mask = mask.at[kH // 2, kW // 2 + (mask_type == "B"):].set(0)
