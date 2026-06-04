@@ -180,7 +180,7 @@ class ModulatedConv2d(nn.Module):
             d = weight.pow(2).sum(dim=[2, 3, 4]).add(1e-8).rsqrt()
             weight = weight * d[:, :, None, None, None]
         weight = weight.view(B * weight.shape[1], C, *weight.shape[3:])
-        x = x.view(1, B * C, H, W)
+        x = x.reshape(1, B * C, H, W)
         out = F.conv2d(x, weight, padding=self.padding, groups=B)
         return out.view(B, -1, H, W)
 
