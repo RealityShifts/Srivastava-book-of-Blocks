@@ -29,14 +29,16 @@ from torch import Tensor
 def scaled_dot_product_attention(
     q: Float[Tensor, "B H Tq D"],
     k: Float[Tensor, "B H Tk D"],
-    v: Float[Tensor, "B H Tk D"],
+    v: Float[Tensor, "B H Tk Dv"],
     mask: Optional[Shaped[Tensor, "..."]] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
-) -> Float[Tensor, "B H Tq D"]:
+) -> Float[Tensor, "B H Tq Dv"]:
     """``softmax(QK^T / sqrt(d)) V`` - delegating to fused kernels when available.
 
-    Shapes: ``(B, H, T, D)`` for q/k/v.
+    Shapes: ``(B, H, Tq, D)`` for q/k and ``(B, H, Tk, Dv)`` for v. Query and key
+    must share the head dim ``D`` (for the ``QK^T`` score); value may carry its own
+    head dim ``Dv``, which the attention output then inherits.
     """
     return F.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=is_causal,
@@ -54,59 +56,62 @@ class MultiHeadAttention(nn.Module):
     ``forward(query, key)``             -> Q from ``query``, K = V from ``key``,
     ``forward(query, key, value)``      -> general MHA with three sources.
 
-    All three tensors must share ``dim``; key and value may differ from query
-    in sequence length. The self-attention path keeps the fused qkv matmul as
-    a fast path; the cross / general path slices the same weight into Wq/Wk/Wv
-    so no extra parameters are introduced (mirrors ``torch.nn.MultiheadAttention``).
+    Query and key share ``dim`` (their projections feed the ``QK^T`` score, so
+    they must land in the same space). The value stream may carry its own feature
+    dim ``vdim``; ``v`` is kept in that space and the attention output therefore
+    lives in ``vdim`` (``out_proj`` maps ``vdim -> vdim``). ``vdim`` defaults to
+    ``dim``, recovering ordinary equal-width attention.
     """
 
     def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0,
-                 bias: bool = True, causal: bool = False) -> None:
+                 bias: bool = True, causal: bool = False,
+                 vdim: Optional[int] = None) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("dim must be divisible by num_heads")
+        self.vdim = vdim if vdim is not None else dim
+        if self.vdim % num_heads != 0:
+            raise ValueError("vdim must be divisible by num_heads")
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = dim // num_heads             # head dim of q and k
+        self.v_head_dim = self.vdim // num_heads     # head dim of v / output
+        self.dim = dim
         self.causal = causal
         self.dropout = dropout
 
-        self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
-        self.out_proj = nn.Linear(dim, dim, bias=bias)
+        # Separate q/k/v projections so the value stream may differ in feature
+        # dim from query/key. q and k must land in `dim` (they form the QK^T
+        # score); v stays in `vdim`, so the attention output is `vdim`.
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(self.vdim, self.vdim, bias=bias)
+        self.out_proj = nn.Linear(self.vdim, self.vdim, bias=bias)
 
     @typecheck
     def forward(
         self,
         query: Float[Tensor, "B Tq D"],
         key: Optional[Float[Tensor, "B Tk D"]] = None,
-        value: Optional[Float[Tensor, "B Tk D"]] = None,
+        value: Optional[Float[Tensor, "B Tk D_val"]] = None,
         mask: Optional[Shaped[Tensor, "..."]] = None,
-    ) -> Float[Tensor, "B Tq D"]:
-        B, Tq, C = query.shape
-        H, D = self.num_heads, self.head_dim
+    ) -> Float[Tensor, "B Tq D_val"]:
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+        B, Tq, _ = query.shape
+        H, D, Dv = self.num_heads, self.head_dim, self.v_head_dim
 
-        if key is None and value is None:
-            qkv = self.qkv(query).view(B, Tq, 3, H, D)
-            q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        else:
-            if key is None:
-                key = query
-            if value is None:
-                value = key
-            Wq, Wk, Wv = self.qkv.weight.chunk(3, dim=0)
-            if self.qkv.bias is not None:
-                bq, bk, bv = self.qkv.bias.chunk(3)
-            else:
-                bq = bk = bv = None
-            q = F.linear(query, Wq, bq).view(B, Tq,             H, D).transpose(1, 2)
-            k = F.linear(key,   Wk, bk).view(B, key.shape[1],   H, D).transpose(1, 2)
-            v = F.linear(value, Wv, bv).view(B, value.shape[1], H, D).transpose(1, 2)
+        q = self.q_proj(query).view(B, Tq,             H, D).transpose(1, 2)
+        k = self.k_proj(key).view(B, key.shape[1],     H, D).transpose(1, 2)
+        v = self.v_proj(value).view(B, value.shape[1], H, Dv).transpose(1, 2)
 
         out = scaled_dot_product_attention(
             q, k, v, mask=mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=self.causal,
         )
-        out = out.transpose(1, 2).reshape(B, Tq, C)
+        out = out.transpose(1, 2).reshape(B, Tq, self.vdim)
         return self.out_proj(out)
 
 
