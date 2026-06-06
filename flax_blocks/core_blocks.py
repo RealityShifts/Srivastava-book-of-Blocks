@@ -35,7 +35,7 @@ class ConvBlock(nnx.Module):
         dilation: int = 1,
         groups: int = 1,
         use_bias: bool = True,
-        norm: str = "batch",
+        norm: str = "layer",
         activation: str = "relu",
         *,
         rngs: nnx.Rngs,
@@ -289,7 +289,7 @@ class ResidualBlock(nnx.Module):
     """ResNet "basic block": ``y = act(F(x) + shortcut(x))``."""
 
     def __init__(self, in_ch: int, out_ch: int, strides: int = 1,
-                 norm: str = "batch", activation: str = "relu",
+                 norm: str = "layer", activation: str = "relu",
                  *, rngs: nnx.Rngs) -> None:
         self.conv1 = ConvBlock(in_ch, out_ch, 3, strides=strides,
                                norm=norm, activation=activation, rngs=rngs)
