@@ -1,0 +1,3 @@
+# Generated / user corpora (copyrighted sources — do not commit)
+*.txt
+!README.md

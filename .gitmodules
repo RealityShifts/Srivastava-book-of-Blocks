@@ -1,0 +1,7 @@
+[submodule "models/blocks"]
+	path = models/blocks
+	url = https://github.com/RealityShifts/Srivastava-book-of-Blocks.git
+
+[submodule "models/diagram"]
+	path = models/diagram
+	url = https://github.com/RealityShifts/Srivastava-book-of-Blocks-diagrams.git
