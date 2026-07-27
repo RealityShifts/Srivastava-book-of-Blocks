@@ -1,0 +1,692 @@
+"""Render a traced :class:`~Blocks.visualized.tracer.Graph` to interactive HTML.
+
+The output is a single self-contained file - no CDN, no build step - so it
+opens straight from disk or inside a notebook iframe. Layout is a longest-path
+layering (each node sits below every producer it depends on) with sibling
+columns, drawn to SVG and driven by a small amount of vanilla JS for pan,
+zoom, collapse and selection.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+from typing import Optional
+
+from .tracer import Graph, INPUT_NODE
+
+
+_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg:#0f1117; --panel:#171a23; --line:#262b38; --fg:#e6e9ef; --muted:#8b93a7;
+  --accent:#6ea8fe; --skip:#f0883e; --edge:#3d4358; --hi:#ffd166; --err:#ff6b6b;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg:#f7f8fa; --panel:#fff; --line:#e2e5ec; --fg:#1b1f2a;
+          --muted:#5f6880; --edge:#c3c9d6; }
+}
+* { box-sizing:border-box; }
+html,body { margin:0; height:100%; overflow:hidden;
+  font:13px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:var(--bg); color:var(--fg); }
+#app { display:flex; height:100vh; }
+#stage { flex:1 1 0; min-width:0; position:relative; overflow:hidden;
+  cursor:grab; }
+#stage.drag { cursor:grabbing; }
+svg { width:100%; height:100%; display:block; }
+#side { width:310px; flex:none; border-left:1px solid var(--line);
+  background:var(--panel); overflow-y:auto; padding:16px; }
+#side h1 { font-size:15px; margin:0 0 2px; }
+#side .sub { color:var(--muted); font-size:11px; margin-bottom:14px;
+  word-break:break-all; }
+.stat { display:flex; justify-content:space-between; gap:10px;
+  padding:5px 0; border-bottom:1px solid var(--line); font-size:12px; }
+.stat span:first-child { color:var(--muted); flex:none; }
+.stat span:last-child { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  text-align:right; word-break:break-word; min-width:0; }
+h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--muted); margin:18px 0 6px; }
+#toolbar { position:absolute; top:12px; left:12px; display:flex; gap:6px;
+  flex-wrap:wrap; align-items:center; z-index:5; }
+#lvl { font-size:11px; color:var(--muted); padding-left:4px; }
+button { font:inherit; font-size:12px; padding:5px 10px; border-radius:6px;
+  border:1px solid var(--line); background:var(--panel); color:var(--fg);
+  cursor:pointer; }
+button:hover { border-color:var(--accent); }
+#legend { position:absolute; bottom:12px; left:12px; font-size:11px;
+  color:var(--muted); background:var(--panel); border:1px solid var(--line);
+  border-radius:6px; padding:8px 10px; z-index:5; }
+#legend div { display:flex; align-items:center; gap:6px; margin:2px 0; }
+#legend i { width:16px; height:0; border-top:2px solid var(--edge);
+  display:inline-block; }
+.node rect { stroke-width:1.5px; }
+.node { cursor:pointer; }
+.node text { pointer-events:none; }
+.nm { font-weight:600; font-size:12px; }
+.nc { font-size:10.5px; fill:var(--muted); }
+.ns { font-size:10px; font-family:ui-monospace,Menlo,monospace;
+  fill:var(--muted); }
+/* Only the frame's stroke and label are clickable, so a click on the empty
+   space inside a group does not collapse it. */
+.flab { font-size:10.5px; font-weight:600; letter-spacing:.02em;
+  cursor:pointer; }
+.frame rect { pointer-events:stroke; cursor:pointer; }
+.node.sel rect { stroke:var(--hi); stroke-width:2.5px; }
+.node.dim { opacity:.28; }
+.edge { fill:none; stroke:var(--edge); stroke-width:1.6px; }
+.edge.skip { stroke:var(--skip); stroke-dasharray:5 4; }
+.edge.hot { stroke:var(--hi); stroke-width:2.6px; }
+.edge.dim { opacity:.12; }
+.badge { font-size:9.5px; fill:var(--bg); font-weight:700; }
+#empty { position:absolute; inset:0; display:grid; place-items:center;
+  color:var(--muted); }
+.err { color:var(--err); border-left:2px solid var(--err); padding-left:8px;
+  margin:10px 0; font-size:12px; }
+code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="toolbar">
+      <button id="fit">Fit</button>
+      <button id="zi">+</button>
+      <button id="zo">&minus;</button>
+      <button id="col">&minus; depth</button>
+      <button id="exp">+ depth</button>
+      <span id="lvl"></span>
+    </div>
+    <svg id="svg"><g id="root"></g></svg>
+    <div id="legend">
+      <div><i></i> dataflow</div>
+      <div><i style="border-color:var(--skip);border-top-style:dashed"></i>
+           skip / residual</div>
+      <div style="margin-top:4px">scroll = zoom &middot; drag = pan &middot;
+           click = inspect</div>
+    </div>
+  </div>
+  <div id="side">
+    <h1 id="title"></h1>
+    <div class="sub" id="subtitle"></div>
+    <div id="detail"></div>
+  </div>
+</div>
+<script>
+const DATA = __DATA__;
+
+// ---------- palette by module family -------------------------------------
+const COLORS = [
+  [/conv/i,          '#6ea8fe'],
+  [/norm|batchnorm/i,'#8bd450'],
+  [/attention|attn/i,'#c792ea'],
+  [/linear|dense|mlp|feedforward|ffn/i, '#f0883e'],
+  [/embed/i,         '#4dd0e1'],
+  [/pool|sample|resize/i, '#f5c542'],
+  [/drop/i,          '#9aa3b8'],
+];
+const colorOf = c => (COLORS.find(([re]) => re.test(c)) || [,'#7c8296'])[1];
+const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B'
+              : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
+              : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
+const shp = t => '(' + t.shape.join(', ') + ')';
+
+// ---------- state ---------------------------------------------------------
+const byId = new Map(DATA.nodes.map(n => [n.id, n]));
+const kids = new Map();
+DATA.nodes.forEach(n => {
+  if (n.parent !== null) {
+    if (!kids.has(n.parent)) kids.set(n.parent, []);
+    kids.get(n.parent).push(n.id);
+  }
+});
+const hasKids = id => (kids.get(id) || []).length > 0;
+// Start with top-level containers collapsed so big models stay readable.
+const collapsed = new Set(
+  DATA.nodes.filter(n => hasKids(n.id) && n.depth >= 1).map(n => n.id));
+
+// Expand every container whose own depth is below `d`. Deeper containers
+// stay collapsed, which keeps at most one level of frames on screen and
+// avoids the overlap you get when frames nest several levels deep.
+function expandToDepth(d) {
+  collapsed.clear();
+  DATA.nodes.forEach(n => { if (hasKids(n.id) && n.depth >= d) collapsed.add(n.id); });
+}
+let selected = null;
+
+const isHidden = id => {          // hidden when any ancestor is collapsed
+  let p = byId.get(id).parent;
+  while (p !== null && p !== undefined) {
+    if (collapsed.has(p)) return true;
+    p = byId.get(p).parent;
+  }
+  return false;
+};
+// Nearest rendered stand-in for a node (itself, or its collapsed ancestor).
+const proxy = id => {
+  if (id === __INPUT__) return __INPUT__;
+  let cur = id, p = byId.get(id) ? byId.get(id).parent : null, top = null;
+  while (p !== null && p !== undefined) {
+    if (collapsed.has(p)) top = p;
+    p = byId.get(p).parent;
+  }
+  return top !== null ? top : cur;
+};
+
+// ---------- layout --------------------------------------------------------
+// GAPY must exceed twice the deepest frame padding plus the label strip,
+// otherwise a group's frame runs into the frame of the group below it.
+const NW = 190, NH = 54, GAPX = 26, GAPY = 92;
+let layout = { nodes: [], edges: [], w: 0, h: 0 };
+
+function relayout() {
+  const vis = DATA.nodes.filter(n => !isHidden(n.id));
+  const visSet = new Set(vis.map(n => n.id));
+
+  // An expanded container draws no edges of its own - its children do. So a
+  // recorded edge touching one is re-pointed at the child that actually
+  // produced (last descendant) or consumed (first descendant) the value.
+  const expanded = id =>
+    id !== __INPUT__ && hasKids(id) && !collapsed.has(id) && visSet.has(id);
+  const descOf = id => {
+    const out = [];
+    const walk = i => (kids.get(i) || []).forEach(c => { out.push(c); walk(c); });
+    walk(id);
+    return out;
+  };
+  const resolve = (id, wantLast) => {
+    let cur = id;
+    while (expanded(cur)) {
+      const ds = descOf(cur).filter(c => visSet.has(c) && !expanded(c));
+      if (!ds.length) break;
+      cur = wantLast ? Math.max(...ds) : Math.min(...ds);
+    }
+    return cur;
+  };
+
+  // Collapse edges onto visible proxies, dropping self-loops.
+  const eds = [];
+  const seen = new Set();
+  for (const e of DATA.edges) {
+    let s = e.src === __INPUT__ ? __INPUT__ : proxy(e.src);
+    let d = proxy(e.dst);
+    if (s !== __INPUT__ && !visSet.has(s)) continue;
+    if (!visSet.has(d)) continue;
+    s = s === __INPUT__ ? s : resolve(s, true);   // producer: its last leaf
+    d = resolve(d, false);                        // consumer: its first leaf
+    if (s === d) continue;
+    const k = s + '>' + d;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    eds.push({ src: s, dst: d, skip: e.skip, tensor: e.tensor });
+  }
+
+  // Only *leaves* carry dataflow; a visible container is a header that spans
+  // its own descendants. Layering containers as if they were peers of their
+  // children is what produces diagonal drift, so they are placed afterwards.
+  const isLeaf = n => !hasKids(n.id) || collapsed.has(n.id);
+  const leaves = vis.filter(isLeaf);
+  const leafSet = new Set(leaves.map(n => n.id));
+
+  // Longest-path layering over leaves only.
+  const row = new Map(leaves.map(n => [n.id, 0]));
+  const preds = new Map();
+  eds.forEach(e => {
+    if (e.src === __INPUT__ || !leafSet.has(e.src) || !leafSet.has(e.dst)) return;
+    if (!preds.has(e.dst)) preds.set(e.dst, []);
+    preds.get(e.dst).push(e.src);
+  });
+  // Sibling leaves inside different containers often have no *direct* edge
+  // (the value passes through the containers), which would collapse the whole
+  // model into a couple of rows. Chain each leaf to the previously executed
+  // one as a weak ordering constraint, except where a real branch exists.
+  const seq = leaves.map(n => n.id).sort((a, b) => a - b);
+  const branchTargets = new Set();
+  eds.forEach(e => { if (e.skip) branchTargets.add(e.dst); });
+  for (let i = 1; i < seq.length; i++) {
+    if (branchTargets.has(seq[i])) continue;   // a shortcut starts a new path
+    if (!preds.has(seq[i])) preds.set(seq[i], []);
+    if (!preds.get(seq[i]).includes(seq[i - 1]))
+      preds.get(seq[i]).push(seq[i - 1]);
+  }
+
+  for (let it = 0; it < leaves.length + 2; it++) {   // acyclic: settles fast
+    let moved = false;
+    for (const n of leaves) {
+      let want = 0;
+      for (const p of (preds.get(n.id) || []))
+        want = Math.max(want, (row.get(p) ?? 0) + 1);
+      if (want !== row.get(n.id)) { row.set(n.id, want); moved = true; }
+    }
+    if (!moved) break;
+  }
+
+  const rows = new Map();
+  leaves.forEach(n => {
+    const r = row.get(n.id);
+    if (!rows.has(r)) rows.set(r, []);
+    rows.get(r).push(n);
+  });
+
+  // Container header rows are inserted above the first row they cover, so
+  // reserve a slot per depth level that actually appears.
+  const rowKeys = [...rows.keys()].sort((a, b) => a - b);
+
+  // Column order matters: siblings of one container must stay contiguous or
+  // their frames interleave and overlap. Sort each row by ancestor chain so
+  // nodes under the same parent are always adjacent.
+  const chain = id => {
+    const out = [];
+    let c = id;
+    while (c !== null && c !== undefined) { out.unshift(c); c = byId.get(c).parent; }
+    return out;
+  };
+  const cmp = (a, b) => {
+    const ca = chain(a.id), cb = chain(b.id);
+    for (let i = 0; i < Math.max(ca.length, cb.length); i++) {
+      const x = ca[i] ?? -1, y2 = cb[i] ?? -1;
+      if (x !== y2) return x - y2;
+    }
+    return 0;
+  };
+
+  // Group leaves by the container that owns them, then give each group its
+  // own column band *and* a contiguous block of rows. Without the row
+  // compaction a group's leaves stagger diagonally, making its frame tall
+  // enough to straddle the neighbouring bands.
+  // Band by the *innermost* visible container: that is the frame that must
+  // stay a tight rectangle. Banding by the outermost one puts every group in
+  // the same column, which is what makes inner frames overlap.
+  const groupOf = id => {
+    let c = byId.get(id).parent;
+    while (c !== null && c !== undefined) {
+      if (visSet.has(c) && !isLeaf(byId.get(c))) return c;
+      c = byId.get(c).parent;
+    }
+    return id;                      // no visible container: stands alone
+  };
+  const groupSeq = [];
+  leaves.slice().sort((a, b) => a.id - b.id).forEach(n => {
+    const g = groupOf(n.id);
+    if (!groupSeq.includes(g)) groupSeq.push(g);
+  });
+
+  // Within a group, leaves that share a row sit side by side; the group's
+  // distinct rows are then renumbered to a contiguous block starting at the
+  // earliest row any of its members reached.
+  // Each group occupies its own block of rows, stacked in execution order.
+  // Inside a block, leaves sharing a dataflow row sit side by side - so
+  // parallel branches (a residual's conv path and its shortcut) stay visibly
+  // parallel while distinct groups never collide.
+  const slot = new Map();           // leaf id -> column index
+  const gridRow = new Map();        // leaf id -> compacted row index
+  let nextRow = 0, maxCols = 1;
+  for (const g of groupSeq) {
+    const mine = leaves.filter(n => groupOf(n.id) === g).sort(cmp);
+    const distinct = [...new Set(mine.map(n => row.get(n.id)))]
+      .sort((a, b) => a - b);
+    const perRow = new Map();
+    mine.forEach(n => {
+      const r = row.get(n.id);
+      const k = perRow.get(r) ?? 0;
+      slot.set(n.id, k);
+      perRow.set(r, k + 1);
+      gridRow.set(n.id, nextRow + distinct.indexOf(r));
+    });
+    nextRow += distinct.length;
+    maxCols = Math.max(maxCols, ...perRow.values());
+  }
+  const W2 = maxCols * (NW + GAPX);
+
+  // Renumber the compacted rows so there are no empty bands left behind.
+  const usedRows = [...new Set([...gridRow.values()])].sort((a, b) => a - b);
+  const rowAt = new Map(usedRows.map((r, i) => [r, i]));
+
+  // Centre each row's occupants across the canvas width.
+  const perGrid = new Map();
+  leaves.forEach(n => {
+    const r = gridRow.get(n.id);
+    perGrid.set(r, (perGrid.get(r) ?? 0) + 1);
+  });
+  const pos = new Map();
+  for (const n of leaves) {
+    const r = gridRow.get(n.id);
+    const span = perGrid.get(r) * (NW + GAPX);
+    pos.set(n.id, {
+      x: (W2 - span) / 2 + slot.get(n.id) * (NW + GAPX) + GAPX / 2,
+      y: 70 + rowAt.get(r) * (NH + GAPY),
+    });
+  }
+
+  // Expanded containers become background *frames* around their descendants
+  // rather than nodes in the flow - a box cannot collide with the children
+  // it encloses, and the nesting stays legible at any depth.
+  // Nesting depth is expressed by *inset*, measured inward from the deepest
+  // level, so the outermost frame is the largest and every frame still fits
+  // inside the row gap regardless of how deep the tree goes.
+  const containers = vis.filter(n => !isLeaf(n));
+  const frames = [];
+  const maxDepth = Math.max(0, ...containers.map(c => c.depth));
+  const STEP = 7, BASE = 10;
+  containers.sort((a, b) => b.depth - a.depth);
+  for (const c of containers) {
+    const pts = descOf(c.id).map(i => pos.get(i)).filter(Boolean);
+    if (!pts.length) continue;
+    const pad = BASE + STEP * (maxDepth - c.depth);
+    const x0 = Math.min(...pts.map(p => p.x)) - pad;
+    const x1 = Math.max(...pts.map(p => p.x)) + NW + pad;
+    const y0 = Math.min(...pts.map(p => p.y)) - pad - 13;
+    const y1 = Math.max(...pts.map(p => p.y)) + NH + pad;
+    frames.push({ id: c.id, x: x0, y: y0, w: x1 - x0, h: y1 - y0, node: c });
+  }
+
+  const frameTop = frames.length ? Math.min(...frames.map(f => f.y)) : 70;
+  pos.set(__INPUT__, { x: (W2 - NW) / 2, y: Math.min(frameTop, 70) - 56 });
+
+  // Normalize so the whole drawing starts at a small positive margin.
+  const dx = 24 - Math.min(...[...pos.values()].map(p => p.x),
+                           ...frames.map(f => f.x));
+  const dy = 24 - Math.min(...[...pos.values()].map(p => p.y),
+                           ...frames.map(f => f.y));
+  pos.forEach(p => { p.x += dx; p.y += dy; });
+  frames.forEach(f => { f.x += dx; f.y += dy; });
+
+  layout = {
+    nodes: leaves, edges: eds, pos, frames,
+    containers: new Set(containers.map(c => c.id)),
+    w: Math.max(...[...pos.values()].map(p => p.x + NW),
+                ...frames.map(f => f.x + f.w)) + 24,
+    h: Math.max(...[...pos.values()].map(p => p.y + NH),
+                ...frames.map(f => f.y + f.h)) + 24,
+  };
+  draw();
+}
+
+// ---------- draw ----------------------------------------------------------
+const SVGNS = 'http://www.w3.org/2000/svg';
+const root = document.getElementById('root');
+const el = (t, a) => {
+  const e = document.createElementNS(SVGNS, t);
+  for (const k in a) e.setAttribute(k, a[k]);
+  return e;
+};
+
+function draw() {
+  root.textContent = '';
+  const { pos } = layout;
+
+  const gF = el('g'), gE = el('g'), gN = el('g');
+  root.append(gF, gE, gN);   // frames sit behind edges and nodes
+
+  for (const f of layout.frames) {
+    const col = colorOf(f.node.cls);
+    const g = el('g', { class: 'frame' });
+    g.dataset.id = f.id;
+    g.appendChild(el('rect', { x: f.x, y: f.y, width: f.w, height: f.h,
+      rx: 10, fill: col, 'fill-opacity': .05, stroke: col,
+      'stroke-opacity': .45, 'stroke-dasharray': '5 4' }));
+    const lab = el('text', { x: f.x + 10, y: f.y + 13, class: 'flab',
+      fill: col });
+    lab.textContent = `${f.node.name}  ·  ${f.node.cls}  ·  ${fmt(f.node.params)}`;
+    g.append(lab);
+    gF.appendChild(g);
+  }
+
+  for (const e of layout.edges) {
+    const a = pos.get(e.src), b = pos.get(e.dst);
+    if (!a || !b) continue;
+    const x1 = a.x + NW / 2, y1 = a.y + (e.src === __INPUT__ ? 26 : NH);
+    const x2 = b.x + NW / 2, y2 = b.y;
+    const my = (y1 + y2) / 2;
+    const p = el('path', {
+      d: `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`,
+      class: 'edge' + (e.skip ? ' skip' : ''),
+      'marker-end': 'url(#arrow)',
+    });
+    p.dataset.src = e.src; p.dataset.dst = e.dst;
+    gE.appendChild(p);
+  }
+
+  // model input pill
+  const ip = pos.get(__INPUT__);
+  const gi = el('g', { transform: `translate(${ip.x},${ip.y})` });
+  gi.appendChild(el('rect', { width: NW, height: 26, rx: 13,
+    fill: 'var(--panel)', stroke: 'var(--accent)' }));
+  const it = el('text', { x: NW / 2, y: 17, 'text-anchor': 'middle',
+    class: 'nc', fill: 'var(--accent)' });
+  it.textContent = 'input ' +
+    (DATA.input_tensors[0] ? shp(DATA.input_tensors[0]) : '');
+  gi.appendChild(it);
+  gN.appendChild(gi);
+
+  for (const n of layout.nodes) {
+    const p = pos.get(n.id);
+    const g = el('g', { class: 'node', transform: `translate(${p.x},${p.y})` });
+    g.dataset.id = n.id;
+    const col = n.error ? 'var(--err)' : colorOf(n.cls);
+    g.appendChild(el('rect', { width: NW, height: NH, rx: 8,
+      fill: 'var(--panel)', stroke: col }));
+    g.appendChild(el('rect', { width: 4, height: NH, rx: 2, fill: col }));
+
+    const t1 = el('text', { x: 12, y: 19, class: 'nm', fill: 'var(--fg)' });
+    t1.textContent = (n.name.length > 20 ? n.name.slice(0, 19) + '\\u2026' : n.name)
+      + (collapsed.has(n.id) ? '  \\u25B8' : '');
+    const t2 = el('text', { x: 12, y: 33, class: 'nc' });
+    t2.textContent = n.cls;
+    const t3 = el('text', { x: 12, y: 47, class: 'ns' });
+    t3.textContent = n.outputs.length ? shp(n.outputs[0]) : '';
+    g.append(t1, t2, t3);
+
+    if (n.params > 0) {
+      const bw = 8 + fmt(n.params).length * 6;
+      g.appendChild(el('rect', { x: NW - bw - 8, y: 8, width: bw, height: 15,
+        rx: 7, fill: col, opacity: .85 }));
+      const tb = el('text', { x: NW - bw / 2 - 8, y: 19,
+        'text-anchor': 'middle', class: 'badge' });
+      tb.textContent = fmt(n.params);
+      g.appendChild(tb);
+    }
+    gN.appendChild(g);
+  }
+
+  const defs = el('defs');
+  const mk = el('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: 9,
+    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
+  mk.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--edge)' }));
+  defs.appendChild(mk);
+  root.appendChild(defs);
+
+  applySelection();
+}
+
+// ---------- interaction ---------------------------------------------------
+let tx = 0, ty = 0, k = 1;
+const svg = document.getElementById('svg');
+const apply = () => root.setAttribute('transform',
+  `translate(${tx},${ty}) scale(${k})`);
+
+function fit() {
+  const r = svg.getBoundingClientRect();
+  // Allow modest upscaling so small graphs fill the canvas, and refuse to
+  // shrink past readability - a tall model is meant to be scrolled, not
+  // rendered as unreadable confetti.
+  k = Math.min(r.width / (layout.w + 80), r.height / (layout.h + 80), 1.9);
+  k = Math.max(k, 0.45);
+  tx = (r.width - layout.w * k) / 2;
+  ty = layout.h * k > r.height ? 16 : (r.height - layout.h * k) / 2;
+  apply();
+}
+
+let drag = null;
+svg.addEventListener('mousedown', e => {
+  drag = { x: e.clientX - tx, y: e.clientY - ty };
+  document.getElementById('stage').classList.add('drag');
+});
+addEventListener('mousemove', e => {
+  if (!drag) return;
+  tx = e.clientX - drag.x; ty = e.clientY - drag.y; apply();
+});
+addEventListener('mouseup', () => {
+  drag = null;
+  document.getElementById('stage').classList.remove('drag');
+});
+svg.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = svg.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const nk = Math.min(3, Math.max(0.12, k * f));
+  tx = mx - (mx - tx) * (nk / k); ty = my - (my - ty) * (nk / k); k = nk;
+  apply();
+}, { passive: false });
+
+svg.addEventListener('click', e => {
+  // A frame's border/label collapses the group it encloses; a node inside it
+  // is matched first, so clicking a child never collapses its parent.
+  const g = e.target.closest('.node') || e.target.closest('.frame');
+  if (!g) { selected = null; applySelection(); return; }
+  const id = +g.dataset.id;
+  const isFrame = g.classList.contains('frame');
+  if (isFrame || (e.detail === 2 && hasKids(id))) {
+    collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+    selected = null;
+    relayout();
+    return;
+  }
+  selected = id;
+  applySelection();
+});
+
+function applySelection() {
+  const near = new Set();
+  if (selected !== null) {
+    near.add(selected);
+    layout.edges.forEach(e => {
+      if (e.src === selected) near.add(e.dst);
+      if (e.dst === selected) near.add(e.src);
+    });
+  }
+  root.querySelectorAll('.node').forEach(g => {
+    const id = +g.dataset.id;
+    g.classList.toggle('sel', id === selected);
+    g.classList.toggle('dim', selected !== null && !near.has(id));
+  });
+  root.querySelectorAll('.edge').forEach(p => {
+    const s = +p.dataset.src, d = +p.dataset.dst;
+    const hot = selected !== null && (s === selected || d === selected);
+    p.classList.toggle('hot', hot);
+    p.classList.toggle('dim', selected !== null && !hot);
+  });
+  detail();
+}
+
+function detail() {
+  const box = document.getElementById('detail');
+  if (selected === null) {
+    const rows = [
+      ['Modules', DATA.nodes.length],
+      ['Parameters', fmt(DATA.total_params) + ' (' + DATA.total_params + ')'],
+      ['Connections', DATA.edges.length],
+      ['Skip edges', DATA.edges.filter(e => e.skip).length],
+    ];
+    box.innerHTML =
+      (DATA.error ? `<div class="err"><b>Forward pass failed</b><br>
+         <code>${esc(DATA.error)}</code><br>Graph shows progress up to the
+         failure.</div>` : '') +
+      '<h2>Model</h2>' + rows.map(r =>
+        `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('') +
+      '<h2>Input</h2>' + DATA.input_tensors.map(t =>
+        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('') +
+      '<h2>Output</h2>' + DATA.output_tensors.map(t =>
+        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('') +
+      '<h2>Tips</h2>' +
+      '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
+      '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
+      '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>';
+    return;
+  }
+  const n = byId.get(selected);
+  const rows = [
+    ['Class', n.cls], ['Path', n.path || '&lt;root&gt;'],
+    ['Depth', n.depth],
+    ['Params (total)', fmt(n.params)],
+    ['Params (own)', fmt(n.own_params)],
+  ];
+  if (DATA.total_params > 0)
+    rows.push(['Share of model',
+      (100 * n.params / DATA.total_params).toFixed(1) + '%']);
+  const cfg = Object.entries(n.config);
+  box.innerHTML =
+    (n.error ? `<div class="err"><code>${esc(n.error)}</code></div>` : '') +
+    '<h2>Module</h2>' + rows.map(r =>
+      `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('') +
+    '<h2>Inputs</h2>' + (n.inputs.length ? n.inputs.map(t =>
+      `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
+      ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
+    '<h2>Outputs</h2>' + (n.outputs.length ? n.outputs.map(t =>
+      `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
+      ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
+    (cfg.length ? '<h2>Config</h2>' + cfg.map(([a, b]) =>
+      `<div class="stat"><span>${esc(a)}</span><span>${esc(String(b))}</span></div>`
+      ).join('') : '');
+}
+const esc = s => String(s).replace(/[&<>]/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+document.getElementById('fit').onclick = fit;
+document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(); };
+document.getElementById('zo').onclick = () => { k = Math.max(.12, k / 1.2); apply(); };
+const MAXD = Math.max(1, ...DATA.nodes.map(n => n.depth));
+let level = 1;
+const setLevel = d => {
+  level = Math.min(MAXD, Math.max(1, d));
+  expandToDepth(level);
+  document.getElementById('lvl').textContent = `depth ${level}/${MAXD}`;
+  selected = null;
+  relayout();
+  fit();
+};
+document.getElementById('exp').onclick = () => setLevel(level + 1);
+document.getElementById('col').onclick = () => setLevel(level - 1);
+
+document.getElementById('title').textContent = DATA.model_name;
+document.getElementById('subtitle').textContent =
+  DATA.nodes.length + ' modules \\u00B7 ' + fmt(DATA.total_params) + ' params';
+setLevel(1);
+addEventListener('resize', fit);
+</script>
+</body>
+</html>
+"""
+
+
+def render_html(graph: Graph, title: Optional[str] = None) -> str:
+    """Return a standalone interactive HTML document for ``graph``."""
+    payload = json.dumps(graph.to_dict(), separators=(",", ":"))
+    # Guard against a literal "</script>" inside the JSON ending the block.
+    payload = payload.replace("</", "<\\/")
+    doc = _TEMPLATE.replace("__DATA__", payload)
+    doc = doc.replace("__INPUT__", str(INPUT_NODE))
+    return doc.replace(
+        "__TITLE__", html.escape(title or f"{graph.model_name} - visualized"))
+
+
+def save_html(graph: Graph, path: str, title: Optional[str] = None) -> str:
+    """Write the visualization to ``path`` and return the absolute path."""
+    doc = render_html(graph, title=title)
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+    return path
+
+
+__all__ = ["render_html", "save_html"]
