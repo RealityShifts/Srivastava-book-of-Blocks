@@ -332,17 +332,61 @@ function relayout() {
     if (!groupSeq.includes(g)) groupSeq.push(g);
   });
 
-  // Within a group, leaves that share a row sit side by side; the group's
-  // distinct rows are then renumbered to a contiguous block starting at the
-  // earliest row any of its members reached.
-  // Each group occupies its own block of rows, stacked in execution order.
-  // Inside a block, leaves sharing a dataflow row sit side by side - so
-  // parallel branches (a residual's conv path and its shortcut) stay visibly
-  // parallel while distinct groups never collide.
+  // Place each group as a block. Groups that are genuinely sequential stack
+  // vertically; groups that run *in parallel* (a residual's conv path and its
+  // shortcut both read the same value and neither feeds the other) must share
+  // rows and sit in adjacent columns, or the picture claims an ordering the
+  // model does not have.
+  const groupDeps = new Map();      // group -> groups it consumes from
+  for (const e of eds) {
+    if (e.src === __INPUT__) continue;
+    const gs = groupOf(e.src), gd = groupOf(e.dst);
+    if (gs === gd) continue;
+    if (!groupDeps.has(gd)) groupDeps.set(gd, new Set());
+    groupDeps.get(gd).add(gs);
+  }
+  // A group may start no earlier than one row past every group it depends on.
+  const groupRow = new Map(groupSeq.map(g => [g, 0]));
+  const groupSpan = new Map(groupSeq.map(g => [g,
+    new Set(leaves.filter(n => groupOf(n.id) === g).map(n => row.get(n.id))).size]));
+  for (let it = 0; it < groupSeq.length + 1; it++) {
+    let moved = false;
+    for (const g of groupSeq) {
+      let want = 0;
+      for (const dep of (groupDeps.get(g) || []))
+        want = Math.max(want, (groupRow.get(dep) ?? 0) + (groupSpan.get(dep) ?? 1));
+      if (want !== groupRow.get(g)) { groupRow.set(g, want); moved = true; }
+    }
+    if (!moved) break;
+  }
+  // Groups sharing a start row are parallel: give them separate column bands.
+  const bandOf = new Map();
+  const byStart = new Map();
+  for (const g of groupSeq) {
+    const r = groupRow.get(g);
+    if (!byStart.has(r)) byStart.set(r, []);
+    bandOf.set(g, byStart.get(r).length);
+    byStart.get(r).push(g);
+  }
+
   const slot = new Map();           // leaf id -> column index
   const gridRow = new Map();        // leaf id -> compacted row index
-  let nextRow = 0, maxCols = 1;
+  let maxCols = 1;
+  // Column offset for a band: width of every band to its left, at any row.
+  const bandWidth = new Map();
   for (const g of groupSeq) {
+    const mine = leaves.filter(n => groupOf(n.id) === g);
+    const perRow = new Map();
+    mine.forEach(n => {
+      const r = row.get(n.id);
+      perRow.set(r, (perRow.get(r) ?? 0) + 1);
+    });
+    bandWidth.set(g, Math.max(1, ...perRow.values()));
+  }
+  for (const g of groupSeq) {
+    const peers = byStart.get(groupRow.get(g)) || [g];
+    const offset = peers.slice(0, bandOf.get(g))
+      .reduce((s, p) => s + bandWidth.get(p), 0);
     const mine = leaves.filter(n => groupOf(n.id) === g).sort(cmp);
     const distinct = [...new Set(mine.map(n => row.get(n.id)))]
       .sort((a, b) => a - b);
@@ -350,12 +394,11 @@ function relayout() {
     mine.forEach(n => {
       const r = row.get(n.id);
       const k = perRow.get(r) ?? 0;
-      slot.set(n.id, k);
+      slot.set(n.id, offset + k);
       perRow.set(r, k + 1);
-      gridRow.set(n.id, nextRow + distinct.indexOf(r));
+      gridRow.set(n.id, groupRow.get(g) + distinct.indexOf(r));
     });
-    nextRow += distinct.length;
-    maxCols = Math.max(maxCols, ...perRow.values());
+    maxCols = Math.max(maxCols, offset + bandWidth.get(g));
   }
   const W2 = maxCols * (NW + GAPX);
 
