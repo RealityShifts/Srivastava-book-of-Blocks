@@ -15,6 +15,7 @@ from typing import Iterable
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int8
 from ._typecheck import typecheck
 
@@ -107,7 +108,7 @@ class QuantizedLinear4bit(nnx.Module):
         return layer
 
     def _dequantize(
-        self, dtype: jnp.dtype
+        self, dtype: DTypeLike
     ) -> Float[Array, "D_in D_out"]:
         lo = (self.qweight.value & 0x0F).astype(jnp.int8) - 8
         hi = (self.qweight.value >> 4).astype(jnp.int8) - 8

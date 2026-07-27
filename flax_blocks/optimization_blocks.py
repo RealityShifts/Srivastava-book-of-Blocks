@@ -22,6 +22,7 @@ from typing import Any, Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, PyTree
 from ._typecheck import typecheck
 
@@ -269,7 +270,7 @@ class EMA:
 # Mixed precision helper
 # ---------------------------------------------------------------------------
 
-def cast_pytree(tree: Any, dtype: jnp.dtype) -> Any:
+def cast_pytree(tree: Any, dtype: DTypeLike) -> Any:
     return jax.tree.map(
         lambda x: x.astype(dtype) if isinstance(x, jax.Array) else x, tree)
 

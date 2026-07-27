@@ -16,6 +16,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped
 from ._typecheck import typecheck
 
@@ -240,7 +241,7 @@ class RotaryEmbedding(nnx.Module):
 
     @typecheck
     def __call__(
-        self, seq_len: int, dtype: jnp.dtype = jnp.float32,
+        self, seq_len: int, dtype: DTypeLike = jnp.float32,
     ) -> tuple[Float[Array, "T D"], Float[Array, "T D"]]:
         inv_freq = 1.0 / (self.base ** (jnp.arange(0, self.head_dim, 2,
                                                    dtype=dtype) / self.head_dim))
