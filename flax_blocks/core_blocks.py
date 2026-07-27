@@ -2,13 +2,78 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from enum import Enum
+from typing import Callable, Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float
 from ._typecheck import typecheck
+
+
+# ---------------------------------------------------------------------------
+# Enums - canonical names for the string-keyed factories below
+# ---------------------------------------------------------------------------
+
+class _StrEnum(str, Enum):
+    """Enum whose members *are* strings, so ``Norm.BATCH == "batch"``.
+
+    Subclassing ``str`` keeps every existing string call site working while
+    giving new code autocompletion and typo-safety.
+    """
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class Activation(_StrEnum):
+    """Activation functions available through :func:`get_activation`."""
+
+    RELU = "relu"
+    LEAKY_RELU = "leaky_relu"
+    GELU = "gelu"
+    SILU = "silu"
+    SWISH = "swish"
+    MISH = "mish"
+    ELU = "elu"
+    TANH = "tanh"
+    SIGMOID = "sigmoid"
+    SOFTPLUS = "softplus"
+    IDENTITY = "identity"
+
+    def __call__(
+        self, x: Float[Array, "..."]
+    ) -> Float[Array, "..."]:
+        """Apply the activation directly: ``Activation.GELU(x)``."""
+        return get_activation(self)(x)
+
+
+class Norm(_StrEnum):
+    """Normalization layers available through :func:`build_norm`."""
+
+    BATCH = "batch"
+    LAYER = "layer"
+    RMS = "rms"
+    INSTANCE = "instance"
+    GROUP = "group"
+    NONE = "none"
+
+    def __call__(self, num_features: int, *, rngs: nnx.Rngs) -> nnx.Module:
+        """Build the layer directly: ``Norm.BATCH(64, rngs=rngs)``."""
+        return build_norm(self, num_features, rngs=rngs)
+
+
+class SkipMode(_StrEnum):
+    """How :class:`SkipConnection` combines the branch with its input."""
+
+    ADD = "add"
+    CONCAT = "concat"
+
+
+ActivationLike = Union[Activation, str]
+NormLike = Union[Norm, str]
+SkipModeLike = Union[SkipMode, str]
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +100,8 @@ class ConvBlock(nnx.Module):
         dilation: int = 1,
         groups: int = 1,
         use_bias: bool = True,
-        norm: str = "layer",
-        activation: str = "relu",
+        norm: NormLike = Norm.LAYER,
+        activation: ActivationLike = Activation.RELU,
         *,
         rngs: nnx.Rngs,
     ) -> None:
@@ -107,29 +172,35 @@ def _mish(x: Float[Array, "..."]) -> Float[Array, "..."]:
     return x * jnp.tanh(jax.nn.softplus(x))
 
 
-_ACTIVATIONS: dict[str, Callable[[Float[Array, "..."]], Float[Array, "..."]]] = {
-    "relu": nnx.relu,
-    "leaky_relu": lambda x: nnx.leaky_relu(x, 0.2),
-    "gelu": nnx.gelu,
-    "silu": nnx.silu,
-    "swish": nnx.silu,
-    "mish": _mish,
-    "elu": nnx.elu,
-    "tanh": nnx.tanh,
-    "sigmoid": nnx.sigmoid,
-    "softplus": nnx.softplus,
-    "identity": lambda x: x,
+_ACTIVATIONS: dict[
+    "Activation", Callable[[Float[Array, "..."]], Float[Array, "..."]]
+] = {
+    Activation.RELU: nnx.relu,
+    Activation.LEAKY_RELU: lambda x: nnx.leaky_relu(x, 0.2),
+    Activation.GELU: nnx.gelu,
+    Activation.SILU: nnx.silu,
+    Activation.SWISH: nnx.silu,
+    Activation.MISH: _mish,
+    Activation.ELU: nnx.elu,
+    Activation.TANH: nnx.tanh,
+    Activation.SIGMOID: nnx.sigmoid,
+    Activation.SOFTPLUS: nnx.softplus,
+    Activation.IDENTITY: lambda x: x,
 }
 
 
 def get_activation(
-    name: str,
+    name: ActivationLike,
 ) -> Callable[[Float[Array, "..."]], Float[Array, "..."]]:
-    """Look up an activation function by short string name."""
-    name = name.lower()
-    if name not in _ACTIVATIONS:
-        raise KeyError(f"unknown activation '{name}', choose from {list(_ACTIVATIONS)}")
-    return _ACTIVATIONS[name]
+    """Look up an activation function by :class:`Activation` member or name."""
+    try:
+        key = Activation(str(name).lower())
+    except ValueError:
+        raise KeyError(
+            f"unknown activation '{name}', choose from "
+            f"{[a.value for a in Activation]}"
+        ) from None
+    return _ACTIVATIONS[key]
 
 
 # ---------------------------------------------------------------------------
@@ -247,25 +318,28 @@ class SPADE(nnx.Module):
         return self.norm(x) * (1 + self.gamma(actv)) + self.beta(actv)
 
 
-def build_norm(kind: str, num_features: int, *,
+def build_norm(kind: NormLike, num_features: int, *,
                rngs: nnx.Rngs) -> nnx.Module:
-    """Factory returning a 2-D normalization Module by short name."""
-    kind = kind.lower()
-    if kind == "batch":
+    """Factory returning a 2-D normalization Module by :class:`Norm` or name."""
+    try:
+        kind = Norm(str(kind).lower())
+    except ValueError:
+        raise KeyError(
+            f"unknown norm '{kind}', choose from {[n.value for n in Norm]}"
+        ) from None
+    if kind is Norm.BATCH:
         return nnx.BatchNorm(num_features, rngs=rngs)
-    if kind == "layer":
+    if kind is Norm.LAYER:
         return nnx.LayerNorm(num_features, rngs=rngs)
-    if kind == "rms":
+    if kind is Norm.RMS:
         return nnx.RMSNorm(num_features, rngs=rngs)
-    if kind == "instance":
+    if kind is Norm.INSTANCE:
         return InstanceNorm(num_features, rngs=rngs)
-    if kind == "group":
+    if kind is Norm.GROUP:
         return nnx.GroupNorm(num_features,
                              num_groups=_gn_groups(num_features),
                              rngs=rngs)
-    if kind == "none":
-        return _Identity()
-    raise KeyError(f"unknown norm '{kind}'")
+    return _Identity()  # Norm.NONE
 
 
 def _gn_groups(channels: int, target: int = 32) -> int:
@@ -289,16 +363,18 @@ class ResidualBlock(nnx.Module):
     """ResNet "basic block": ``y = act(F(x) + shortcut(x))``."""
 
     def __init__(self, in_ch: int, out_ch: int, strides: int = 1,
-                 norm: str = "layer", activation: str = "relu",
+                 norm: NormLike = Norm.LAYER,
+                 activation: ActivationLike = Activation.RELU,
                  *, rngs: nnx.Rngs) -> None:
         self.conv1 = ConvBlock(in_ch, out_ch, 3, strides=strides,
                                norm=norm, activation=activation, rngs=rngs)
         self.conv2 = ConvBlock(out_ch, out_ch, 3,
-                               norm=norm, activation="identity", rngs=rngs)
+                               norm=norm, activation=Activation.IDENTITY, rngs=rngs)
         self.act = get_activation(activation)
         if strides != 1 or in_ch != out_ch:
             self.shortcut: nnx.Module = ConvBlock(in_ch, out_ch, 1, strides=strides,
-                                                  norm=norm, activation="identity",
+                                                  norm=norm,
+                                                  activation=Activation.IDENTITY,
                                                   rngs=rngs)
         else:
             self.shortcut = _Identity()
@@ -313,13 +389,16 @@ class ResidualBlock(nnx.Module):
 class SkipConnection(nnx.Module):
     """Generic residual / concat wrapper: ``y = combine(f(x), x)``."""
 
-    def __init__(self, fn: nnx.Module, mode: str = "add") -> None:
-        if mode not in {"add", "concat"}:
-            raise ValueError("mode must be 'add' or 'concat'")
+    def __init__(self, fn: nnx.Module, mode: SkipModeLike = SkipMode.ADD) -> None:
+        try:
+            mode = SkipMode(str(mode).lower())
+        except ValueError:
+            raise ValueError("mode must be 'add' or 'concat'") from None
         self.fn = fn
         self.mode = mode
 
     @typecheck
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
         y = self.fn(x)
-        return x + y if self.mode == "add" else jnp.concatenate([x, y], axis=-1)
+        return (x + y if self.mode is SkipMode.ADD
+                else jnp.concatenate([x, y], axis=-1))

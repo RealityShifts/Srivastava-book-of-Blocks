@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Shaped
 from ._typecheck import typecheck
+from .core_blocks import Activation, ActivationLike, get_activation
 
 from .attention_blocks import (
     MultiHeadAttention,
@@ -29,11 +30,12 @@ class FeedForward(nnx.Module):
     """Vanilla two-layer MLP used inside transformer blocks."""
 
     def __init__(self, dim: int, hidden: Optional[int] = None,
-                 activation: str = "gelu", *, rngs: nnx.Rngs) -> None:
+                 activation: ActivationLike = Activation.GELU,
+                 *, rngs: nnx.Rngs) -> None:
         hidden = hidden or 4 * dim
         self.fc1 = nnx.Linear(dim, hidden, rngs=rngs)
         self.fc2 = nnx.Linear(hidden, dim, rngs=rngs)
-        self.act = {"gelu": nnx.gelu, "relu": nnx.relu, "silu": nnx.silu}[activation]
+        self.act = get_activation(activation)
 
     @typecheck
     def __call__(

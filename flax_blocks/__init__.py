@@ -49,8 +49,12 @@ from . import (
     efficient_blocks,
     specialized_blocks,
 )
+from .core_blocks import Activation, Norm, SkipMode
 
 __all__ = [
+    "Activation",
+    "Norm",
+    "SkipMode",
     "core_blocks",
     "attention_blocks",
     "transformer_blocks",

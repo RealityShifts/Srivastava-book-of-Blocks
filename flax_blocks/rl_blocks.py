@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
 from ._typecheck import typecheck
+from .core_blocks import Activation, ActivationLike, get_activation
 
 
 # ---------------------------------------------------------------------------
@@ -23,10 +24,10 @@ from ._typecheck import typecheck
 # ---------------------------------------------------------------------------
 
 class _MLP(nnx.Module):
-    def __init__(self, dims: Sequence[int], activation: str = "tanh",
+    def __init__(self, dims: Sequence[int],
+                 activation: ActivationLike = Activation.TANH,
                  *, rngs: nnx.Rngs) -> None:
-        act = {"tanh": nnx.tanh, "relu": nnx.relu, "gelu": nnx.gelu}[activation]
-        self.act = act
+        self.act = get_activation(activation)
         self.layers = [nnx.Linear(dims[i], dims[i + 1], rngs=rngs)
                        for i in range(len(dims) - 1)]
 
