@@ -18,7 +18,10 @@ reject stray instance attributes) and always removed in a ``finally``.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import inspect
+import textwrap
 from typing import Any, Callable, Optional
 
 import jax
@@ -68,6 +71,14 @@ class Node:
     outputs: list        # list[Tensor]
     config: dict         # scalar attributes worth showing (kernel size, ...)
     error: Optional[str] = None
+    # "module" for a real nnx.Module, "merge" for a synthesized node standing
+    # in for a bare array combine (``out + x``) that owns no parameters.
+    kind: str = "module"
+    op: Optional[str] = None      # for merges: "add", "concat", ...
+    # Position in the forward pass. Equals ``id`` for real modules; merges are
+    # appended after tracing, so they carry the order of the call they belong
+    # to and still sort next to their siblings.
+    order: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +94,9 @@ class Node:
             "outputs": [t.to_dict() for t in self.outputs],
             "config": self.config,
             "error": self.error,
+            "kind": self.kind,
+            "op": self.op,
+            "order": self.order if self.order >= 0 else self.id,
         }
 
 
@@ -117,6 +131,8 @@ class Graph:
     input_tensors: list
     output_tensors: list
     error: Optional[str] = None
+    # One entry per returned array: ``{"tensor": Tensor, "src": node id|None}``
+    output_sources: list = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +143,10 @@ class Graph:
             "input_tensors": [t.to_dict() for t in self.input_tensors],
             "output_tensors": [t.to_dict() for t in self.output_tensors],
             "error": self.error,
+            "output_sources": [
+                {"tensor": o["tensor"].to_dict(), "src": o["src"]}
+                for o in self.output_sources
+            ],
         }
 
 
@@ -169,6 +189,42 @@ _INTERESTING = (
     "num_heads", "in_ch", "out_ch", "dim", "hidden", "mode", "axis",
     "momentum", "dtype", "param_dtype",
 )
+
+
+def _is_descendant(node_id: int, ancestor_id: int, nodes: list) -> bool:
+    """Is ``node_id`` inside ``ancestor_id``'s subtree?"""
+    cur = nodes[node_id].parent
+    while cur is not None:
+        if cur == ancestor_id:
+            return True
+        cur = nodes[cur].parent
+    return False
+
+
+def _combine_op(fn: Optional[Callable]) -> Optional[str]:
+    """Does ``fn`` (an unwrapped ``__call__``) combine tensors with array ops?
+
+    Returns ``"add"`` / ``"concat"`` / ``None``. Residual adds are written as
+    ``out = out + x`` rather than as a module, so nothing in the runtime trace
+    marks them. Reading the source is exact where guessing from array identity
+    is not: ``ConvBlock`` also returns a fresh array (its activation) but
+    contains no add, and only the source distinguishes the two.
+    """
+    if fn is None:
+        return None
+    fn = getattr(fn, "__wrapped__", fn)
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    except (OSError, TypeError, SyntaxError, IndentationError):
+        return None                      # C-implemented or source unavailable
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return "add"
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) in
+                ("concatenate", "concat")):
+            return "concat"
+    return None
 
 
 def _config_of(module: nnx.Module) -> dict:
@@ -224,15 +280,28 @@ def trace_model(
     keepalive: list = []
     stack: list = []         # currently-executing node ids
     order: list = []         # completion order, for skip-edge detection
+    child_of: dict = {}      # node id -> ids of modules it called directly
+    produced_by: dict = {}   # node id -> ids of the arrays it returned
+    merge_candidates: list = []   # calls that combined values with bare ops
 
-    def _register(obj: Any, node_id: int) -> None:
-        """Record ``node_id`` as the producer of every array leaf in ``obj``."""
+    def _register(obj: Any, node_id: int, *, claim: bool = True) -> None:
+        """Record ``node_id`` as the producer of every array leaf in ``obj``.
+
+        ``claim=False`` keeps the first (innermost) producer: a container
+        returns its child's array unchanged, and the child is the real
+        origin of that value.
+        """
         for leaf in jax.tree_util.tree_leaves(obj):
             if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
-                producer[id(leaf)] = node_id
+                if claim or id(leaf) not in producer:
+                    producer[id(leaf)] = node_id
                 keepalive.append(leaf)
 
     def _wrap(fn: Callable) -> Callable:
+        # Computed once per class, from the *original* function - inside the
+        # wrapper ``cls.__dict__['__call__']`` is this wrapper, not the source.
+        combine_op = _combine_op(fn)
+
         def wrapper(self, *a, **kw):
             key = id(self)
             if key not in paths:      # a module built during the call
@@ -253,6 +322,8 @@ def trace_model(
                 config=_config_of(self),
             )
             nodes.append(node)
+            if node.parent is not None:
+                child_of.setdefault(node.parent, []).append(node.id)
             stack.append(node.id)
 
             # Edges: which earlier module produced the arrays we consumed?
@@ -284,7 +355,30 @@ def trace_model(
                     order.append(node.id)
 
             node.outputs = _as_tensors(out)
-            _register(out, node.id)
+
+            # Did this call combine values with bare array ops? A container
+            # that returns an array none of its children produced, while two
+            # or more values it *did* see are still unaccounted for, has run
+            # something like ``out + x`` between its children. Record the
+            # candidate; ``_add_merges`` below decides which are real.
+            out_ids = set(_array_ids(out))
+            child_ids: set = set()
+            for cid in child_of.get(node.id, []):
+                child_ids.update(produced_by.get(cid, ()))
+            if out_ids and not (out_ids & child_ids):
+                merge_candidates.append({
+                    "node": node.id,
+                    "in_ids": set(_array_ids((a, kw))),
+                    "child_ids": child_ids,
+                    "out": next(iter(node.outputs), None),
+                    "op": combine_op,
+                })
+
+            produced_by[node.id] = out_ids
+            # A wrapper module often returns its last child's array verbatim.
+            # Keep the child as the producer so edges and output attribution
+            # point at the module that actually computed the value.
+            _register(out, node.id, claim=False)
             return out
 
         wrapper._visualized_tracer = True
@@ -305,6 +399,7 @@ def trace_model(
 
     error = None
     outputs: list = []
+    result = None
     # Node id -1 stands for "the model's own input", so a module consuming the
     # raw input (a residual shortcut, typically) still gets a visible edge.
     _register((args, kwargs), INPUT_NODE)
@@ -317,6 +412,21 @@ def trace_model(
         for cls, fn in patched.items():
             setattr(cls, "__call__", fn)
 
+    # Which module produced each returned array? Recorded here (while the
+    # producer map is still populated) so the renderer can draw one output
+    # node per result and wire it to the module it came from.
+    out_sources: list = []
+    if result is not None:
+        for leaf in jax.tree_util.tree_leaves(result):
+            if not (hasattr(leaf, "shape") and hasattr(leaf, "dtype")):
+                continue
+            out_sources.append({
+                "tensor": Tensor(tuple(leaf.shape), str(leaf.dtype)),
+                # ``None`` means the value was built by bare jnp ops after the
+                # last module ran, so no module owns it directly.
+                "src": producer.get(id(leaf)),
+            })
+
     # own_params = params not attributable to any child module
     children: dict = {}
     for n in nodes:
@@ -325,6 +435,79 @@ def trace_model(
     for n in nodes:
         child_total = sum(nodes[c].params for c in children.get(n.id, []))
         n.own_params = max(0, n.params - child_total)
+
+    # Residual adds are bare array ops (``out = out + x``), not modules, so
+    # nothing above records them and the branches appear to diverge and never
+    # rejoin. Synthesize an explicit merge node for each container that
+    # combined an incoming value with something its children produced: it is
+    # the only part of a residual block that carries no parameters, and
+    # without it the picture is simply wrong.
+    for cand in merge_candidates:
+        host = nodes[cand["node"]]
+        op = cand["op"]
+        if op is None:
+            continue                    # no ``+`` / concat in this __call__
+        kids_ids = child_of.get(host.id, [])
+        if not kids_ids:
+            continue                    # a leaf module, nothing was combined
+        # Operands are the children whose output nothing else consumed - the
+        # ends of each branch. In ``conv2(conv1(x)) + shortcut(x)`` that is
+        # {conv2, shortcut}: conv1's output was eaten by conv2, so conv1 is
+        # mid-branch, while the *last-called* child is merely ``shortcut``.
+        consumed = {e.src for e in edges if e.dst in kids_ids}
+        branch_ends = [k for k in kids_ids if k not in consumed]
+        # Plus any value the host received that no child produced (a residual
+        # adding the raw input, as in ``out + x``). Skip it when a branch end
+        # already consumed that same value - then the branch *is* that path
+        # (``shortcut(x)``), and adding the raw input would double-count it.
+        in_end_subtree = set(branch_ends)
+        for n in nodes:
+            if any(_is_descendant(n.id, b, nodes) for b in branch_ends):
+                in_end_subtree.add(n.id)
+        fed_ends = {e.src for e in edges
+                    if e.dst in in_end_subtree and e.src not in kids_ids}
+        carried = [src for src in (producer.get(i) for i in cand["in_ids"])
+                   if src is not None and src != host.id
+                   and src not in kids_ids and src not in fed_ends]
+        if len(branch_ends) + len(carried) < 2:
+            continue                    # nothing actually converged here
+        last_kid = branch_ends[-1] if branch_ends else kids_ids[-1]
+        sym = "+" if op == "add" else "⧺"
+        merge = Node(
+            id=len(nodes),
+            path=f"{host.path}.{sym}" if host.path != "<root>" else sym,
+            name=sym,
+            cls=op,
+            depth=host.depth + 1,
+            parent=host.id,
+            params=0,
+            own_params=0,
+            inputs=[t for t in (cand["out"],) if t is not None],
+            outputs=[t for t in (cand["out"],) if t is not None],
+            config={},
+            kind="merge",
+            op=op,
+            # Runs after the host's last child *and everything that child
+            # called*, so sort past that whole subtree rather than past the
+            # child's own id.
+            order=max([last_kid] + [n.id for n in nodes
+                                    if _is_descendant(n.id, last_kid, nodes)]),
+        )
+        nodes.append(merge)
+        children.setdefault(host.id, []).append(merge.id)
+        tensor = cand["out"] or Tensor((), "")
+        # Every branch end feeds the merge. The first (the longest-running
+        # path) is the main line; the rest are the shortcuts.
+        operands = list(dict.fromkeys(branch_ends + carried))
+        for i, src in enumerate(operands):
+            edges.append(Edge(src, merge.id, tensor, skip=i > 0))
+        # anything that consumed the host's output now consumes the merge
+        for e in edges:
+            if e.src == host.id and e.dst != merge.id:
+                e.src = merge.id
+        for o in out_sources:
+            if o["src"] == host.id:
+                o["src"] = merge.id
 
     # Array identity only survives while a value passes straight from one
     # module to the next. A bare ``jnp``/``jax.nn`` call in between (an
@@ -381,6 +564,7 @@ def trace_model(
         input_tensors=_as_tensors((args, kwargs)),
         output_tensors=outputs,
         error=error,
+        output_sources=out_sources,
     )
 
 

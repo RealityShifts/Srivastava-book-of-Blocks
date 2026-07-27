@@ -69,6 +69,20 @@ residual connections; solid edges are ordinary dataflow. The sidebar shows
 per-module input/output shapes, parameter totals, share of the whole model,
 and constructor config (kernel size, strides, epsilon, ...).
 
+The blue pill at the top is the model input. **Green pills at the bottom are
+the model's outputs** - one per returned array, each wired in green to the
+module that actually produced it. A model returning a tuple or a list of
+feature maps gets one pill per entry, numbered in return order; click any of
+them to see its shape and its producing module.
+
+**Residual adds appear as an orange `+` circle.** A residual is written as a
+bare array op (`out = out + x`), not as a module, so nothing in a
+module-level trace records it - the branches would appear to diverge and
+never rejoin. Blocks like `FeatResBlock` and `ResidualBlock` therefore get a
+synthesized merge node carrying no parameters, with the skip operand bowed
+out sideways so the bypass is visible rather than hidden under the main
+chain.
+
 The view opens at depth 1 - top-level children only. Increase depth as
 needed; big models stay readable because you choose how far to unfold.
 
@@ -93,8 +107,14 @@ Consequences worth knowing:
   marked in red - which is exactly when the picture is most useful.
 - **Dataflow edges come from array identity** (`id()` of the arrays a module
   consumed vs. produced). Values that pass through pure `jnp` operations
-  between modules are new arrays, so an edge may be attributed to the nearest
-  enclosing module rather than the exact tensor.
+  between modules are new arrays, which breaks the chain; those links are
+  recovered from execution order instead and tagged `inferred`.
+- **Merge nodes are gated on the source.** Whether a container really
+  combined tensors is decided by parsing its `__call__` for a `+` or a
+  `concatenate`, because array identity alone cannot tell a residual add from
+  an ordinary activation - `ConvBlock` also returns a fresh array. If the
+  source is unavailable (a C-implemented or dynamically generated `__call__`),
+  no merge node is synthesized and the residual will not be drawn.
 - Tracing is not thread-safe: it patches classes for the duration of the call.
 
 ## Requirements

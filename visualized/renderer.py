@@ -27,6 +27,7 @@ _TEMPLATE = """<!doctype html>
 :root {
   --bg:#0f1117; --panel:#171a23; --line:#262b38; --fg:#e6e9ef; --muted:#8b93a7;
   --accent:#6ea8fe; --skip:#f0883e; --edge:#3d4358; --hi:#ffd166; --err:#ff6b6b;
+  --out:#5ec9a7;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg:#f7f8fa; --panel:#fff; --line:#e2e5ec; --fg:#1b1f2a;
@@ -78,10 +79,12 @@ button:hover { border-color:var(--accent); }
 .flab { font-size:10.5px; font-weight:600; letter-spacing:.02em;
   cursor:pointer; }
 .frame rect { pointer-events:stroke; cursor:pointer; }
-.node.sel rect { stroke:var(--hi); stroke-width:2.5px; }
-.node.dim { opacity:.28; }
+.node.sel rect, .outnode.sel rect { stroke:var(--hi); stroke-width:2.5px; }
+.node.dim, .outnode.dim { opacity:.28; }
 .edge { fill:none; stroke:var(--edge); stroke-width:1.6px; }
 .edge.skip { stroke:var(--skip); stroke-dasharray:5 4; }
+.edge.toout { stroke:var(--out); }
+.outnode rect { transition:stroke-width .1s; }
 .edge.hot { stroke:var(--hi); stroke-width:2.6px; }
 .edge.dim { opacity:.12; }
 .badge { font-size:9.5px; fill:var(--bg); font-weight:700; }
@@ -108,6 +111,7 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
       <div><i></i> dataflow</div>
       <div><i style="border-color:var(--skip);border-top-style:dashed"></i>
            skip / residual</div>
+      <div><i style="border-color:var(--out)"></i> model output</div>
       <div style="margin-top:4px">scroll = zoom &middot; drag = pan &middot;
            click = inspect</div>
     </div>
@@ -139,6 +143,11 @@ const shp = t => '(' + t.shape.join(', ') + ')';
 
 // ---------- state ---------------------------------------------------------
 const byId = new Map(DATA.nodes.map(n => [n.id, n]));
+const mergeIds = new Set(
+  DATA.nodes.filter(n => n.kind === 'merge').map(n => n.id));
+// Execution position. Merge nodes are appended after tracing, so their raw id
+// is far higher than their siblings'; ``order`` puts them back in sequence.
+const ord = n => (typeof n === 'object' ? n : byId.get(n) || {}).order ?? 0;
 const kids = new Map();
 DATA.nodes.forEach(n => {
   if (n.parent !== null) {
@@ -183,6 +192,10 @@ const proxy = id => {
 // GAPY must exceed twice the deepest frame padding plus the label strip,
 // otherwise a group's frame runs into the frame of the group below it.
 const NW = 190, NH = 54, GAPX = 26, GAPY = 92;
+// Output pills take ids below every real node id (which start at 0) and below
+// __INPUT__, so the three id spaces never collide.
+const OUT_BASE = -1000;
+const isOutput = id => id <= OUT_BASE;
 let layout = { nodes: [], edges: [], w: 0, h: 0 };
 
 function relayout() {
@@ -246,11 +259,12 @@ function relayout() {
   // (the value passes through the containers), which would collapse the whole
   // model into a couple of rows. Chain each leaf to the previously executed
   // one as a weak ordering constraint, except where a real branch exists.
-  const seq = leaves.map(n => n.id).sort((a, b) => a - b);
+  const seq = leaves.map(n => n.id).sort((a, b) => ord(a) - ord(b));
   const branchTargets = new Set();
   eds.forEach(e => { if (e.skip) branchTargets.add(e.dst); });
   for (let i = 1; i < seq.length; i++) {
     if (branchTargets.has(seq[i])) continue;   // a shortcut starts a new path
+    if (mergeIds.has(seq[i])) continue;        // a merge is placed by its edges
     if (!preds.has(seq[i])) preds.set(seq[i], []);
     if (!preds.get(seq[i]).includes(seq[i - 1]))
       preds.get(seq[i]).push(seq[i - 1]);
@@ -291,7 +305,8 @@ function relayout() {
     const ca = chain(a.id), cb = chain(b.id);
     for (let i = 0; i < Math.max(ca.length, cb.length); i++) {
       const x = ca[i] ?? -1, y2 = cb[i] ?? -1;
-      if (x !== y2) return x - y2;
+      // -1 means "chain ended": the shallower node sorts first.
+      if (x !== y2) return (x < 0 ? -1 : ord(x)) - (y2 < 0 ? -1 : ord(y2));
     }
     return 0;
   };
@@ -312,7 +327,7 @@ function relayout() {
     return id;                      // no visible container: stands alone
   };
   const groupSeq = [];
-  leaves.slice().sort((a, b) => a.id - b.id).forEach(n => {
+  leaves.slice().sort((a, b) => ord(a) - ord(b)).forEach(n => {
     const g = groupOf(n.id);
     if (!groupSeq.includes(g)) groupSeq.push(g);
   });
@@ -354,13 +369,29 @@ function relayout() {
     const r = gridRow.get(n.id);
     perGrid.set(r, (perGrid.get(r) ?? 0) + 1);
   });
+  // A row holding only merges is drawn as small circles, so it needs far
+  // less vertical space than a row of full module cards.
+  const rowIsMerge = new Map();
+  leaves.forEach(n => {
+    const r = gridRow.get(n.id);
+    const prev = rowIsMerge.get(r);
+    const mine = n.kind === 'merge';
+    rowIsMerge.set(r, prev === undefined ? mine : prev && mine);
+  });
+  const rowTop = new Map();
+  let yCursor = 70;
+  [...rowAt.keys()].sort((a, b) => rowAt.get(a) - rowAt.get(b)).forEach(r => {
+    rowTop.set(r, yCursor);
+    yCursor += (rowIsMerge.get(r) ? 40 : NH) + GAPY;
+  });
+
   const pos = new Map();
   for (const n of leaves) {
     const r = gridRow.get(n.id);
     const span = perGrid.get(r) * (NW + GAPX);
     pos.set(n.id, {
       x: (W2 - span) / 2 + slot.get(n.id) * (NW + GAPX) + GAPX / 2,
-      y: 70 + rowAt.get(r) * (NH + GAPY),
+      y: rowTop.get(r),
     });
   }
 
@@ -379,15 +410,53 @@ function relayout() {
     const pts = descOf(c.id).map(i => pos.get(i)).filter(Boolean);
     if (!pts.length) continue;
     const pad = BASE + STEP * (maxDepth - c.depth);
+    const ids = descOf(c.id).filter(i => pos.get(i));
+    const hOf = i => (byId.get(i) && byId.get(i).kind === 'merge' ? 40 : NH);
     const x0 = Math.min(...pts.map(p => p.x)) - pad;
     const x1 = Math.max(...pts.map(p => p.x)) + NW + pad;
     const y0 = Math.min(...pts.map(p => p.y)) - pad - 13;
-    const y1 = Math.max(...pts.map(p => p.y)) + NH + pad;
+    const y1 = Math.max(...ids.map(i => pos.get(i).y + hOf(i))) + pad;
     frames.push({ id: c.id, x: x0, y: y0, w: x1 - x0, h: y1 - y0, node: c });
   }
 
   const frameTop = frames.length ? Math.min(...frames.map(f => f.y)) : 70;
   pos.set(__INPUT__, { x: (W2 - NW) / 2, y: Math.min(frameTop, 70) - 56 });
+
+  // One output pill per returned array, on a row below everything else and
+  // wired to the module that produced it. Outputs use ids __OUT_BASE__ - i so
+  // they never collide with real node ids.
+  const frameBottom = frames.length
+    ? Math.max(...frames.map(f => f.y + f.h))
+    : Math.max(...[...pos.values()].map(p => p.y + NH));
+  const outs = (DATA.output_sources || []).map((o, i) => {
+    // Resolve the producing module down to whatever is currently visible.
+    let s = o.src;
+    if (s !== null && s !== undefined) {
+      s = proxy(s);
+      s = visSet.has(s) ? resolve(s, true) : null;
+    } else s = null;
+    return { id: OUT_BASE - i, tensor: o.tensor, src: o.src, index: i,
+             attach: s };
+  });
+  // Place pills in producer order (left to right) so the connecting curves
+  // fan out cleanly instead of crossing each other.
+  const ordered = outs.slice().sort((a, b) => {
+    const pa = a.attach !== null ? pos.get(a.attach) : null;
+    const pb = b.attach !== null ? pos.get(b.attach) : null;
+    if (pa && pb && pa.x !== pb.x) return pa.x - pb.x;
+    if (pa && pb) return pa.y - pb.y;
+    return a.index - b.index;
+  });
+  const outSpan = Math.max(1, ordered.length) * (NW + GAPX);
+  ordered.forEach((o, i) => {
+    pos.set(o.id, {
+      x: (W2 - outSpan) / 2 + i * (NW + GAPX) + GAPX / 2,
+      y: frameBottom + 46,
+    });
+    if (o.attach !== null)
+      eds.push({ src: o.attach, dst: o.id, skip: false, tensor: o.tensor,
+                 toOutput: true });
+  });
 
   // Normalize so the whole drawing starts at a small positive margin.
   const dx = 24 - Math.min(...[...pos.values()].map(p => p.x),
@@ -398,7 +467,7 @@ function relayout() {
   frames.forEach(f => { f.x += dx; f.y += dy; });
 
   layout = {
-    nodes: leaves, edges: eds, pos, frames,
+    nodes: leaves, edges: eds, pos, frames, outs,
     containers: new Set(containers.map(c => c.id)),
     w: Math.max(...[...pos.values()].map(p => p.x + NW),
                 ...frames.map(f => f.x + f.w)) + 24,
@@ -441,13 +510,28 @@ function draw() {
   for (const e of layout.edges) {
     const a = pos.get(e.src), b = pos.get(e.dst);
     if (!a || !b) continue;
-    const x1 = a.x + NW / 2, y1 = a.y + (e.src === __INPUT__ ? 26 : NH);
-    const x2 = b.x + NW / 2, y2 = b.y;
+    // Merges are drawn as a circle centred in their slot, so edges meet the
+    // circle rather than the (invisible) card bounds.
+    const srcMerge = mergeIds.has(e.src), dstMerge = mergeIds.has(e.dst);
+    const x1 = a.x + NW / 2;
+    const y1 = a.y + (e.src === __INPUT__ ? 26 : srcMerge ? 37 : NH);
+    const x2 = b.x + NW / 2;
+    const y2 = b.y + (dstMerge ? 3 : 0);
     const my = (y1 + y2) / 2;
+    let d;
+    if (e.skip && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
+      // A residual that returns to the same column would be hidden under the
+      // main chain. Bow it out sideways so the bypass is actually visible.
+      const bow = NW * 0.62;
+      d = `M${x1},${y1} C${x1 - bow},${y1 + 20} ${x2 - bow},${y2 - 20} `
+        + `${x2},${y2}`;
+    } else {
+      d = `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
+    }
     const p = el('path', {
-      d: `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`,
-      class: 'edge' + (e.skip ? ' skip' : ''),
-      'marker-end': 'url(#arrow)',
+      d,
+      class: 'edge' + (e.skip ? ' skip' : '') + (e.toOutput ? ' toout' : ''),
+      'marker-end': e.toOutput ? 'url(#arrowout)' : 'url(#arrow)',
     });
     p.dataset.src = e.src; p.dataset.dst = e.dst;
     gE.appendChild(p);
@@ -465,10 +549,45 @@ function draw() {
   gi.appendChild(it);
   gN.appendChild(gi);
 
+  // one pill per returned array
+  for (const o of layout.outs) {
+    const p = pos.get(o.id);
+    if (!p) continue;
+    const g = el('g', { class: 'outnode',
+      transform: `translate(${p.x},${p.y})` });
+    g.dataset.id = o.id;
+    g.appendChild(el('rect', { width: NW, height: 30, rx: 15,
+      fill: 'var(--panel)', stroke: 'var(--out)', 'stroke-width': 1.6 }));
+    const t = el('text', { x: NW / 2, y: 19, 'text-anchor': 'middle',
+      class: 'nc', fill: 'var(--out)' });
+    const label = layout.outs.length > 1 ? `output ${o.index}` : 'output';
+    t.textContent = `${label} ${shp(o.tensor)}`;
+    g.appendChild(t);
+    gN.appendChild(g);
+  }
+
   for (const n of layout.nodes) {
     const p = pos.get(n.id);
     const g = el('g', { class: 'node', transform: `translate(${p.x},${p.y})` });
     g.dataset.id = n.id;
+
+    // A merge (a residual ``+``) owns no parameters and is not a module, so
+    // it is drawn as a small circle on the flow rather than a full card.
+    if (n.kind === 'merge') {
+      const cx = NW / 2, cy = 20;
+      g.appendChild(el('circle', { cx, cy, r: 17, fill: 'var(--panel)',
+        stroke: 'var(--skip)', 'stroke-width': 2 }));
+      const s = el('text', { x: cx, y: cy + 6, 'text-anchor': 'middle',
+        fill: 'var(--skip)', 'font-size': 18, 'font-weight': 700 });
+      s.textContent = n.name;
+      g.appendChild(s);
+      const sh = el('text', { x: cx, y: cy + 33, 'text-anchor': 'middle',
+        class: 'ns' });
+      sh.textContent = n.outputs.length ? shp(n.outputs[0]) : '';
+      g.appendChild(sh);
+      gN.appendChild(g);
+      continue;
+    }
     const col = n.error ? 'var(--err)' : colorOf(n.cls);
     g.appendChild(el('rect', { width: NW, height: NH, rx: 8,
       fill: 'var(--panel)', stroke: col }));
@@ -500,6 +619,10 @@ function draw() {
     refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
   mk.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--edge)' }));
   defs.appendChild(mk);
+  const mo = el('marker', { id: 'arrowout', viewBox: '0 0 10 10', refX: 9,
+    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
+  mo.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--out)' }));
+  defs.appendChild(mo);
   root.appendChild(defs);
 
   applySelection();
@@ -549,7 +672,8 @@ svg.addEventListener('wheel', e => {
 svg.addEventListener('click', e => {
   // A frame's border/label collapses the group it encloses; a node inside it
   // is matched first, so clicking a child never collapses its parent.
-  const g = e.target.closest('.node') || e.target.closest('.frame');
+  const g = e.target.closest('.node') || e.target.closest('.outnode')
+         || e.target.closest('.frame');
   if (!g) { selected = null; applySelection(); return; }
   const id = +g.dataset.id;
   const isFrame = g.classList.contains('frame');
@@ -572,7 +696,7 @@ function applySelection() {
       if (e.dst === selected) near.add(e.src);
     });
   }
-  root.querySelectorAll('.node').forEach(g => {
+  root.querySelectorAll('.node, .outnode').forEach(g => {
     const id = +g.dataset.id;
     g.classList.toggle('sel', id === selected);
     g.classList.toggle('dim', selected !== null && !near.has(id));
@@ -609,6 +733,22 @@ function detail() {
       '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
       '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
       '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>';
+    return;
+  }
+  if (isOutput(selected)) {           // an output pill, not a module
+    const o = layout.outs.find(x => x.id === selected);
+    const src = o && o.src !== null && o.src !== undefined
+      ? byId.get(o.src) : null;
+    box.innerHTML = '<h2>Model output</h2>' +
+      `<div class="stat"><span>Index</span><span>${o ? o.index : ''}</span></div>` +
+      `<div class="stat"><span>Shape</span><span>${o ? shp(o.tensor) : ''}</span></div>` +
+      `<div class="stat"><span>dtype</span><span>${o ? o.tensor.dtype : ''}</span></div>` +
+      '<h2>Produced by</h2>' +
+      (src
+        ? `<div class="stat"><span>${esc(src.cls)}</span>` +
+          `<span>${esc(src.path)}</span></div>`
+        : '<div class="stat"><span>no module</span>' +
+          '<span>built by array ops</span></div>');
     return;
   }
   const n = byId.get(selected);
