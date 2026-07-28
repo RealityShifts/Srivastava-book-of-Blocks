@@ -14,7 +14,7 @@ import json
 import os
 from typing import Optional
 
-from .tracer import Graph, INPUT_NODE
+from .tracer import Graph, INPUT_NODE, IN_BASE
 
 
 _TEMPLATE = """<!doctype html>
@@ -193,9 +193,12 @@ const proxy = id => {
 // otherwise a group's frame runs into the frame of the group below it.
 const NW = 190, NH = 54, GAPX = 26, GAPY = 92;
 // Output pills take ids below every real node id (which start at 0) and below
-// __INPUT__, so the three id spaces never collide.
+// __INPUT__, so the three id spaces never collide. Extra input pills (argument
+// two onward) sit in the gap between __INPUT__ and OUT_BASE.
 const OUT_BASE = -1000;
+const IN_BASE = __IN_BASE__;
 const isOutput = id => id <= OUT_BASE;
+const isInput = id => id === __INPUT__ || (id <= IN_BASE && id > OUT_BASE);
 let layout = { nodes: [], edges: [], w: 0, h: 0 };
 
 function relayout() {
@@ -504,7 +507,24 @@ function relayout() {
   }
 
   const frameTop = frames.length ? Math.min(...frames.map(f => f.y)) : 70;
-  pos.set(__INPUT__, { x: (W2 - NW) / 2, y: Math.min(frameTop, 70) - 56 });
+  // One pill per argument the model was called with. The first keeps the id
+  // __INPUT__ so the dataflow edges the tracer already emits against it stay
+  // valid; the rest use __IN_BASE__ - i, which cannot collide with real node
+  // ids or with the output pills.
+  const ins = (DATA.input_tensors || []).map((t, i) => ({
+    id: i === 0 ? __INPUT__ : IN_BASE - i, tensor: t, index: i,
+  }));
+  if (!ins.length) ins.push({ id: __INPUT__, tensor: null, index: 0 });
+  const inSpan = ins.length * (NW + GAPX);
+  const inY = Math.min(frameTop, 70) - 56;
+  ins.forEach((n, i) => {
+    pos.set(n.id, {
+      x: ins.length === 1
+        ? (W2 - NW) / 2
+        : (W2 - inSpan) / 2 + i * (NW + GAPX) + GAPX / 2,
+      y: inY,
+    });
+  });
 
   // One output pill per returned array, on a row below everything else and
   // wired to the module that produced it. Outputs use ids __OUT_BASE__ - i so
@@ -551,7 +571,7 @@ function relayout() {
   frames.forEach(f => { f.x += dx; f.y += dy; });
 
   layout = {
-    nodes: leaves, edges: eds, pos, frames, outs,
+    nodes: leaves, edges: eds, pos, frames, outs, ins,
     containers: new Set(containers.map(c => c.id)),
     w: Math.max(...[...pos.values()].map(p => p.x + NW),
                 ...frames.map(f => f.x + f.w)) + 24,
@@ -598,7 +618,7 @@ function draw() {
     // circle rather than the (invisible) card bounds.
     const srcMerge = mergeIds.has(e.src), dstMerge = mergeIds.has(e.dst);
     const x1 = a.x + NW / 2;
-    const y1 = a.y + (e.src === __INPUT__ ? 26 : srcMerge ? 37 : NH);
+    const y1 = a.y + (isInput(e.src) ? 26 : srcMerge ? 37 : NH);
     const x2 = b.x + NW / 2;
     const y2 = b.y + (dstMerge ? 3 : 0);
     const my = (y1 + y2) / 2;
@@ -621,17 +641,20 @@ function draw() {
     gE.appendChild(p);
   }
 
-  // model input pill
-  const ip = pos.get(__INPUT__);
-  const gi = el('g', { transform: `translate(${ip.x},${ip.y})` });
-  gi.appendChild(el('rect', { width: NW, height: 26, rx: 13,
-    fill: 'var(--panel)', stroke: 'var(--accent)' }));
-  const it = el('text', { x: NW / 2, y: 17, 'text-anchor': 'middle',
-    class: 'nc', fill: 'var(--accent)' });
-  it.textContent = 'input ' +
-    (DATA.input_tensors[0] ? shp(DATA.input_tensors[0]) : '');
-  gi.appendChild(it);
-  gN.appendChild(gi);
+  // one pill per model input
+  for (const n of layout.ins) {
+    const ip = pos.get(n.id);
+    if (!ip) continue;
+    const gi = el('g', { transform: `translate(${ip.x},${ip.y})` });
+    gi.appendChild(el('rect', { width: NW, height: 26, rx: 13,
+      fill: 'var(--panel)', stroke: 'var(--accent)' }));
+    const it = el('text', { x: NW / 2, y: 17, 'text-anchor': 'middle',
+      class: 'nc', fill: 'var(--accent)' });
+    const label = layout.ins.length > 1 ? `input ${n.index}` : 'input';
+    it.textContent = `${label} ${n.tensor ? shp(n.tensor) : ''}`;
+    gi.appendChild(it);
+    gN.appendChild(gi);
+  }
 
   // one pill per returned array
   for (const o of layout.outs) {
@@ -897,6 +920,7 @@ def render_html(graph: Graph, title: Optional[str] = None) -> str:
     payload = payload.replace("</", "<\\/")
     doc = _TEMPLATE.replace("__DATA__", payload)
     doc = doc.replace("__INPUT__", str(INPUT_NODE))
+    doc = doc.replace("__IN_BASE__", str(IN_BASE))
     return doc.replace(
         "__TITLE__", html.escape(title or f"{graph.model_name} - visualized"))
 

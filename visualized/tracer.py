@@ -31,6 +31,9 @@ from flax import nnx
 
 # Synthetic node id meaning "the model's own input" (see ``trace_model``).
 INPUT_NODE = -1
+# Arguments after the first get their own input pills, numbered IN_BASE - i.
+# The renderer mirrors both constants - keep them in step.
+IN_BASE = -500
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +405,12 @@ def trace_model(
     result = None
     # Node id -1 stands for "the model's own input", so a module consuming the
     # raw input (a residual shortcut, typically) still gets a visible edge.
-    _register((args, kwargs), INPUT_NODE)
+    # A model called with several arguments gets one pill per argument: leaf i
+    # is owned by IN_BASE - i, matching the ids the renderer lays out. Leaf 0
+    # keeps INPUT_NODE so single-input graphs are unchanged.
+    for i, leaf in enumerate(jax.tree_util.tree_leaves((args, kwargs))):
+        if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
+            _register(leaf, INPUT_NODE if i == 0 else IN_BASE - i)
     try:
         result = model(*args, **kwargs)
         outputs = _as_tensors(result)
