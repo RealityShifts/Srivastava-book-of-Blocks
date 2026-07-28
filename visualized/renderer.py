@@ -326,11 +326,28 @@ function relayout() {
     }
     return id;                      // no visible container: stands alone
   };
+  // Group *runs*, not group ids. A container's leaves need not be contiguous
+  // in execution order: MotionEncoder's root owns conv1 (first) and the
+  // trailing Linears (last), with every res_block in between. Treating that
+  // as one block forces the whole tail up beside conv1 and draws a long edge
+  // back up the canvas. Splitting on discontinuity keeps each run in place.
+  const runOf = new Map();          // leaf id -> run key
   const groupSeq = [];
-  leaves.slice().sort((a, b) => ord(a) - ord(b)).forEach(n => {
-    const g = groupOf(n.id);
-    if (!groupSeq.includes(g)) groupSeq.push(g);
-  });
+  {
+    const ordered = leaves.slice().sort((a, b) => ord(a) - ord(b));
+    let prevGroup = null, runIdx = 0;
+    for (const n of ordered) {
+      const g = groupOf(n.id);
+      if (g !== prevGroup) {        // a new run starts whenever the group flips
+        runIdx++;
+        prevGroup = g;
+        groupSeq.push(`${g}:${runIdx}`);
+      }
+      runOf.set(n.id, `${g}:${runIdx}`);
+    }
+  }
+  // Which container a run belongs to (for frames and column banding).
+  const runGroup = k => +String(k).split(':')[0];
 
   // Place each group as a block. Groups that are genuinely sequential stack
   // vertically; groups that run *in parallel* (a residual's conv path and its
@@ -340,15 +357,39 @@ function relayout() {
   const groupDeps = new Map();      // group -> groups it consumes from
   for (const e of eds) {
     if (e.src === __INPUT__) continue;
-    const gs = groupOf(e.src), gd = groupOf(e.dst);
+    const gs = runOf.get(e.src), gd = runOf.get(e.dst);
+    if (gs === undefined || gd === undefined) continue;
     if (gs === gd) continue;
     if (!groupDeps.has(gd)) groupDeps.set(gd, new Set());
     groupDeps.get(gd).add(gs);
   }
-  // A group may start no earlier than one row past every group it depends on.
-  const groupRow = new Map(groupSeq.map(g => [g, 0]));
   const groupSpan = new Map(groupSeq.map(g => [g,
-    new Set(leaves.filter(n => groupOf(n.id) === g).map(n => row.get(n.id))).size]));
+    new Set(leaves.filter(n => runOf.get(n.id) === g).map(n => row.get(n.id))).size]));
+
+  const groupRow = new Map(groupSeq.map(g => [g, 0]));
+  // Chain each group to the previously executed one unless it is a genuine
+  // parallel branch - i.e. unless it shares a producer with the group before
+  // it and neither feeds the other. Without this, a group whose only inbound
+  // edge is `inferred` (MotionEncoder's trailing Linears, each its own
+  // single-node group) floats to row 0 and the whole tail renders *above* the
+  // res-blocks it comes after, producing a long upward edge.
+  const feeds = (a, b) => (groupDeps.get(b) || new Set()).has(a);
+  groupSeq.forEach((g, i) => {
+    if (i === 0) return;
+    const prev = groupSeq[i - 1];
+    const mine = groupDeps.get(g) || new Set();
+    // Parallel iff g and prev draw from a common producer and are unrelated.
+    const prevDeps = groupDeps.get(prev) || new Set();
+    const shared = [...mine].some(d => prevDeps.has(d));
+    if (shared && !feeds(prev, g) && !feeds(g, prev)) return;
+    if (!groupDeps.has(g)) groupDeps.set(g, new Set());
+    groupDeps.get(g).add(prev);
+  });
+
+  // Then pull each group up to the earliest row its dependencies allow. Two
+  // groups fed by the same producer and feeding no one another land on the
+  // same row - that is what keeps a residual's conv path and its shortcut
+  // side by side instead of stacked.
   for (let it = 0; it < groupSeq.length + 1; it++) {
     let moved = false;
     for (const g of groupSeq) {
@@ -375,7 +416,7 @@ function relayout() {
   // Column offset for a band: width of every band to its left, at any row.
   const bandWidth = new Map();
   for (const g of groupSeq) {
-    const mine = leaves.filter(n => groupOf(n.id) === g);
+    const mine = leaves.filter(n => runOf.get(n.id) === g);
     const perRow = new Map();
     mine.forEach(n => {
       const r = row.get(n.id);
@@ -387,7 +428,7 @@ function relayout() {
     const peers = byStart.get(groupRow.get(g)) || [g];
     const offset = peers.slice(0, bandOf.get(g))
       .reduce((s, p) => s + bandWidth.get(p), 0);
-    const mine = leaves.filter(n => groupOf(n.id) === g).sort(cmp);
+    const mine = leaves.filter(n => runOf.get(n.id) === g).sort(cmp);
     const distinct = [...new Set(mine.map(n => row.get(n.id)))]
       .sort((a, b) => a - b);
     const perRow = new Map();
