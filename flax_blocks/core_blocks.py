@@ -225,6 +225,24 @@ class InstanceNorm(nnx.Module):
         return self.norm(x)
 
 
+class L2Norm(nnx.Module):
+    """Projects the last axis onto the unit hypersphere ``S^(D-1)``.
+
+    Unlike the statistical norms in this section, this rescales each vector
+    to ``||x|| == 1`` without learnable parameters: direction is preserved,
+    magnitude is discarded. Bounds an otherwise unbounded latent (e.g. the
+    output of a final affine layer) regardless of input scale.
+    """
+
+    def __init__(self, *, epsilon: float = 1e-8) -> None:
+        self.epsilon = epsilon
+
+    @typecheck
+    def __call__(self, x: Float[Array, "*B D"]) -> Float[Array, "*B D"]:
+        return x * jax.lax.rsqrt(
+            jnp.sum(x * x, axis=-1, keepdims=True) + self.epsilon)
+
+
 class WeightNorm(nnx.Module):
     """Salimans & Kingma 2016 - reparameterizes ``W = g * v / ||v||``.
 
