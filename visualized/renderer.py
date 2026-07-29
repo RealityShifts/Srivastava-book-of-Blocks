@@ -24,14 +24,22 @@ _TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
+/* Mermaid's default ("neutral"-ish) look: soft lavender fills, a single
+   restrained stroke colour, and mid-grey edges rather than one hue per module
+   family. The family colour is kept only as a thin left accent on each card, so
+   the graph reads as one calm system instead of a paintbox. */
 :root {
-  --bg:#0f1117; --panel:#171a23; --line:#262b38; --fg:#e6e9ef; --muted:#8b93a7;
-  --accent:#6ea8fe; --skip:#f0883e; --edge:#3d4358; --hi:#ffd166; --err:#ff6b6b;
+  --bg:#0f1117; --panel:#1b1e28; --line:#2b303d; --fg:#e6e9ef; --muted:#9aa3b8;
+  --accent:#8494e4; --skip:#e8944a; --edge:#6b7690; --hi:#ffd166; --err:#ff6b6b;
   --out:#5ec9a7;
+  --card:#252a38; --cardln:#4a5268; --frame:#1f2431; --frameln:#39415a;
 }
 @media (prefers-color-scheme: light) {
-  :root { --bg:#f7f8fa; --panel:#fff; --line:#e2e5ec; --fg:#1b1f2a;
-          --muted:#5f6880; --edge:#c3c9d6; }
+  :root { --bg:#ffffff; --panel:#fff; --line:#e2e5ec; --fg:#1f2430;
+          --muted:#5f6880; --edge:#8a93a6; --accent:#5b6fd6;
+          /* Mermaid's signature pale-lavender node fill. */
+          --card:#eceffc; --cardln:#9aa5d8; --frame:#f6f7fd;
+          --frameln:#c7cde8; }
 }
 * { box-sizing:border-box; }
 html,body { margin:0; height:100%; overflow:hidden;
@@ -67,9 +75,12 @@ button:hover { border-color:var(--accent); }
 #legend div { display:flex; align-items:center; gap:6px; margin:2px 0; }
 #legend i { width:16px; height:0; border-top:2px solid var(--edge);
   display:inline-block; }
-.node rect { stroke-width:1.5px; }
+.node rect { stroke-width:1.2px; }
 .node { cursor:pointer; }
 .node text { pointer-events:none; }
+/* The family hue survives as a 3px left rule - enough to group at a glance
+   without flooding the canvas with colour. */
+.accent { stroke-width:0; }
 .nm { font-weight:600; font-size:12px; }
 .nc { font-size:10.5px; fill:var(--muted); }
 .ns { font-size:10px; font-family:ui-monospace,Menlo,monospace;
@@ -81,7 +92,8 @@ button:hover { border-color:var(--accent); }
 .frame rect { pointer-events:stroke; cursor:pointer; }
 .node.sel rect, .outnode.sel rect { stroke:var(--hi); stroke-width:2.5px; }
 .node.dim, .outnode.dim { opacity:.28; }
-.edge { fill:none; stroke:var(--edge); stroke-width:1.6px; }
+.edge { fill:none; stroke:var(--edge); stroke-width:1.4px;
+  stroke-linecap:round; }
 .edge.skip { stroke:var(--skip); stroke-dasharray:5 4; }
 .edge.toout { stroke:var(--out); }
 .outnode rect { transition:stroke-width .1s; }
@@ -104,6 +116,9 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
       <button id="zo">&minus;</button>
       <button id="col">&minus; depth</button>
       <button id="exp">+ depth</button>
+      <button id="svg-dl" title="Download the current view as SVG">SVG</button>
+      <button id="mmd-dl" title="Download Mermaid source for the current view"
+        >Mermaid</button>
       <span id="lvl"></span>
     </div>
     <svg id="svg"><g id="root"></g></svg>
@@ -122,6 +137,7 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
     <div id="detail"></div>
   </div>
 </div>
+<script>/*__DAGRE__*/</script>
 <script>
 const DATA = __DATA__;
 
@@ -156,6 +172,16 @@ DATA.nodes.forEach(n => {
   }
 });
 const hasKids = id => (kids.get(id) || []).length > 0;
+// Is `id` anywhere inside `anc`'s subtree? Used by the Mermaid export to place
+// each visible leaf in the frame that encloses it.
+const isDesc = (id, anc) => {
+  let p = byId.get(id) ? byId.get(id).parent : null;
+  while (p !== null && p !== undefined) {
+    if (p === anc) return true;
+    p = byId.get(p).parent;
+  }
+  return false;
+};
 // Start with top-level containers collapsed so big models stay readable.
 const collapsed = new Set(
   DATA.nodes.filter(n => hasKids(n.id) && n.depth >= 1).map(n => n.id));
@@ -280,236 +306,84 @@ function relayout() {
   const leaves = vis.filter(isLeaf);
   const leafSet = new Set(leaves.map(n => n.id));
 
-  // Longest-path layering over leaves only.
-  const row = new Map(leaves.map(n => [n.id, 0]));
-  const preds = new Map();
-  eds.forEach(e => {
-    if (isInput(e.src) || !leafSet.has(e.src) || !leafSet.has(e.dst)) return;
-    if (!preds.has(e.dst)) preds.set(e.dst, []);
-    preds.get(e.dst).push(e.src);
+  // ---- layout via dagre --------------------------------------------------
+  // Ranks, in-rank ordering, crossing reduction and edge routing all come from
+  // dagre - the same engine Mermaid uses. The piece that matters for a deep
+  // model is its virtual nodes: a long edge occupies real space in every rank it
+  // spans, so boxes are placed out of its way instead of underneath it.
+  // Containers are declared as compound parents so dagre reserves room for the
+  // frames drawn later.
+  const G = new dagre.graphlib.Graph({ compound: true });
+  // ranksep is the gap between *ranks*, and dagre adds a rank per level a long
+  // edge spans, so a residual over three modules multiplies the nominal gap.
+  // Keep it tight; GAPY was tuned for the old one-row-per-node layout.
+  G.setGraph({ rankdir: 'TB', nodesep: GAPX, ranksep: 34,
+               marginx: 24, marginy: 24, ranker: 'network-simplex' });
+  G.setDefaultEdgeLabel(() => ({}));
+
+  const hOfNode = n => (n.kind === 'merge' ? 40 : NH);
+  for (const n of leaves)
+    G.setNode(String(n.id), { width: NW, height: hOfNode(n) });
+  // Input pills are real ranked nodes, so their edges are routed like any other
+  // rather than being drawn as straight lines over the graph.
+  const inIds = (DATA.input_tensors || []).map((t, i) =>
+    i === 0 ? __INPUT__ : IN_BASE - i);
+  inIds.forEach(id => G.setNode(String(id), { width: NW, height: 26 }));
+  // Output pills are ranked too. Placing them by hand afterwards left their
+  // edges unrouted, so they cut straight back across the graph.
+  const outPre = (DATA.output_sources || []).map((o, i) => {
+    let s = o.src;
+    if (s !== null && s !== undefined) {
+      s = proxy(s);
+      s = visSet.has(s) ? resolve(s, true) : null;
+    } else s = null;
+    return { id: OUT_BASE - i, tensor: o.tensor, index: i, attach: s };
   });
-  // Sibling leaves inside different containers often have no *direct* edge
-  // (the value passes through the containers), which would collapse the whole
-  // model into a couple of rows. Chain each leaf to the previously executed
-  // one as a weak ordering constraint, except where a real branch exists.
-  const seq = leaves.map(n => n.id).sort((a, b) => ord(a) - ord(b));
-  const branchTargets = new Set();
-  eds.forEach(e => { if (e.skip) branchTargets.add(e.dst); });
-  for (let i = 1; i < seq.length; i++) {
-    if (branchTargets.has(seq[i])) continue;   // a shortcut starts a new path
-    if (mergeIds.has(seq[i])) continue;        // a merge is placed by its edges
-    if (!preds.has(seq[i])) preds.set(seq[i], []);
-    if (!preds.get(seq[i]).includes(seq[i - 1]))
-      preds.get(seq[i]).push(seq[i - 1]);
+  outPre.forEach(o => G.setNode(String(o.id), { width: NW, height: 30 }));
+
+  // Compound parents. dagre needs every ancestor declared, and a cluster may
+  // not be its own parent.
+  const contAll = vis.filter(n => !isLeaf(n));
+  contAll.forEach(c => G.setNode(String(c.id), {}));
+  for (const n of [...leaves, ...contAll]) {
+    let p = n.parent;
+    while (p !== null && p !== undefined && !contAll.some(c => c.id === p))
+      p = byId.get(p) ? byId.get(p).parent : null;
+    if (p !== null && p !== undefined && p !== n.id)
+      G.setParent(String(n.id), String(p));
   }
 
-  for (let it = 0; it < leaves.length + 2; it++) {   // acyclic: settles fast
-    let moved = false;
-    for (const n of leaves) {
-      let want = 0;
-      for (const p of (preds.get(n.id) || []))
-        want = Math.max(want, (row.get(p) ?? 0) + 1);
-      if (want !== row.get(n.id)) { row.set(n.id, want); moved = true; }
-    }
-    if (!moved) break;
-  }
-
-  const rows = new Map();
-  leaves.forEach(n => {
-    const r = row.get(n.id);
-    if (!rows.has(r)) rows.set(r, []);
-    rows.get(r).push(n);
-  });
-
-  // Container header rows are inserted above the first row they cover, so
-  // reserve a slot per depth level that actually appears.
-  const rowKeys = [...rows.keys()].sort((a, b) => a - b);
-
-  // Column order matters: siblings of one container must stay contiguous or
-  // their frames interleave and overlap. Sort each row by ancestor chain so
-  // nodes under the same parent are always adjacent.
-  const chain = id => {
-    const out = [];
-    let c = id;
-    while (c !== null && c !== undefined) { out.unshift(c); c = byId.get(c).parent; }
-    return out;
-  };
-  const cmp = (a, b) => {
-    const ca = chain(a.id), cb = chain(b.id);
-    for (let i = 0; i < Math.max(ca.length, cb.length); i++) {
-      const x = ca[i] ?? -1, y2 = cb[i] ?? -1;
-      // -1 means "chain ended": the shallower node sorts first.
-      if (x !== y2) return (x < 0 ? -1 : ord(x)) - (y2 < 0 ? -1 : ord(y2));
-    }
-    return 0;
-  };
-
-  // Group leaves by the container that owns them, then give each group its
-  // own column band *and* a contiguous block of rows. Without the row
-  // compaction a group's leaves stagger diagonally, making its frame tall
-  // enough to straddle the neighbouring bands.
-  // Band by the *innermost* visible container: that is the frame that must
-  // stay a tight rectangle. Banding by the outermost one puts every group in
-  // the same column, which is what makes inner frames overlap.
-  const groupOf = id => {
-    let c = byId.get(id).parent;
-    while (c !== null && c !== undefined) {
-      if (visSet.has(c) && !isLeaf(byId.get(c))) return c;
-      c = byId.get(c).parent;
-    }
-    return id;                      // no visible container: stands alone
-  };
-  // Group *runs*, not group ids. A container's leaves need not be contiguous
-  // in execution order: MotionEncoder's root owns conv1 (first) and the
-  // trailing Linears (last), with every res_block in between. Treating that
-  // as one block forces the whole tail up beside conv1 and draws a long edge
-  // back up the canvas. Splitting on discontinuity keeps each run in place.
-  const runOf = new Map();          // leaf id -> run key
-  const groupSeq = [];
-  {
-    const ordered = leaves.slice().sort((a, b) => ord(a) - ord(b));
-    let prevGroup = null, runIdx = 0;
-    for (const n of ordered) {
-      const g = groupOf(n.id);
-      if (g !== prevGroup) {        // a new run starts whenever the group flips
-        runIdx++;
-        prevGroup = g;
-        groupSeq.push(`${g}:${runIdx}`);
-      }
-      runOf.set(n.id, `${g}:${runIdx}`);
-    }
-  }
-  // Which container a run belongs to (for frames and column banding).
-  const runGroup = k => +String(k).split(':')[0];
-
-  // Place each group as a block. Groups that are genuinely sequential stack
-  // vertically; groups that run *in parallel* (a residual's conv path and its
-  // shortcut both read the same value and neither feeds the other) must share
-  // rows and sit in adjacent columns, or the picture claims an ordering the
-  // model does not have.
-  const groupDeps = new Map();      // group -> groups it consumes from
   for (const e of eds) {
-    if (e.src === __INPUT__) continue;
-    const gs = runOf.get(e.src), gd = runOf.get(e.dst);
-    if (gs === undefined || gd === undefined) continue;
-    if (gs === gd) continue;
-    if (!groupDeps.has(gd)) groupDeps.set(gd, new Set());
-    groupDeps.get(gd).add(gs);
+    if (!G.hasNode(String(e.src)) || !G.hasNode(String(e.dst))) continue;
+    // weight keeps the main chain straight and lets skips bend around it.
+    G.setEdge(String(e.src), String(e.dst),
+              { weight: e.skip ? 1 : 8, minlen: 1 });
   }
-  const groupSpan = new Map(groupSeq.map(g => [g,
-    new Set(leaves.filter(n => runOf.get(n.id) === g).map(n => row.get(n.id))).size]));
-
-  const groupRow = new Map(groupSeq.map(g => [g, 0]));
-  // Chain each group to the previously executed one unless it is a genuine
-  // parallel branch - i.e. unless it shares a producer with the group before
-  // it and neither feeds the other. Without this, a group whose only inbound
-  // edge is `inferred` (MotionEncoder's trailing Linears, each its own
-  // single-node group) floats to row 0 and the whole tail renders *above* the
-  // res-blocks it comes after, producing a long upward edge.
-  const feeds = (a, b) => (groupDeps.get(b) || new Set()).has(a);
-  groupSeq.forEach((g, i) => {
-    if (i === 0) return;
-    const prev = groupSeq[i - 1];
-    const mine = groupDeps.get(g) || new Set();
-    // Parallel iff g and prev draw from a common producer and are unrelated.
-    const prevDeps = groupDeps.get(prev) || new Set();
-    const shared = [...mine].some(d => prevDeps.has(d));
-    if (shared && !feeds(prev, g) && !feeds(g, prev)) return;
-    if (!groupDeps.has(g)) groupDeps.set(g, new Set());
-    groupDeps.get(g).add(prev);
+  outPre.forEach(o => {
+    if (o.attach !== null && G.hasNode(String(o.attach)))
+      G.setEdge(String(o.attach), String(o.id), { weight: 8, minlen: 1 });
   });
 
-  // Then pull each group up to the earliest row its dependencies allow. Two
-  // groups fed by the same producer and feeding no one another land on the
-  // same row - that is what keeps a residual's conv path and its shortcut
-  // side by side instead of stacked.
-  for (let it = 0; it < groupSeq.length + 1; it++) {
-    let moved = false;
-    for (const g of groupSeq) {
-      let want = 0;
-      for (const dep of (groupDeps.get(g) || []))
-        want = Math.max(want, (groupRow.get(dep) ?? 0) + (groupSpan.get(dep) ?? 1));
-      if (want !== groupRow.get(g)) { groupRow.set(g, want); moved = true; }
-    }
-    if (!moved) break;
-  }
-  // Groups sharing a start row are parallel: give them separate column bands.
-  const bandOf = new Map();
-  const byStart = new Map();
-  for (const g of groupSeq) {
-    const r = groupRow.get(g);
-    if (!byStart.has(r)) byStart.set(r, []);
-    bandOf.set(g, byStart.get(r).length);
-    byStart.get(r).push(g);
-  }
+  dagre.layout(G);
 
-  const slot = new Map();           // leaf id -> column index
-  const gridRow = new Map();        // leaf id -> compacted row index
-  let maxCols = 1;
-  // Column offset for a band: width of every band to its left, at any row.
-  const bandWidth = new Map();
-  for (const g of groupSeq) {
-    const mine = leaves.filter(n => runOf.get(n.id) === g);
-    const perRow = new Map();
-    mine.forEach(n => {
-      const r = row.get(n.id);
-      perRow.set(r, (perRow.get(r) ?? 0) + 1);
-    });
-    bandWidth.set(g, Math.max(1, ...perRow.values()));
-  }
-  for (const g of groupSeq) {
-    const peers = byStart.get(groupRow.get(g)) || [g];
-    const offset = peers.slice(0, bandOf.get(g))
-      .reduce((s, p) => s + bandWidth.get(p), 0);
-    const mine = leaves.filter(n => runOf.get(n.id) === g).sort(cmp);
-    const distinct = [...new Set(mine.map(n => row.get(n.id)))]
-      .sort((a, b) => a - b);
-    const perRow = new Map();
-    mine.forEach(n => {
-      const r = row.get(n.id);
-      const k = perRow.get(r) ?? 0;
-      slot.set(n.id, offset + k);
-      perRow.set(r, k + 1);
-      gridRow.set(n.id, groupRow.get(g) + distinct.indexOf(r));
-    });
-    maxCols = Math.max(maxCols, offset + bandWidth.get(g));
-  }
-  const W2 = maxCols * (NW + GAPX);
-
-  // Renumber the compacted rows so there are no empty bands left behind.
-  const usedRows = [...new Set([...gridRow.values()])].sort((a, b) => a - b);
-  const rowAt = new Map(usedRows.map((r, i) => [r, i]));
-
-  // Centre each row's occupants across the canvas width.
-  const perGrid = new Map();
-  leaves.forEach(n => {
-    const r = gridRow.get(n.id);
-    perGrid.set(r, (perGrid.get(r) ?? 0) + 1);
-  });
-  // A row holding only merges is drawn as small circles, so it needs far
-  // less vertical space than a row of full module cards.
-  const rowIsMerge = new Map();
-  leaves.forEach(n => {
-    const r = gridRow.get(n.id);
-    const prev = rowIsMerge.get(r);
-    const mine = n.kind === 'merge';
-    rowIsMerge.set(r, prev === undefined ? mine : prev && mine);
-  });
-  const rowTop = new Map();
-  let yCursor = 70;
-  [...rowAt.keys()].sort((a, b) => rowAt.get(a) - rowAt.get(b)).forEach(r => {
-    rowTop.set(r, yCursor);
-    yCursor += (rowIsMerge.get(r) ? 40 : NH) + GAPY;
-  });
-
+  // dagre reports centres; the drawing code works from top-left corners.
   const pos = new Map();
   for (const n of leaves) {
-    const r = gridRow.get(n.id);
-    const span = perGrid.get(r) * (NW + GAPX);
-    pos.set(n.id, {
-      x: (W2 - span) / 2 + slot.get(n.id) * (NW + GAPX) + GAPX / 2,
-      y: rowTop.get(r),
-    });
+    const d = G.node(String(n.id));
+    if (d) pos.set(n.id, { x: d.x - NW / 2, y: d.y - hOfNode(n) / 2 });
+  }
+  // Input pills were ranked too; without reading their position back they keep
+  // a stale one while their routed edge starts where dagre actually put them,
+  // which is what left long wires dangling from the top of the canvas.
+  inIds.forEach(id => {
+    const d = G.node(String(id));
+    if (d) pos.set(id, { x: d.x - NW / 2, y: d.y - 13 });
+  });
+  // Routed polylines, keyed by edge, for the draw step.
+  const routed = new Map();
+  for (const e of G.edges()) {
+    const pts = (G.edge(e).points || []).map(q => ({ x: q.x, y: q.y }));
+    if (pts.length) routed.set(e.v + '>' + e.w, pts);
   }
 
   // Expanded containers become background *frames* around their descendants
@@ -545,48 +419,22 @@ function relayout() {
     id: i === 0 ? __INPUT__ : IN_BASE - i, tensor: t, index: i,
   }));
   if (!ins.length) ins.push({ id: __INPUT__, tensor: null, index: 0 });
-  const inSpan = ins.length * (NW + GAPX);
-  const inY = Math.min(frameTop, 70) - 56;
+  // Keep the position dagre chose for each pill. Flattening them onto a shared
+  // row looks tidier in isolation but discards the ranking that made their
+  // edges routable, so a pill feeding three distant consumers ends up dragging
+  // three long wires across the graph.
   ins.forEach((n, i) => {
-    pos.set(n.id, {
-      x: ins.length === 1
-        ? (W2 - NW) / 2
-        : (W2 - inSpan) / 2 + i * (NW + GAPX) + GAPX / 2,
-      y: inY,
-    });
+    if (!pos.get(n.id)) pos.set(n.id, { x: i * (NW + GAPX) + 24, y: 0 });
   });
+  // Canvas width, now that dagre has decided the extents.
+  const W2 = Math.max(NW, ...[...pos.values()].map(p => p.x + NW));
 
-  // One output pill per returned array, on a row below everything else and
-  // wired to the module that produced it. Outputs use ids __OUT_BASE__ - i so
-  // they never collide with real node ids.
-  const frameBottom = frames.length
-    ? Math.max(...frames.map(f => f.y + f.h))
-    : Math.max(...[...pos.values()].map(p => p.y + NH));
-  const outs = (DATA.output_sources || []).map((o, i) => {
-    // Resolve the producing module down to whatever is currently visible.
-    let s = o.src;
-    if (s !== null && s !== undefined) {
-      s = proxy(s);
-      s = visSet.has(s) ? resolve(s, true) : null;
-    } else s = null;
-    return { id: OUT_BASE - i, tensor: o.tensor, src: o.src, index: i,
-             attach: s };
-  });
-  // Place pills in producer order (left to right) so the connecting curves
-  // fan out cleanly instead of crossing each other.
-  const ordered = outs.slice().sort((a, b) => {
-    const pa = a.attach !== null ? pos.get(a.attach) : null;
-    const pb = b.attach !== null ? pos.get(b.attach) : null;
-    if (pa && pb && pa.x !== pb.x) return pa.x - pb.x;
-    if (pa && pb) return pa.y - pb.y;
-    return a.index - b.index;
-  });
-  const outSpan = Math.max(1, ordered.length) * (NW + GAPX);
-  ordered.forEach((o, i) => {
-    pos.set(o.id, {
-      x: (W2 - outSpan) / 2 + i * (NW + GAPX) + GAPX / 2,
-      y: frameBottom + 46,
-    });
+  // One output pill per returned array, positioned by dagre along with the rest
+  // so its edge is routed rather than drawn straight back over the graph.
+  const outs = outPre.map(o => ({ ...o, src: o.attach }));
+  outs.forEach(o => {
+    const d = G.node(String(o.id));
+    if (d) pos.set(o.id, { x: d.x - NW / 2, y: d.y - 15 });
     if (o.attach !== null)
       eds.push({ src: o.attach, dst: o.id, skip: false, tensor: o.tensor,
                  toOutput: true });
@@ -599,9 +447,11 @@ function relayout() {
                            ...frames.map(f => f.y));
   pos.forEach(p => { p.x += dx; p.y += dy; });
   frames.forEach(f => { f.x += dx; f.y += dy; });
+  // Routed polylines live in the same coordinate space, so they shift too.
+  routed.forEach(pts => pts.forEach(q => { q.x += dx; q.y += dy; }));
 
   layout = {
-    nodes: leaves, edges: eds, pos, frames, outs, ins,
+    nodes: leaves, edges: eds, pos, frames, outs, ins, routed,
     containers: new Set(containers.map(c => c.id)),
     w: Math.max(...[...pos.values()].map(p => p.x + NW),
                 ...frames.map(f => f.x + f.w)) + 24,
@@ -631,11 +481,13 @@ function draw() {
     const col = colorOf(f.node.cls);
     const g = el('g', { class: 'frame' });
     g.dataset.id = f.id;
+    // Mermaid draws a subgraph as a quiet solid panel with a plain border - no
+    // dashes, no per-group hue - so nesting reads as depth rather than as noise.
     g.appendChild(el('rect', { x: f.x, y: f.y, width: f.w, height: f.h,
-      rx: 10, fill: col, 'fill-opacity': .05, stroke: col,
-      'stroke-opacity': .45, 'stroke-dasharray': '5 4' }));
+      rx: 8, fill: 'var(--frame)', 'fill-opacity': .85,
+      stroke: 'var(--frameln)' }));
     const lab = el('text', { x: f.x + 10, y: f.y + 13, class: 'flab',
-      fill: col });
+      fill: 'var(--muted)' });
     lab.textContent = `${f.node.name}  ·  ${f.node.cls}  ·  ${fmt(f.node.params)}`;
     g.append(lab);
     gF.appendChild(g);
@@ -653,7 +505,34 @@ function draw() {
     const y2 = b.y + (dstMerge ? 3 : 0);
     const my = (y1 + y2) / 2;
     let d;
-    if (e.skip && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
+    // dagre already routed this edge around whatever lay in its path, so follow
+    // its polyline. Drawing our own curve is what put long edges over boxes.
+    const pts = (layout.routed || new Map()).get(e.src + '>' + e.dst);
+    if (pts && pts.length > 1) {
+      // Follow the polyline, rounding each corner with a short quadratic. A
+      // per-segment S-curve overshoots the waypoints and reintroduces exactly
+      // the crossings dagre routed around, so keep the path on its own line and
+      // only soften the joins.
+      // Keep every waypoint dagre produced - they are the virtual nodes that
+      // steer the edge around boxes. Only the endpoints are nudged onto the
+      // node borders, and dropping the interior points (as slicing them off
+      // does) collapses the detour back into one long straight line.
+      const q = pts.map(p => ({ x: p.x, y: p.y }));
+      q[0] = { x: x1, y: y1 };
+      q[q.length - 1] = { x: x2, y: y2 };
+      const R = 12;
+      d = `M${q[0].x},${q[0].y}`;
+      for (let i = 1; i < q.length - 1; i++) {
+        const p0 = q[i - 1], p1 = q[i], p2 = q[i + 1];
+        const len = (u, v) => Math.hypot(v.x - u.x, v.y - u.y) || 1;
+        const t1 = Math.min(R, len(p0, p1) / 2) / len(p0, p1);
+        const t2 = Math.min(R, len(p1, p2) / 2) / len(p1, p2);
+        d += ` L${p1.x + (p0.x - p1.x) * t1},${p1.y + (p0.y - p1.y) * t1}`
+          + ` Q${p1.x},${p1.y} `
+          + `${p1.x + (p2.x - p1.x) * t2},${p1.y + (p2.y - p1.y) * t2}`;
+      }
+      d += ` L${q[q.length - 1].x},${q[q.length - 1].y}`;
+    } else if (e.skip && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
       // A residual that returns to the same column would be hidden under the
       // main chain. Bow it out sideways so the bypass is actually visible.
       const bow = NW * 0.62;
@@ -722,10 +601,10 @@ function draw() {
       const wRaw = glyph ? 34 : [...n.name].length * fs * 0.62 + 16;
       const w = Math.min(wRaw, NW), h = 34;
       g.appendChild(el('rect', { x: cx - w / 2, y: cy - h / 2, width: w,
-        height: h, rx: h / 2, fill: 'var(--panel)',
-        stroke: 'var(--skip)', 'stroke-width': 2 }));
+        height: h, rx: h / 2, fill: 'var(--card)',
+        stroke: 'var(--cardln)', 'stroke-width': 1.2 }));
       const s = el('text', { x: cx, y: cy + (glyph ? 6 : 4),
-        'text-anchor': 'middle', fill: 'var(--skip)', 'font-size': fs,
+        'text-anchor': 'middle', fill: 'var(--fg)', 'font-size': fs,
         'font-weight': 700 });
       s.textContent = n.name;
       g.appendChild(s);
@@ -737,9 +616,14 @@ function draw() {
       continue;
     }
     const col = n.error ? 'var(--err)' : colorOf(n.cls);
-    g.appendChild(el('rect', { width: NW, height: NH, rx: 8,
-      fill: 'var(--panel)', stroke: col }));
-    g.appendChild(el('rect', { width: 4, height: NH, rx: 2, fill: col }));
+    // Mermaid-style card: one shared fill and border for every node, with the
+    // module family reduced to a left accent rule. An error still overrides the
+    // border outright, since that must not be subtle.
+    g.appendChild(el('rect', { width: NW, height: NH, rx: 6,
+      fill: 'var(--card)',
+      stroke: n.error ? 'var(--err)' : 'var(--cardln)' }));
+    g.appendChild(el('rect', { width: 3, height: NH, rx: 1.5, fill: col,
+      class: 'accent' }));
 
     const t1 = el('text', { x: 12, y: 19, class: 'nm', fill: 'var(--fg)' });
     t1.textContent = (n.name.length > 20 ? n.name.slice(0, 19) + '\\u2026' : n.name)
@@ -753,7 +637,7 @@ function draw() {
     if (n.params > 0) {
       const bw = 8 + fmt(n.params).length * 6;
       g.appendChild(el('rect', { x: NW - bw - 8, y: 8, width: bw, height: 15,
-        rx: 7, fill: col, opacity: .85 }));
+        rx: 7, fill: col, opacity: .9 }));
       const tb = el('text', { x: NW - bw / 2 - 8, y: 19,
         'text-anchor': 'middle', class: 'badge' });
       tb.textContent = fmt(n.params);
@@ -943,6 +827,119 @@ const setLevel = d => {
 document.getElementById('exp').onclick = () => setLevel(level + 1);
 document.getElementById('col').onclick = () => setLevel(level - 1);
 
+// ---------- export --------------------------------------------------------
+const save = (text, name, mime) => {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  a.click();
+  // Revoking immediately can cancel the download in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+const slug = DATA.model_name.replace(/[^\\w.-]+/g, '_');
+
+// Standalone SVG of the current view: the live <svg> carries the pan/zoom
+// transform and inherits its colours from the page, so export a detached clone
+// sized to the graph with the CSS variables resolved to literals.
+document.getElementById('svg-dl').onclick = () => {
+  const clone = svg.cloneNode(true);
+  const cs = getComputedStyle(document.documentElement);
+  // Inline every --var the markup references; a bare `var(...)` would render
+  // black once the file is opened outside this page.
+  let out = clone.outerHTML.replace(/var\\((--[\\w-]+)\\)/g,
+    (_, v) => cs.getPropertyValue(v).trim() || '#888');
+  const pad = 20;
+  out = out
+    .replace(/<svg[^>]*>/, '<svg xmlns="http://www.w3.org/2000/svg" '
+      + `width="${layout.w + pad * 2}" height="${layout.h + pad * 2}" `
+      + `viewBox="${-pad} ${-pad} ${layout.w + pad * 2} ${layout.h + pad * 2}">`)
+    // Drop the interactive pan/zoom so the exported file is framed on content.
+    .replace(/<g id="root"[^>]*>/, '<g id="root">');
+  const bg = cs.getPropertyValue('--bg').trim() || '#fff';
+  // The classes the markup relies on (.edge, .nm, .ns, ...) are defined in the
+  // page's <head>, which a detached clone does not carry. Without them every
+  // edge falls back to SVG defaults - a 1px black hairline - and the text loses
+  // its sizes. Inline the rules the graph actually needs, with the custom
+  // properties already resolved.
+  const c = v => cs.getPropertyValue(v).trim();
+  const css = `<style>
+    .edge{fill:none;stroke:${c('--edge')};stroke-width:1.6px;stroke-linecap:round}
+    .edge.skip{stroke:${c('--skip')};stroke-dasharray:5 4}
+    .edge.toout{stroke:${c('--out')}}
+    .node rect,.frame rect,.outnode rect{stroke-width:1.2px}
+    .accent{stroke-width:0}
+    text{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+    .nm{font-weight:600;font-size:12px;fill:${c('--fg')}}
+    .nc{font-size:10.5px;fill:${c('--muted')}}
+    .ns{font-size:10px;font-family:ui-monospace,Menlo,monospace;
+        fill:${c('--muted')}}
+    .flab{font-size:10.5px;font-weight:600;fill:${c('--muted')}}
+    .badge{font-size:9.5px;fill:${bg};font-weight:700}
+  </style>`;
+  out = out.replace('<g id="root">',
+    `${css}<rect x="${-pad}" y="${-pad}" width="${layout.w + pad * 2}" `
+    + `height="${layout.h + pad * 2}" fill="${bg}"/><g id="root">`);
+  save(out, slug + '.svg', 'image/svg+xml');
+};
+
+// Mermaid source for the current view. Uses the same visible-node set and
+// resolved edges the canvas is showing, so collapsing a group collapses it in
+// the export too. Containers become `subgraph` blocks, which is Mermaid's
+// nearest equivalent to a frame.
+document.getElementById('mmd-dl').onclick = () => {
+  const mid = id => 'n' + String(id).replace('-', '_');
+  const q = s => String(s).replace(/"/g, "'");
+  const L = ['flowchart TD'];
+  // Mermaid has no styling for our families, so emit classDef + class lines and
+  // let the shape carry the rest: rounded box = module, stadium = array op,
+  // pill = input/output.
+  L.push('  classDef mod fill:#eceffc,stroke:#9aa5d8,color:#1f2430;');
+  L.push('  classDef op fill:#fff6e8,stroke:#e8944a,color:#1f2430;');
+  L.push('  classDef io fill:#e8f4ee,stroke:#5ec9a7,color:#1f2430;');
+
+  const decl = [];
+  for (const n of layout.ins) {
+    const t = n.tensor ? ' ' + shp(n.tensor) : '';
+    const label = (layout.ins.length > 1 ? 'input ' + n.index : 'input') + t;
+    decl.push(`  ${mid(n.id)}(["${q(label)}"]):::io`);
+  }
+  // Group visible leaves by their frame so each frame becomes a subgraph.
+  const inFrame = new Map();
+  for (const f of layout.frames)
+    for (const n of layout.nodes)
+      if (isDesc(n.id, f.id)) inFrame.set(n.id, f.id);
+  const loose = layout.nodes.filter(n => !inFrame.has(n.id));
+  const nodeLine = n => {
+    const sh = n.outputs.length ? '<br/>' + shp(n.outputs[0]) : '';
+    if (n.kind === 'merge')
+      return `  ${mid(n.id)}(["${q(n.name)}${sh}"]):::op`;
+    const ps = n.params > 0 ? '<br/>' + fmt(n.params) + ' params' : '';
+    return `  ${mid(n.id)}["${q(n.name)}<br/><i>${q(n.cls)}</i>${sh}${ps}"]:::mod`;
+  };
+  loose.forEach(n => decl.push(nodeLine(n)));
+  for (const f of layout.frames) {
+    const mine = layout.nodes.filter(n => inFrame.get(n.id) === f.id);
+    if (!mine.length) continue;
+    decl.push(`  subgraph ${mid(f.id)}["${q(f.node.name + ' · ' + f.node.cls)}"]`);
+    mine.forEach(n => decl.push('  ' + nodeLine(n)));
+    decl.push('  end');
+  }
+  for (const o of layout.outs) {
+    const label = (layout.outs.length > 1 ? 'output ' + o.index : 'output')
+      + ' ' + shp(o.tensor);
+    decl.push(`  ${mid(o.id)}(["${q(label)}"]):::io`);
+  }
+  L.push(...decl);
+  // ``-.->`` marks a skip/branch, matching the dashed orange edge on canvas.
+  for (const e of layout.edges) {
+    const arrow = e.skip ? '-.->' : '-->';
+    const lbl = e.tensor && e.tensor.shape && e.tensor.shape.length
+      ? `|"${q(shp(e.tensor))}"|` : '';
+    L.push(`  ${mid(e.src)} ${arrow}${lbl} ${mid(e.dst)}`);
+  }
+  save(L.join('\\n') + '\\n', slug + '.mmd', 'text/plain');
+};
+
 document.getElementById('title').textContent = DATA.model_name;
 document.getElementById('subtitle').textContent =
   DATA.nodes.length + ' modules \\u00B7 ' + fmt(DATA.total_params) + ' params';
@@ -954,6 +951,21 @@ addEventListener('resize', fit);
 """
 
 
+def _dagre_source() -> str:
+    """The vendored dagre bundle, inlined so the page stays self-contained.
+
+    Layered graph drawing is not something to hand-roll: the part that keeps a
+    deep model readable is inserting a virtual node per rank a long edge spans,
+    so boxes get placed *out of the edge's way* rather than under it. dagre is
+    what Mermaid itself uses, and vendoring it keeps the output a single file
+    with no CDN dependency.
+    """
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "dagre.min.js")
+    with open(here, encoding="utf-8") as fh:
+        return fh.read()
+
+
 def render_html(graph: Graph, title: Optional[str] = None) -> str:
     """Return a standalone interactive HTML document for ``graph``."""
     payload = json.dumps(graph.to_dict(), separators=(",", ":"))
@@ -962,6 +974,9 @@ def render_html(graph: Graph, title: Optional[str] = None) -> str:
     doc = _TEMPLATE.replace("__DATA__", payload)
     doc = doc.replace("__INPUT__", str(INPUT_NODE))
     doc = doc.replace("__IN_BASE__", str(IN_BASE))
+    # Substituted last: the bundle is ~96KB of minified JS and must not be
+    # scanned for the other placeholders.
+    doc = doc.replace("/*__DAGRE__*/", _dagre_source())
     return doc.replace(
         "__TITLE__", html.escape(title or f"{graph.model_name} - visualized"))
 

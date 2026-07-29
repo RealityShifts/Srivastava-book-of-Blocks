@@ -906,13 +906,27 @@ def trace_model(
                     operands = list(dict.fromkeys(branch_ends + carried))
                     for i, src in enumerate(operands):
                         edges.append(Edge(src, node.id, tensor, skip=i > 0))
-                    # whatever consumed the host's output now consumes the op
+                    # Whatever consumed the host's output now consumes the op.
+                    # The value leaves the host's *last leaf*, not the host node
+                    # itself, so matching only ``host.id`` left the original edge
+                    # in place: a second arrow ran from deep inside the block
+                    # straight to the next module, bypassing the residual and its
+                    # activation. Redirect everything leaving the subtree.
+                    h_inside = {host.id} | {n.id for n in nodes
+                                            if _is_descendant(n.id, host.id, nodes)}
                     for e in edges:
-                        if e.src == host.id and e.dst != node.id:
+                        if (e.src in h_inside and e.dst != node.id
+                                and e.dst not in h_inside):
                             e.src = node.id
                     for o in out_sources:
-                        if o["src"] == host.id:
+                        if o["src"] in h_inside:
                             o["src"] = node.id
+                    # The combine is now the tip of each branch it closed, so an
+                    # op written *after* it (``out = out + x`` then
+                    # ``out = leaky_relu(out)``) chains downstream instead of
+                    # splicing onto the branch and landing upstream of it.
+                    for b in operands:
+                        tip[b] = node.id
                     merged = True
 
             if merged or not anchors:
@@ -945,11 +959,22 @@ def trace_model(
                 node = _new_op_node(host, op, sym, qual, tensor,
                                     order=_subtree_max(src_kid),
                                     out_tensor=out_t)
+                # Downstream consumers now read from the op. A container returns
+                # the array its last leaf produced, so the recorded edge often
+                # leaves that leaf (``changer.0.norm``) rather than the anchor
+                # itself (``changer.0``). Matching only the anchor left the op
+                # dangling with no output while the real flow bypassed it - the
+                # module appeared wired straight through, short-circuiting the
+                # join. Redirect anything leaving the anchor's subtree, except
+                # edges that stay inside it.
+                inside = {prev} | {n.id for n in nodes
+                                   if _is_descendant(n.id, prev, nodes)}
                 for e in edges:
-                    if e.src == prev and e.dst != node.id:
+                    if (e.src in inside and e.dst != node.id
+                            and e.dst not in inside):
                         e.src = node.id
                 for o in out_sources:
-                    if o["src"] == prev:
+                    if o["src"] in inside:
                         o["src"] = node.id
                 edges.append(Edge(prev, node.id, tensor or Tensor((), "")))
 
@@ -993,6 +1018,18 @@ def trace_model(
                             node.outputs = [Tensor(tuple(dims), tensor.dtype)]
 
                 tip[src_kid] = node.id
+
+    # An edge carries whatever its source emits. Splicing an op into the flow
+    # reassigns ``src`` on the edges downstream of it, but those edges kept the
+    # tensor recorded for the *old* producer - so an arrow out of an activation
+    # could advertise the shape of the module it points at rather than the value
+    # travelling the wire. Re-label from the source now that every op is placed.
+    for e in edges:
+        if e.src < 0 or e.src >= len(nodes):
+            continue                     # an input pill: nothing to read off
+        out = nodes[e.src].outputs
+        if out:
+            e.tensor = out[0]
 
     # Deduplicate: one module pair can exchange several arrays.
     seen = set()
