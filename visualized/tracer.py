@@ -204,30 +204,271 @@ def _is_descendant(node_id: int, ancestor_id: int, nodes: list) -> bool:
     return False
 
 
-def _combine_op(fn: Optional[Callable]) -> Optional[str]:
-    """Does ``fn`` (an unwrapped ``__call__``) combine tensors with array ops?
+# Modules whose functions are array ops worth drawing. A call like
+# ``jnp.concat(...)`` or ``nnx.leaky_relu(x)`` is a real step in the forward
+# pass, but it is not an ``nnx.Module``, so the runtime trace never sees it.
+_OP_ROOTS = ("jnp", "jax", "nnx", "np", "numpy", "lax", "F")
 
-    Returns ``"add"`` / ``"concat"`` / ``None``. Residual adds are written as
-    ``out = out + x`` rather than as a module, so nothing in the runtime trace
-    marks them. Reading the source is exact where guessing from array identity
-    is not: ``ConvBlock`` also returns a fresh array (its activation) but
-    contains no add, and only the source distinguishes the two.
+# Binary/unary operators, mapped to the symbol drawn inside the op circle.
+_BINOPS = {
+    ast.Add: ("add", "+"), ast.Sub: ("sub", "−"),
+    ast.Mult: ("mul", "×"), ast.Div: ("div", "÷"),
+    ast.MatMult: ("matmul", "@"), ast.Pow: ("pow", "^"),
+    ast.Mod: ("mod", "%"), ast.FloorDiv: ("floordiv", "//"),
+}
+
+# Elementwise ops, whose output shape always equals their input shape. For
+# anything outside this set (``mean``, ``reshape``, ``sum``, ``transpose``...)
+# the produced shape has to be read off the module that consumed the value,
+# since bare ops are not intercepted and never record their own output.
+_SHAPE_PRESERVING = frozenset({
+    "relu", "leaky_relu", "gelu", "elu", "silu", "swish", "selu", "celu",
+    "sigmoid", "tanh", "softplus", "softsign", "hard_sigmoid", "hard_tanh",
+    "hard_swish", "hard_silu", "log_sigmoid", "softmax", "log_softmax",
+    "abs", "exp", "log", "sqrt", "rsqrt", "square", "sign", "negative",
+    "clip", "round", "floor", "ceil", "where", "dropout", "standardize",
+})
+
+# Short glyphs for the array functions that come up often; anything else
+# falls back to the function's own name.
+_OP_SYMBOLS = {
+    "concat": "⧺", "concatenate": "⧺", "stack": "⧺",
+    "add": "+", "subtract": "−", "multiply": "×",
+    "divide": "÷", "true_divide": "÷", "matmul": "@",
+    "dot": "@", "einsum": "∑", "sum": "∑", "mean": "μ",
+    "reshape": "↳", "transpose": "⇄", "swapaxes": "⇄",
+    "split": "✂", "where": "?", "pad": "▣",
+}
+
+
+# Builtins that return a plain Python number, so arithmetic on their result
+# is index/shape bookkeeping rather than dataflow.
+_SCALAR_CALLS = frozenset({"len", "int", "round", "abs", "min", "max", "sum"})
+
+
+def _is_scalar_expr(node: ast.AST) -> bool:
+    """Does ``node`` obviously evaluate to a plain Python number?
+
+    ``len(x) - 1`` and ``i + 1`` are index arithmetic, not array ops, but the
+    AST cannot tell them apart from ``out + x`` by shape alone. Recognising the
+    numeric side is enough: a subtraction with a literal ``1`` on the right is
+    bookkeeping, whereas a residual combines two names.
+    """
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and not isinstance(
+            node.value, bool)
+    if isinstance(node, ast.UnaryOp) and isinstance(
+            node.op, (ast.UAdd, ast.USub)):
+        return _is_scalar_expr(node.operand)
+    if isinstance(node, ast.Call):
+        return getattr(node.func, "id", None) in _SCALAR_CALLS
+    if isinstance(node, ast.BinOp):
+        return (_is_scalar_expr(node.left) or _is_scalar_expr(node.right))
+    # ``x.shape[0]``, ``x.ndim`` - attributes that hold sizes, never arrays.
+    if isinstance(node, ast.Attribute) and node.attr in ("ndim", "size"):
+        return True
+    if (isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "shape"):
+        return True
+    return False
+
+
+def _op_root(node: ast.AST) -> Optional[str]:
+    """Leftmost name of a dotted expression: ``jax.nn.relu`` -> ``jax``."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _dotted(node: ast.AST) -> str:
+    """Render an attribute chain back to source form."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+@dataclasses.dataclass
+class _Op:
+    """A bare array operation found in a module's ``__call__`` source."""
+
+    op: str          # "concat", "add", "leaky_relu", ...
+    sym: str         # glyph drawn in the node circle
+    qual: str        # full call as written, e.g. "jnp.concat"
+    lineno: int      # source line, used to order ops against module calls
+    col: int
+    nargs: int       # positional array arguments, so binary ops fan in
+    # ``self.<attr>`` calls this op's own statement makes - the op consumes
+    # their result directly (``nnx.leaky_relu(self.init(x))``).
+    after: tuple = ()
+    # The nearest ``self.<attr>`` call *before* this op in source order, for
+    # the common two-statement form ``x = layer(x)`` then ``x = act(x)``.
+    prev_call: Optional[str] = None
+    # True when the op sits inside a loop, so it runs once per iteration and
+    # must attach to every child that loop invoked, not just the first.
+    in_loop: bool = False
+    # AST nesting depth. Within one statement the deepest op evaluates first,
+    # which is the order the synthesized nodes must chain in.
+    depth: int = 0
+
+
+def _scan_ops(fn: Optional[Callable]) -> list:
+    """Every bare array op in ``fn``, in source order.
+
+    Residual adds, ``jnp.concat``, activations like ``nnx.leaky_relu`` and
+    reshapes are all written as plain expressions rather than modules, so
+    nothing in a module-level runtime trace records them. Reading the source
+    is what makes them visible - and it is exact where guessing from array
+    identity is not, since a module that merely returns a fresh array (a
+    ``ConvBlock`` and its activation) looks identical at runtime to one that
+    combined two branches.
     """
     if fn is None:
-        return None
+        return []
     fn = getattr(fn, "__wrapped__", fn)
     try:
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
     except (OSError, TypeError, SyntaxError, IndentationError):
-        return None                      # C-implemented or source unavailable
+        return []                        # C-implemented or source unavailable
+
+    # Nodes inside a ``for``/``while`` body run once per iteration.
+    looped: set = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            return "add"
-        if (isinstance(node, ast.Call)
-                and getattr(node.func, "attr", None) in
-                ("concatenate", "concat")):
-            return "concat"
-    return None
+        if isinstance(node, (ast.For, ast.While)):
+            for inner in node.body:
+                for sub in ast.walk(inner):
+                    looped.add(id(sub))
+
+    # Nesting depth, so ops in one expression can be ordered the way they
+    # evaluate: in ``tanh(a(x)) * 2 + y`` the ``+`` is outermost but runs
+    # last, while ``tanh`` is deepest and runs first.
+    depth_of: dict = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            depth_of[id(child)] = depth_of.get(id(parent), 0) + 1
+
+    # Arithmetic sitting in a subscript, a slice, or a comparison is choosing
+    # *which* element to use, never computing one: ``x[i + 1]``,
+    # ``out_ch[:-1]``, ``if i != len(x) - 1``. Collect those positions so the
+    # scan below can skip them wholesale.
+    index_ctx: set = set()
+    for node in ast.walk(tree):
+        holders = []
+        if isinstance(node, ast.Subscript):
+            holders.append(node.slice)
+        elif isinstance(node, ast.Slice):
+            holders.extend(h for h in (node.lower, node.upper, node.step) if h)
+        elif isinstance(node, ast.Compare):
+            holders.append(node.left)
+            holders.extend(node.comparators)
+        for holder in holders:
+            for sub in ast.walk(holder):
+                index_ctx.add(id(sub))
+
+    ops: list = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+            # Index/shape bookkeeping, not dataflow. Either side being a plain
+            # number is enough - ``len(x) - 1``, ``i + 1``, ``ch * 2`` - since a
+            # real array combine has arrays on both sides.
+            if id(node) in index_ctx or _is_scalar_expr(node):
+                continue
+            name, sym = _BINOPS[type(node.op)]
+            ops.append(_Op(name, sym, name, node.lineno, node.col_offset, 2,
+                           in_loop=id(node) in looped,
+                           depth=depth_of.get(id(node), 0)))
+        elif isinstance(node, ast.Call):
+            root = _op_root(node.func)
+            if root not in _OP_ROOTS:
+                continue                 # a module call or an unrelated helper
+            attr = getattr(node.func, "attr", None)
+            if attr is None or attr.startswith("_"):
+                continue
+            ops.append(_Op(
+                attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
+                node.lineno, node.col_offset, len(node.args),
+                in_loop=id(node) in looped,
+                depth=depth_of.get(id(node), 0)))
+
+    # ``for layer in self.layers:`` binds a submodule to a plain name, so the
+    # call inside the body reads ``layer(x)`` and names no attribute. Map each
+    # such loop variable back to the container it iterates, so those calls
+    # count as calls to ``self.layers``.
+    aliases: dict = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                and _op_root(node.iter) == "self"):
+            aliases[node.target.id] = _dotted(node.iter)
+        # ``for i, layer in enumerate(self.layers)`` / ``zip(...)``
+        elif isinstance(node, ast.For) and isinstance(node.target, ast.Tuple):
+            it = node.iter
+            if isinstance(it, ast.Call) and getattr(
+                    it.func, "id", None) in ("enumerate", "zip"):
+                for arg in it.args:
+                    if _op_root(arg) != "self":
+                        continue
+                    for elt in node.target.elts:
+                        if isinstance(elt, ast.Name):
+                            aliases.setdefault(elt.id, _dotted(arg))
+
+    def _call_target(call: ast.Call) -> Optional[str]:
+        """The ``self.<attr>`` a call resolves to, directly or via an alias."""
+        if _op_root(call.func) == "self":
+            return _dotted(call.func)
+        if isinstance(call.func, ast.Name) and call.func.id in aliases:
+            return aliases[call.func.id]
+        # ``self.layers[i](x)`` - subscripting a container attribute.
+        if isinstance(call.func, ast.Subscript):
+            inner = call.func.value
+            if _op_root(inner) == "self":
+                return _dotted(inner)
+        return None
+
+    # Every module call, with its source position, so each op can be tied to
+    # the calls it sits with or after.
+    calls = sorted(
+        ((c.lineno, c.col_offset, _call_target(c))
+         for c in ast.walk(tree)
+         if isinstance(c, ast.Call) and _call_target(c) is not None),
+        key=lambda t: (t[0], t[1]),
+    )
+    for op in ops:
+        # Same statement (``nnx.leaky_relu(self.init(x))``): the op consumes
+        # that call's result, whichever order the two appear on the line.
+        op.after = tuple(q for ln, _, q in calls if ln == op.lineno)
+        # Otherwise the nearest module call above it, which is what produced
+        # the value the op is being applied to.
+        prior = [q for ln, cl, q in calls
+                 if (ln, cl) < (op.lineno, op.col) and ln != op.lineno]
+        op.prev_call = prior[-1] if prior else None
+
+    # Statements run top to bottom; within one, the deepest op runs first.
+    ops.sort(key=lambda o: (o.lineno, -o.depth, o.col))
+    return ops
+
+
+def _concat_axis(a: Tensor, b: Tensor) -> Optional[int]:
+    """The single axis on which ``a`` and ``b`` differ, if there is exactly one.
+
+    Two arrays can be concatenated only when they agree on every other axis, so
+    a lone mismatch identifies the join axis. Equal shapes are joinable on any
+    axis; report the last, which is the overwhelmingly common channel concat.
+    """
+    if len(a.shape) != len(b.shape) or not a.shape:
+        return None
+    diff = [i for i, (x, y) in enumerate(zip(a.shape, b.shape)) if x != y]
+    if not diff:
+        return len(a.shape) - 1
+    return diff[0] if len(diff) == 1 else None
+
+
+def _concat_compatible(a: Tensor, b: Tensor) -> bool:
+    """Could ``a`` and ``b`` be operands of the same concatenate?"""
+    return _concat_axis(a, b) is not None
 
 
 def _config_of(module: nnx.Module) -> dict:
@@ -303,7 +544,7 @@ def trace_model(
     def _wrap(fn: Callable) -> Callable:
         # Computed once per class, from the *original* function - inside the
         # wrapper ``cls.__dict__['__call__']`` is this wrapper, not the source.
-        combine_op = _combine_op(fn)
+        source_ops = _scan_ops(fn)
 
         def wrapper(self, *a, **kw):
             key = id(self)
@@ -335,15 +576,22 @@ def trace_model(
             keepalive.extend(
                 l for l in jax.tree_util.tree_leaves((a, kw))
                 if hasattr(l, "shape") and hasattr(l, "dtype"))
-            for aid in _array_ids((a, kw)):
-                src = producer.get(aid)
+            # Pair each consumed array with its own descriptor, so an edge
+            # reports the tensor that actually travelled it. Labelling every
+            # incoming edge with ``inputs[0]`` misreports each argument after
+            # the first - a style vector arriving at ``ModulatedConv2d(out, w)``
+            # would claim the feature map's shape.
+            in_leaves = [l for l in jax.tree_util.tree_leaves((a, kw))
+                         if hasattr(l, "shape") and hasattr(l, "dtype")]
+            for leaf in in_leaves:
+                src = producer.get(id(leaf))
                 if src is None or src == node.id or src in stack:
                     continue
                 if src == INPUT_NODE and node.depth == 0:
                     continue  # the root receiving the input is not an edge
                 edges.append(Edge(
                     src, node.id,
-                    next(iter(node.inputs), Tensor((), ""))))
+                    Tensor(tuple(leaf.shape), str(leaf.dtype))))
 
             try:
                 out = fn(self, *a, **kw)
@@ -359,22 +607,33 @@ def trace_model(
 
             node.outputs = _as_tensors(out)
 
-            # Did this call combine values with bare array ops? A container
-            # that returns an array none of its children produced, while two
-            # or more values it *did* see are still unaccounted for, has run
-            # something like ``out + x`` between its children. Record the
-            # candidate; ``_add_merges`` below decides which are real.
+            # Bare array ops (``x + skip``, ``jnp.concat([a, b])``,
+            # ``nnx.leaky_relu(x)``) are not modules, so nothing above recorded
+            # them. The source scan says which ops this ``__call__`` runs;
+            # ``_add_op_nodes`` below turns them into nodes and wires them into
+            # the dataflow. Recorded for *every* call that has ops - including
+            # ones whose output came straight from a child, as in an adapter
+            # that concatenates its inputs and then returns ``self.final(x)``.
             out_ids = set(_array_ids(out))
             child_ids: set = set()
             for cid in child_of.get(node.id, []):
                 child_ids.update(produced_by.get(cid, ()))
-            if out_ids and not (out_ids & child_ids):
+            if source_ops:
                 merge_candidates.append({
                     "node": node.id,
-                    "in_ids": set(_array_ids((a, kw))),
+                    # A list, not a set: ``in_arrays`` is zipped against it, so
+                    # the order of the two must agree.
+                    "in_ids": [id(l) for l in in_leaves],
+                    "in_arrays": [Tensor(tuple(l.shape), str(l.dtype))
+                                  for l in in_leaves],
                     "child_ids": child_ids,
                     "out": next(iter(node.outputs), None),
-                    "op": combine_op,
+                    "in_tensors": list(node.inputs),
+                    "ops": source_ops,
+                    # True when the value the host returned is *not* one a
+                    # child produced - the mark of a trailing combine such as
+                    # ``out + x`` that closes a residual branch.
+                    "tail_combine": bool(out_ids) and not (out_ids & child_ids),
                 })
 
             produced_by[node.id] = out_ids
@@ -444,85 +703,13 @@ def trace_model(
         child_total = sum(nodes[c].params for c in children.get(n.id, []))
         n.own_params = max(0, n.params - child_total)
 
-    # Residual adds are bare array ops (``out = out + x``), not modules, so
-    # nothing above records them and the branches appear to diverge and never
-    # rejoin. Synthesize an explicit merge node for each container that
-    # combined an incoming value with something its children produced: it is
-    # the only part of a residual block that carries no parameters, and
-    # without it the picture is simply wrong.
-    for cand in merge_candidates:
-        host = nodes[cand["node"]]
-        op = cand["op"]
-        if op is None:
-            continue                    # no ``+`` / concat in this __call__
-        kids_ids = child_of.get(host.id, [])
-        if not kids_ids:
-            continue                    # a leaf module, nothing was combined
-        # Operands are the children whose output nothing else consumed - the
-        # ends of each branch. In ``conv2(conv1(x)) + shortcut(x)`` that is
-        # {conv2, shortcut}: conv1's output was eaten by conv2, so conv1 is
-        # mid-branch, while the *last-called* child is merely ``shortcut``.
-        consumed = {e.src for e in edges if e.dst in kids_ids}
-        branch_ends = [k for k in kids_ids if k not in consumed]
-        # Plus any value the host received that no child produced (a residual
-        # adding the raw input, as in ``out + x``). Skip it when a branch end
-        # already consumed that same value - then the branch *is* that path
-        # (``shortcut(x)``), and adding the raw input would double-count it.
-        in_end_subtree = set(branch_ends)
-        for n in nodes:
-            if any(_is_descendant(n.id, b, nodes) for b in branch_ends):
-                in_end_subtree.add(n.id)
-        fed_ends = {e.src for e in edges
-                    if e.dst in in_end_subtree and e.src not in kids_ids}
-        carried = [src for src in (producer.get(i) for i in cand["in_ids"])
-                   if src is not None and src != host.id
-                   and src not in kids_ids and src not in fed_ends]
-        if len(branch_ends) + len(carried) < 2:
-            continue                    # nothing actually converged here
-        last_kid = branch_ends[-1] if branch_ends else kids_ids[-1]
-        sym = "+" if op == "add" else "⧺"
-        merge = Node(
-            id=len(nodes),
-            path=f"{host.path}.{sym}" if host.path != "<root>" else sym,
-            name=sym,
-            cls=op,
-            depth=host.depth + 1,
-            parent=host.id,
-            params=0,
-            own_params=0,
-            inputs=[t for t in (cand["out"],) if t is not None],
-            outputs=[t for t in (cand["out"],) if t is not None],
-            config={},
-            kind="merge",
-            op=op,
-            # Runs after the host's last child *and everything that child
-            # called*, so sort past that whole subtree rather than past the
-            # child's own id.
-            order=max([last_kid] + [n.id for n in nodes
-                                    if _is_descendant(n.id, last_kid, nodes)]),
-        )
-        nodes.append(merge)
-        children.setdefault(host.id, []).append(merge.id)
-        tensor = cand["out"] or Tensor((), "")
-        # Every branch end feeds the merge. The first (the longest-running
-        # path) is the main line; the rest are the shortcuts.
-        operands = list(dict.fromkeys(branch_ends + carried))
-        for i, src in enumerate(operands):
-            edges.append(Edge(src, merge.id, tensor, skip=i > 0))
-        # anything that consumed the host's output now consumes the merge
-        for e in edges:
-            if e.src == host.id and e.dst != merge.id:
-                e.src = merge.id
-        for o in out_sources:
-            if o["src"] == host.id:
-                o["src"] = merge.id
-
     # Array identity only survives while a value passes straight from one
     # module to the next. A bare ``jnp``/``jax.nn`` call in between (an
     # activation, a mean, a reshape) produces a *new* array, so the chain
     # breaks and the consumer looks like it has no producer at all. Fall back
     # to execution order for those: link a leaf with no recorded producer to
-    # the previously completed leaf, which is what actually fed it.
+    # the previously completed leaf, which is what actually fed it. This runs
+    # *before* op synthesis so the ops below splice onto a complete chain.
     leaf_ids = [n.id for n in nodes if not children.get(n.id)]
     has_producer = {e.dst for e in edges}
     prev_leaf = None
@@ -536,6 +723,276 @@ def trace_model(
                               next(iter(node.inputs), Tensor((), "")),
                               inferred=True))
         prev_leaf = nid
+
+    # Bare array ops - residual adds, ``jnp.concat``, activations, reshapes -
+    # are written as plain expressions, not modules, so nothing above records
+    # them. Without them a residual's branches appear to diverge and never
+    # rejoin, and a block that concatenates its inputs shows two arrows
+    # arriving at a Linear with no sign of where they joined. Synthesize a
+    # node per op from the source scan and wire it into the dataflow.
+    def _subtree_max(nid: int) -> int:
+        """Highest node id inside ``nid``'s subtree - when it finished."""
+        return max([nid] + [n.id for n in nodes
+                            if _is_descendant(n.id, nid, nodes)])
+
+    def _new_op_node(host: Node, op: str, sym: str, qual: str,
+                     tensor: Optional[Tensor], order: int,
+                     out_tensor: Optional[Tensor] = None) -> Node:
+        # ``out_tensor`` differs from ``tensor`` for ops that change shape - a
+        # ``jnp.mean`` over the spatial axes consumes (B,H,W,C) and produces
+        # (B,C). Bare ops are never intercepted, so the shape they produced is
+        # not observed directly; it is read off whatever consumed the value.
+        node = Node(
+            id=len(nodes),
+            path=f"{host.path}.{sym}" if host.path != "<root>" else sym,
+            name=sym,
+            cls=qual,
+            depth=host.depth + 1,
+            parent=host.id,
+            params=0,
+            own_params=0,
+            inputs=[t for t in (tensor,) if t is not None],
+            outputs=[t for t in (out_tensor or tensor,) if t is not None],
+            config={},
+            kind="merge",
+            op=op,
+            order=order,
+        )
+        nodes.append(node)
+        children.setdefault(host.id, []).append(node.id)
+        return node
+
+    for cand in merge_candidates:
+        host = nodes[cand["node"]]
+        kids_ids = list(child_of.get(host.id, []))
+        # ``after`` on each op names the ``self.<attr>(...)`` calls made in the
+        # same statement, so an op can be placed relative to real children.
+        # Map each child node back to the attribute path used to call it.
+        kid_by_attr: dict = {}
+        for kid in kids_ids:
+            attr = nodes[kid].path
+            if attr.startswith(host.path + ".") and host.path != "<root>":
+                attr = attr[len(host.path) + 1:]
+            kid_by_attr.setdefault(f"self.{attr}", []).append(kid)
+            # Children held in a list or dict are reached as ``self.layers.0``
+            # but called as ``layer(x)`` inside ``for layer in self.layers``.
+            # Register the container name too, so a loop body's ops attach to
+            # every element the loop invoked.
+            container = attr.rsplit(".", 1)[0]
+            if container != attr:
+                kid_by_attr.setdefault(f"self.{container}", []).append(kid)
+
+        # The tip of each wire as ops are spliced onto it. ``jnp.tanh(a(x)) *
+        # 2 + y`` synthesizes three nodes that must chain - tanh off ``a``,
+        # then ``*`` off tanh, then ``+`` off ``*`` - rather than all three
+        # hanging off ``a``. Keyed by the child they ultimately derive from.
+        tip: dict = {}
+
+        for op_info in cand["ops"]:
+            op, sym, qual = op_info.op, op_info.sym, op_info.qual
+            # Which child ran in the same statement? That anchors the op in
+            # execution order and gives it its operand. Failing that, the
+            # nearest module call above it produced the value it consumes.
+            anchors = [k for call in op_info.after
+                       for k in kid_by_attr.get(call, [])]
+            if not anchors and op_info.prev_call:
+                anchors = list(kid_by_attr.get(op_info.prev_call, []))
+            # A call site inside a loop runs once per iteration; each of the
+            # children it produced gets its own copy of the op.
+            if anchors and not op_info.in_loop:
+                anchors = anchors[-1:]
+
+            if op in ("concat", "concatenate", "stack") and not anchors:
+                # A join of several *incoming* values, before any child runs -
+                # ``jnp.concat([motion, id])`` at the top of an adapter. Its
+                # operands are the host's own inputs, and everything the host
+                # fed downstream should hang off the join instead.
+                # Keep each operand's own tensor alongside its producer, so the
+                # incoming arrows report pre-concat shapes rather than the
+                # joined width.
+                src_tensor: dict = {}
+                srcs = []
+                for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
+                    s = producer.get(aid)
+                    if s is None or s == host.id or s in kids_ids:
+                        continue
+                    if s not in src_tensor:
+                        src_tensor[s] = tsr
+                        srcs.append(s)
+                if len(srcs) < 2:
+                    continue            # not actually joining two branches
+                # The join's result is what the child that consumed it received.
+                # Prefer the earliest child *in call order* whose own input is
+                # wider than every operand - that is the concatenated array.
+                # ``min(kids_ids)`` alone assumes the first child consumes the
+                # join, which is not true in general.
+                joined = None
+                op_widths = [t.shape[-1] for t in src_tensor.values()
+                             if t is not None and t.shape]
+                total = sum(op_widths) if op_widths else None
+                for kid in sorted(kids_ids):
+                    cand_t = next(iter(nodes[kid].inputs), None)
+                    if cand_t is None or not cand_t.shape:
+                        continue
+                    if total is not None and cand_t.shape[-1] == total:
+                        joined = cand_t
+                        break
+                if joined is None and kids_ids:
+                    joined = next(iter(nodes[min(kids_ids)].inputs), None)
+                if joined is None:
+                    joined = cand["in_tensors"][0] if cand["in_tensors"] else None
+                first_kid = min(kids_ids) if kids_ids else host.id
+                node = _new_op_node(host, op, sym, qual, joined,
+                                    order=first_kid - 1)
+                srcs_set = set(srcs)
+                # The children that consumed those raw inputs now consume the
+                # join - that is what the source actually does. Rewire before
+                # adding the operand edges so they are not themselves caught.
+                rewired = False
+                for e in edges:
+                    if (e.src in srcs_set and e.dst != node.id
+                            and (e.dst in kids_ids
+                                 or any(_is_descendant(e.dst, k, nodes)
+                                        for k in kids_ids))):
+                        e.src = node.id
+                        rewired = True
+                # The first child usually received the joined array directly,
+                # so no edge existed to rewire - the value never passed
+                # through another module. Wire the join to it explicitly.
+                if not rewired and kids_ids:
+                    edges.append(Edge(node.id, first_kid,
+                                      joined or Tensor((), "")))
+                for i, src in enumerate(srcs):
+                    edges.append(Edge(
+                        src, node.id,
+                        src_tensor.get(src) or joined or Tensor((), ""),
+                        skip=i > 0))
+                continue
+
+            if not kids_ids:
+                continue                # a leaf module: no flow to splice into
+
+            merged = False
+            if cand["tail_combine"] and op in ("add", "sub", "mul", "concat",
+                                               "concatenate", "div"):
+                # A trailing combine that closes a residual: ``out + x``.
+                # Operands are the children whose output nothing consumed -
+                # the ends of each branch. In ``conv2(conv1(x)) + shortcut(x)``
+                # that is {conv2, shortcut}: conv1's output was eaten by conv2.
+                consumed = {e.src for e in edges if e.dst in kids_ids}
+                branch_ends = [k for k in kids_ids if k not in consumed]
+                # Plus any value the host received that no child produced (a
+                # residual adding the raw input). Skip it when a branch end
+                # already consumed that value - then the branch *is* that path
+                # (``shortcut(x)``) and adding it would double-count.
+                in_end_subtree = set(branch_ends)
+                for n in nodes:
+                    if any(_is_descendant(n.id, b, nodes) for b in branch_ends):
+                        in_end_subtree.add(n.id)
+                fed_ends = {e.src for e in edges
+                            if e.dst in in_end_subtree
+                            and e.src not in kids_ids}
+                carried = [s for s in (producer.get(i) for i in cand["in_ids"])
+                           if s is not None and s != host.id
+                           and s not in kids_ids and s not in fed_ends]
+                # Fewer than two operands means nothing converged here, so
+                # this is not a residual merge - fall through and draw it as
+                # an ordinary elementwise op instead of dropping it.
+                if len(branch_ends) + len(carried) >= 2:
+                    last_kid = branch_ends[-1] if branch_ends else kids_ids[-1]
+                    node = _new_op_node(host, op, sym, qual, cand["out"],
+                                        order=_subtree_max(last_kid))
+                    tensor = cand["out"] or Tensor((), "")
+                    operands = list(dict.fromkeys(branch_ends + carried))
+                    for i, src in enumerate(operands):
+                        edges.append(Edge(src, node.id, tensor, skip=i > 0))
+                    # whatever consumed the host's output now consumes the op
+                    for e in edges:
+                        if e.src == host.id and e.dst != node.id:
+                            e.src = node.id
+                    for o in out_sources:
+                        if o["src"] == host.id:
+                            o["src"] = node.id
+                    merged = True
+
+            if merged or not anchors:
+                continue                # placed, or cannot be placed reliably
+
+            # An elementwise op applied to a child's output - an activation
+            # (``x = nnx.leaky_relu(x)`` after ``x = layer(x)``) or a reshape.
+            # Splice it onto the wire leaving that child: everything
+            # downstream of the child now reads from the op instead.
+            for src_kid in anchors:
+                # Splice onto the current tip of this wire, so several ops in
+                # one statement form a chain instead of a fan.
+                prev = tip.get(src_kid, src_kid)
+                tensor = next(iter(nodes[prev].outputs), None)
+                # A reducing or reshaping op (``jnp.mean(x, axis=(1, 2))``)
+                # outputs a different shape than it consumed, and bare ops are
+                # never intercepted so that shape was never recorded. The
+                # module that consumed the result did record it as its own
+                # input - take it from there rather than reporting the
+                # unchanged input shape, which would simply be wrong.
+                out_t = None
+                if op not in _SHAPE_PRESERVING:
+                    for e in edges:
+                        if e.src != prev:
+                            continue
+                        cons = next(iter(nodes[e.dst].inputs), None)
+                        if cons is not None:
+                            out_t = cons
+                            break
+                node = _new_op_node(host, op, sym, qual, tensor,
+                                    order=_subtree_max(src_kid),
+                                    out_tensor=out_t)
+                for e in edges:
+                    if e.src == prev and e.dst != node.id:
+                        e.src = node.id
+                for o in out_sources:
+                    if o["src"] == prev:
+                        o["src"] = node.id
+                edges.append(Edge(prev, node.id, tensor or Tensor((), "")))
+
+                # A join is not unary. ``jnp.concat([out, x[i+1]])`` follows a
+                # child, so it lands here rather than in the no-anchor branch
+                # above, but it still consumes a second value - typically one of
+                # the host's own inputs that no child produced. Without this the
+                # node draws a single arrow and the joined operand never
+                # connects, which also makes its width look unexplained.
+                if op in ("concat", "concatenate", "stack") and tensor is not None:
+                    used = {e.src for e in edges if e.dst == node.id}
+                    extra = []
+                    for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
+                        s = producer.get(aid)
+                        if (s is None or s == host.id or s == node.id
+                                or s in used or s in kids_ids):
+                            continue
+                        # A genuine operand agrees on every axis but the one
+                        # being joined. Matching on rank alone is far too loose:
+                        # in a pyramid every feature map is rank 4, so all of
+                        # them looked like operands and the join lit up three
+                        # unrelated inputs instead of the one it consumes.
+                        if not _concat_compatible(tsr, tensor):
+                            continue
+                        extra.append((s, tsr))
+                    # ``jnp.concat([out, feat])`` takes exactly one partner. If
+                    # several inputs are shape-compatible the trace cannot say
+                    # which, and guessing draws confidently wrong arrows - so
+                    # wire it only when the choice is unambiguous.
+                    if len(extra) == 1:
+                        s, tsr = extra[0]
+                        edges.append(Edge(s, node.id, tsr, skip=True))
+                        used.add(s)
+                        # The join widens the concat axis; the recorded output
+                        # was read off a consumer and is often the pre-join
+                        # shape. Correct it from the operands actually wired.
+                        ax = _concat_axis(tsr, tensor)
+                        if ax is not None:
+                            dims = list(tensor.shape)
+                            dims[ax] = tensor.shape[ax] + tsr.shape[ax]
+                            node.outputs = [Tensor(tuple(dims), tensor.dtype)]
+
+                tip[src_kid] = node.id
 
     # Deduplicate: one module pair can exchange several arrays.
     seen = set()

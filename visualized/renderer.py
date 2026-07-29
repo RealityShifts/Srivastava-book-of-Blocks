@@ -179,7 +179,9 @@ const isHidden = id => {          // hidden when any ancestor is collapsed
 };
 // Nearest rendered stand-in for a node (itself, or its collapsed ancestor).
 const proxy = id => {
-  if (id === __INPUT__) return __INPUT__;
+  // Input and output pills are not real nodes, so they have no ancestor to
+  // collapse into and stand in for themselves.
+  if (id < 0) return id;
   let cur = id, p = byId.get(id) ? byId.get(id).parent : null, top = null;
   while (p !== null && p !== undefined) {
     if (collapsed.has(p)) top = p;
@@ -216,12 +218,33 @@ function relayout() {
     walk(id);
     return out;
   };
-  const resolve = (id, wantLast) => {
+  // Pick by execution order, not by raw id. Merge nodes are appended after
+  // tracing, so their ids run far above their siblings' - ``Math.min``/
+  // ``Math.max`` over ids therefore picks the wrong end of the subtree and
+  // several distinct edges collapse onto one node.
+  const pick = (ds, wantLast) => ds.reduce((best, c) =>
+    (wantLast ? ord(c) > ord(best) : ord(c) < ord(best)) ? c : best);
+  // ``hint`` is the node on the other side of the edge: when a container holds
+  // the real endpoint, prefer the descendant that actually carries this edge
+  // instead of the subtree's first/last leaf. Without it every input feeding
+  // different children of one container lands on the same leaf.
+  const resolve = (id, wantLast, hint) => {
     let cur = id;
     while (expanded(cur)) {
       const ds = descOf(cur).filter(c => visSet.has(c) && !expanded(c));
       if (!ds.length) break;
-      cur = wantLast ? Math.max(...ds) : Math.min(...ds);
+      let pool = ds;
+      if (hint !== undefined && hint !== null) {
+        // Descendants genuinely linked to the other endpoint by a recorded
+        // edge. The far endpoint may itself be a container, so accept an edge
+        // landing anywhere in its subtree.
+        const far = new Set([hint, ...descOf(hint)]);
+        const linked = ds.filter(c => DATA.edges.some(e => wantLast
+          ? (e.src === c && far.has(e.dst))
+          : (e.dst === c && far.has(e.src))));
+        if (linked.length) pool = linked;
+      }
+      cur = pick(pool, wantLast);
     }
     return cur;
   };
@@ -230,12 +253,19 @@ function relayout() {
   const eds = [];
   const seen = new Set();
   for (const e of DATA.edges) {
-    let s = e.src === __INPUT__ ? __INPUT__ : proxy(e.src);
+    // Every input pill is a source, not just the first. Testing only
+    // ``__INPUT__`` here dropped the edges of arguments two onward - their ids
+    // are not real nodes, so ``visSet`` never contains them and the pills drew
+    // with no arrows at all.
+    let s = isInput(e.src) ? e.src : proxy(e.src);
     let d = proxy(e.dst);
-    if (s !== __INPUT__ && !visSet.has(s)) continue;
+    if (!isInput(s) && !visSet.has(s)) continue;
     if (!visSet.has(d)) continue;
-    s = s === __INPUT__ ? s : resolve(s, true);   // producer: its last leaf
-    d = resolve(d, false);                        // consumer: its first leaf
+    // Hint with the raw recorded endpoints, not the already-resolved ones, so
+    // the two lookups stay independent of each other's outcome.
+    const s0 = s, d0 = d;
+    s = isInput(s) ? s : resolve(s, true, d0);    // producer: its last leaf
+    d = resolve(d, false, s0);                   // consumer: its first leaf
     if (s === d) continue;
     const k = s + '>' + d;
     if (seen.has(k)) continue;
@@ -254,7 +284,7 @@ function relayout() {
   const row = new Map(leaves.map(n => [n.id, 0]));
   const preds = new Map();
   eds.forEach(e => {
-    if (e.src === __INPUT__ || !leafSet.has(e.src) || !leafSet.has(e.dst)) return;
+    if (isInput(e.src) || !leafSet.has(e.src) || !leafSet.has(e.dst)) return;
     if (!preds.has(e.dst)) preds.set(e.dst, []);
     preds.get(e.dst).push(e.src);
   });
@@ -678,14 +708,25 @@ function draw() {
     const g = el('g', { class: 'node', transform: `translate(${p.x},${p.y})` });
     g.dataset.id = n.id;
 
-    // A merge (a residual ``+``) owns no parameters and is not a module, so
-    // it is drawn as a small circle on the flow rather than a full card.
+    // An array op (a residual ``+``, a concat, an activation) owns no
+    // parameters and is not a module, so it is drawn as a small pill on the
+    // flow rather than a full card. A one-glyph label keeps the classic
+    // circle; a named op like ``leaky_relu`` widens into a rounded pill so
+    // the text is not clipped.
     if (n.kind === 'merge') {
       const cx = NW / 2, cy = 20;
-      g.appendChild(el('circle', { cx, cy, r: 17, fill: 'var(--panel)',
+      const glyph = [...n.name].length <= 2;
+      const fs = glyph ? 18 : 11;
+      // SVG has no text metrics before layout; this per-character estimate is
+      // close enough for a monospace-ish label and never under-sizes.
+      const wRaw = glyph ? 34 : [...n.name].length * fs * 0.62 + 16;
+      const w = Math.min(wRaw, NW), h = 34;
+      g.appendChild(el('rect', { x: cx - w / 2, y: cy - h / 2, width: w,
+        height: h, rx: h / 2, fill: 'var(--panel)',
         stroke: 'var(--skip)', 'stroke-width': 2 }));
-      const s = el('text', { x: cx, y: cy + 6, 'text-anchor': 'middle',
-        fill: 'var(--skip)', 'font-size': 18, 'font-weight': 700 });
+      const s = el('text', { x: cx, y: cy + (glyph ? 6 : 4),
+        'text-anchor': 'middle', fill: 'var(--skip)', 'font-size': fs,
+        'font-weight': 700 });
       s.textContent = n.name;
       g.appendChild(s);
       const sh = el('text', { x: cx, y: cy + 33, 'text-anchor': 'middle',

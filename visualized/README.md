@@ -75,13 +75,20 @@ module that actually produced it. A model returning a tuple or a list of
 feature maps gets one pill per entry, numbered in return order; click any of
 them to see its shape and its producing module.
 
-**Residual adds appear as an orange `+` circle.** A residual is written as a
-bare array op (`out = out + x`), not as a module, so nothing in a
-module-level trace records it - the branches would appear to diverge and
-never rejoin. Blocks like `FeatResBlock` and `ResidualBlock` therefore get a
-synthesized merge node carrying no parameters, with the skip operand bowed
-out sideways so the bypass is visible rather than hidden under the main
-chain.
+**Bare array ops appear as orange circles.** Anything written as a plain
+expression rather than a module - a residual `out = out + x`, a
+`jnp.concat([a, b])`, an activation like `nnx.leaky_relu(x)`, a reshape - is
+invisible to a module-level trace: the branches would appear to diverge and
+never rejoin, and a block that concatenates its inputs would show two arrows
+arriving at a `Linear` with no sign of where they joined. Each op therefore
+gets a synthesized node carrying no parameters, labelled with a glyph (`+`,
+`⧺`, `×`, `∑`, `↳`, ...) or the function's own name, and spliced into the
+dataflow where the source runs it. The details panel shows the qualified
+call (`jnp.concat`, `nnx.leaky_relu`) and the shape it produced.
+
+For a merge, the skip operand is bowed out sideways so the bypass is visible
+rather than hidden under the main chain. Ops are recognised on `jnp`, `jax`,
+`nnx`, `lax`, and `numpy`, plus the arithmetic operators.
 
 The view opens at depth 1 - top-level children only. Increase depth as
 needed; big models stay readable because you choose how far to unfold.
@@ -109,12 +116,19 @@ Consequences worth knowing:
   consumed vs. produced). Values that pass through pure `jnp` operations
   between modules are new arrays, which breaks the chain; those links are
   recovered from execution order instead and tagged `inferred`.
-- **Merge nodes are gated on the source.** Whether a container really
-  combined tensors is decided by parsing its `__call__` for a `+` or a
-  `concatenate`, because array identity alone cannot tell a residual add from
-  an ordinary activation - `ConvBlock` also returns a fresh array. If the
-  source is unavailable (a C-implemented or dynamically generated `__call__`),
-  no merge node is synthesized and the residual will not be drawn.
+- **Op nodes come from the source.** Which array ops a container runs is
+  decided by parsing its `__call__`, because array identity alone cannot tell
+  a residual add from an ordinary activation - `ConvBlock` also returns a
+  fresh array. Each op is then placed against the module calls around it: in
+  the same statement (`nnx.leaky_relu(self.init(x))`), or after the nearest
+  preceding call (`x = layer(x)` then `x = nnx.leaky_relu(x)`). Ops in a loop
+  body attach to every child that loop invoked, and `for layer in self.layers`
+  is resolved back to the container so those calls are matched. If the source
+  is unavailable (a C-implemented or dynamically generated `__call__`), no op
+  nodes are synthesized and those steps will not be drawn.
+- **Ops are drawn where they are written, not where they execute.** The
+  source scan gives position, not a second runtime trace, so an op guarded by
+  a branch that did not run for your inputs may still be drawn.
 - Tracing is not thread-safe: it patches classes for the duration of the call.
 
 ## Requirements
