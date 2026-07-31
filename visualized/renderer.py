@@ -100,12 +100,16 @@ button:hover { border-color:var(--accent); }
   border-radius:6px; padding:8px 10px; z-index:5; }
 #legend div { display:flex; align-items:center; gap:6px; margin:2px 0; }
 #legend i { width:16px; height:0; border-top:2px solid var(--edge);
-  display:inline-block; }
+  display:inline-block; flex:none; }
+#legend.off { display:none; }
+/* The class key can run long on a deep model; cap it and let it scroll rather
+   than letting the legend grow past the top of the canvas. */
+#classkey { max-height:34vh; overflow-y:auto; }
 .node rect { stroke-width:1.2px; }
 .node { cursor:pointer; }
 .node text { pointer-events:none; }
-/* The family hue survives as a 3px left rule - enough to group at a glance
-   without flooding the canvas with colour. */
+/* The class hue is on the card border; the 3px left rule repeats it so the
+   grouping still reads at low zoom, where a 1.4px outline thins to nothing. */
 .accent { stroke-width:0; }
 .nm { font-weight:600; font-size:12px; }
 .nc { font-size:10.5px; fill:var(--muted); }
@@ -153,6 +157,8 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
       <button id="zo">&minus;</button>
       <button id="shapes" title="Show/hide the shape on every connection"
         aria-pressed="true">Shapes</button>
+      <button id="legtog" title="Show/hide the legend and colour key"
+        aria-pressed="true">Legend</button>
       <button id="col">&minus; depth</button>
       <button id="exp">+ depth</button>
       <button id="svg-dl" title="Download the current view as SVG">SVG</button>
@@ -167,6 +173,7 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
       <div><i style="border-color:var(--skip);border-top-style:dashed"></i>
            skip / residual</div>
       <div><i style="border-color:var(--out)"></i> model output</div>
+      <div id="classkey"></div>
       <div style="margin-top:4px">scroll = zoom &middot; drag = pan &middot;
            click = inspect</div>
     </div>
@@ -181,17 +188,66 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
 <script>
 const DATA = __DATA__;
 
-// ---------- palette by module family -------------------------------------
-const COLORS = [
-  [/conv/i,          '#6ea8fe'],
-  [/norm|batchnorm/i,'#8bd450'],
-  [/attention|attn/i,'#c792ea'],
-  [/linear|dense|mlp|feedforward|ffn/i, '#f0883e'],
-  [/embed/i,         '#4dd0e1'],
-  [/pool|sample|resize/i, '#f5c542'],
-  [/drop/i,          '#9aa3b8'],
+// ---------- palette by shared weights -------------------------------------
+// Colour marks *weight sharing*, not module type. A module's ``path`` is its
+// attribute path in the model, so one path appearing on two cards means the
+// same object - the same parameters - was called twice. In ``Synthesis`` that
+// is ``refernce_modulator.N``, invoked once with the reference style and again
+// with the driver style; those two cards are one set of weights and now read as
+// one colour.
+//
+// Colouring by class was the earlier behaviour and answers a different
+// question: it groups ``FeatResBlock`` with ``FeatResBlock`` even though each
+// carries its own independent parameters. Modules with untied weights are left
+// neutral here, so a tinted border means exactly one thing - this block's
+// weights appear somewhere else in the graph.
+const RAMP = [
+  '#6ea8fe', '#e06c9f', '#8bd450', '#c792ea', '#f0883e', '#5ec8c0',
+  '#f5c542', '#b58cf0', '#4dd0e1', '#9ccf5a', '#e8944a', '#7fb3f5',
+  '#d47ba8', '#4db8a8', '#d4a24c', '#8fa6f0', '#6fc4e8', '#c98ad6',
 ];
-const colorOf = c => (COLORS.find(([re]) => re.test(c)) || [,'#7c8296'])[1];
+const NEUTRAL = '#7c8296';
+
+// How many times each path was invoked, and how many parameters it owns. A
+// path called once is not shared; a path owning no parameters (a bare wrapper,
+// a reshape-only block) has no weights to tie, so repeating it means only that
+// a structural container ran twice - not weight reuse worth flagging.
+const _uses = new Map();
+const _pparams = new Map();
+for (const n of DATA.nodes) {
+  if (n.kind === 'merge') continue;
+  _uses.set(n.path, (_uses.get(n.path) || 0) + 1);
+  _pparams.set(n.path, n.params);
+}
+// Deal hues in first-appearance order, which is forward-pass order, so the
+// assignment is deterministic rather than dependent on hash luck.
+const _hue = new Map();
+for (const n of DATA.nodes) {
+  if (n.kind === 'merge' || _hue.has(n.path)) continue;
+  if ((_uses.get(n.path) || 0) < 2 || !(_pparams.get(n.path) > 0)) continue;
+  _hue.set(n.path, RAMP[_hue.size % RAMP.length]);
+}
+// Keyed on path, so ``colorOf`` takes the node rather than a class string.
+const colorOf = n => (n && _hue.get(n.path)) || NEUTRAL;
+const isTied = n => !!(n && _hue.has(n.path));
+
+// Colour key: one row per shared-weight group, with how many times it is
+// called. Nothing tied means nothing to explain, so the section stays out of
+// the way entirely rather than printing an empty heading.
+(() => {
+  const box = document.getElementById('classkey');
+  if (!box) return;
+  const byPath = new Map(DATA.nodes.filter(n => n.kind !== 'merge')
+    .map(n => [n.path, n]));
+  const rows = [..._hue.keys()].map(p => [p, byPath.get(p), _uses.get(p)])
+    .sort((a, b) => b[2] - a[2] || a[0].localeCompare(b[0]));
+  if (!rows.length) return;
+  box.innerHTML = '<div style="margin-top:6px;opacity:.75">shared weights</div>'
+    + rows.map(([path, n, k]) =>
+      `<div><i style="border-top-width:6px;border-color:${colorOf(n)}"></i>`
+      + `${path} \\u00d7${k}</div>`).join('')
+    + '<div style="margin-top:2px;opacity:.6">grey = weights not shared</div>';
+})();
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B'
               : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
               : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
@@ -536,7 +592,6 @@ function draw() {
   root.append(gF, gFL, gE, gEL, gN);
 
   for (const f of layout.frames) {
-    const col = colorOf(f.node.cls);
     const g = el('g', { class: 'frame' });
     g.dataset.id = f.id;
     // Mermaid draws a subgraph as a quiet solid panel with a plain border - no
@@ -727,15 +782,21 @@ function draw() {
       gN.appendChild(g);
       continue;
     }
-    const col = n.error ? 'var(--err)' : colorOf(n.cls);
-    // Mermaid-style card: one shared fill and border for every node, with the
-    // module family reduced to a left accent rule. An error still overrides the
-    // border outright, since that must not be subtle.
+    const tied = isTied(n);
+    const col = n.error ? 'var(--err)' : colorOf(n);
+    // A tied module wears its group's colour on the border and the left rule;
+    // an untied one keeps the quiet default, so colour on the canvas always
+    // means shared weights rather than decoration. The 3px bar repeats the hue
+    // because at low zoom a 1.4px outline thins to nothing. An error overrides
+    // both, since that must not be subtle.
     g.appendChild(el('rect', { width: NW, height: NH, rx: 6,
       fill: 'var(--card)',
-      stroke: n.error ? 'var(--err)' : 'var(--cardln)' }));
-    g.appendChild(el('rect', { width: 3, height: NH, rx: 1.5, fill: col,
-      class: 'accent' }));
+      stroke: n.error ? 'var(--err)' : (tied ? col : 'var(--cardln)'),
+      'stroke-width': tied && !n.error ? 2 : 1.4 }));
+    if (tied || n.error) {
+      g.appendChild(el('rect', { width: 3, height: NH, rx: 1.5, fill: col,
+        class: 'accent' }));
+    }
 
     const t1 = el('text', { x: 12, y: 19, class: 'nm', fill: 'var(--fg)' });
     t1.textContent = (n.name.length > 20 ? n.name.slice(0, 19) + '\\u2026' : n.name)
@@ -960,6 +1021,10 @@ document.getElementById('shapes').onclick = () => {
   const off = document.getElementById('stage').classList.toggle('nolabels');
   document.getElementById('shapes').setAttribute('aria-pressed', !off);
 };
+document.getElementById('legtog').onclick = () => {
+  const off = document.getElementById('legend').classList.toggle('off');
+  document.getElementById('legtog').setAttribute('aria-pressed', !off);
+};
 document.getElementById('fit').onclick = fit;
 document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(); };
 document.getElementById('zo').onclick = () => { k = Math.max(.12, k / 1.2); apply(); };
@@ -1015,7 +1080,7 @@ document.getElementById('svg-dl').onclick = () => {
     .edge{fill:none;stroke:${c('--edge')};stroke-width:1.6px;stroke-linecap:round}
     .edge.skip{stroke:${c('--skip')};stroke-dasharray:5 4}
     .edge.toout{stroke:${c('--out')}}
-    .node rect,.outnode rect{stroke-width:1.2px}
+    .outnode rect{stroke-width:1.4px}
     .frame rect{stroke-width:1.6px}
     .accent{stroke-width:0}
     text{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
