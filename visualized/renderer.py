@@ -51,7 +51,14 @@ html,body { margin:0; height:100%; overflow:hidden;
 #stage.drag { cursor:grabbing; }
 svg { width:100%; height:100%; display:block; }
 #side { width:310px; flex:none; border-left:1px solid var(--line);
-  background:var(--panel); overflow-y:auto; padding:16px; }
+  background:var(--panel); overflow-y:auto; padding:16px;
+  transition:width .18s ease, opacity .18s ease; }
+/* Collapsed, the panel gives its width back to the canvas. ``visibility``
+   rather than ``display`` so the width can animate rather than jump. */
+#app.noside #side { width:0; padding-left:0; padding-right:0; opacity:0;
+  overflow:hidden; visibility:hidden; border-left-width:0; }
+/* The handle rides the panel edge, so it stays clickable either way. */
+#sidetog { position:absolute; top:12px; right:12px; z-index:6; }
 #side h1 { font-size:15px; margin:0 0 2px; }
 #side .sub { color:var(--muted); font-size:11px; margin-bottom:14px;
   word-break:break-all; }
@@ -62,6 +69,19 @@ svg { width:100%; height:100%; display:block; }
   text-align:right; word-break:break-word; min-width:0; }
 h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
   color:var(--muted); margin:18px 0 6px; }
+/* Each detail section is a <details>, so a long sidebar can be folded down to
+   just the headings the reader cares about. The caret is drawn by hand because
+   the native marker sits at a different baseline across browsers. */
+.sec { border-bottom:0; }
+.sec > summary { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--muted); margin:18px 0 6px; cursor:pointer; list-style:none;
+  display:flex; align-items:center; gap:6px; user-select:none; }
+.sec > summary::-webkit-details-marker { display:none; }
+.sec > summary:hover { color:var(--fg); }
+.sec > summary::before { content:''; flex:none; width:0; height:0;
+  border-left:4px solid currentColor; border-top:3.5px solid transparent;
+  border-bottom:3.5px solid transparent; transition:transform .12s; }
+.sec[open] > summary::before { transform:rotate(90deg); }
 #toolbar { position:absolute; top:12px; left:12px; display:flex; gap:6px;
   flex-wrap:wrap; align-items:center; z-index:5; }
 #lvl { font-size:11px; color:var(--muted); padding-left:4px; }
@@ -121,6 +141,7 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
         >Mermaid</button>
       <span id="lvl"></span>
     </div>
+    <button id="sidetog" title="Show/hide the details panel">Details</button>
     <svg id="svg"><g id="root"></g></svg>
     <div id="legend">
       <div><i></i> dataflow</div>
@@ -742,6 +763,14 @@ function applySelection() {
   detail();
 }
 
+// A collapsible sidebar section. Open/closed state is keyed by title and kept
+// in ``secOpen`` so re-rendering the panel on every selection does not reset
+// what the reader has folded away.
+const secOpen = new Map();
+const sec = (title, body) =>
+  `<details class="sec"${secOpen.get(title) === false ? '' : ' open'}>` +
+  `<summary>${title}</summary>${body}</details>`;
+
 function detail() {
   const box = document.getElementById('detail');
   if (selected === null) {
@@ -755,32 +784,32 @@ function detail() {
       (DATA.error ? `<div class="err"><b>Forward pass failed</b><br>
          <code>${esc(DATA.error)}</code><br>Graph shows progress up to the
          failure.</div>` : '') +
-      '<h2>Model</h2>' + rows.map(r =>
-        `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('') +
-      '<h2>Input</h2>' + DATA.input_tensors.map(t =>
-        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('') +
-      '<h2>Output</h2>' + DATA.output_tensors.map(t =>
-        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('') +
-      '<h2>Tips</h2>' +
-      '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
-      '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
-      '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>';
+      sec('Model', rows.map(r =>
+        `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('')) +
+      sec('Input', DATA.input_tensors.map(t =>
+        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('')) +
+      sec('Output', DATA.output_tensors.map(t =>
+        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('')) +
+      sec('Tips',
+        '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
+        '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
+        '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>');
     return;
   }
   if (isOutput(selected)) {           // an output pill, not a module
     const o = layout.outs.find(x => x.id === selected);
     const src = o && o.src !== null && o.src !== undefined
       ? byId.get(o.src) : null;
-    box.innerHTML = '<h2>Model output</h2>' +
+    box.innerHTML = sec('Model output',
       `<div class="stat"><span>Index</span><span>${o ? o.index : ''}</span></div>` +
       `<div class="stat"><span>Shape</span><span>${o ? shp(o.tensor) : ''}</span></div>` +
-      `<div class="stat"><span>dtype</span><span>${o ? o.tensor.dtype : ''}</span></div>` +
-      '<h2>Produced by</h2>' +
+      `<div class="stat"><span>dtype</span><span>${o ? o.tensor.dtype : ''}</span></div>`) +
+      sec('Produced by',
       (src
         ? `<div class="stat"><span>${esc(src.cls)}</span>` +
           `<span>${esc(src.path)}</span></div>`
         : '<div class="stat"><span>no module</span>' +
-          '<span>built by array ops</span></div>');
+          '<span>built by array ops</span></div>'));
     return;
   }
   const n = byId.get(selected);
@@ -796,20 +825,42 @@ function detail() {
   const cfg = Object.entries(n.config);
   box.innerHTML =
     (n.error ? `<div class="err"><code>${esc(n.error)}</code></div>` : '') +
-    '<h2>Module</h2>' + rows.map(r =>
-      `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('') +
-    '<h2>Inputs</h2>' + (n.inputs.length ? n.inputs.map(t =>
+    sec('Module', rows.map(r =>
+      `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('')) +
+    sec('Inputs', n.inputs.length ? n.inputs.map(t =>
       `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
       ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
-    '<h2>Outputs</h2>' + (n.outputs.length ? n.outputs.map(t =>
+    sec('Outputs', n.outputs.length ? n.outputs.map(t =>
       `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
       ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
-    (cfg.length ? '<h2>Config</h2>' + cfg.map(([a, b]) =>
+    (cfg.length ? sec('Config', cfg.map(([a, b]) =>
       `<div class="stat"><span>${esc(a)}</span><span>${esc(String(b))}</span></div>`
-      ).join('') : '');
+      ).join('')) : '');
 }
 const esc = s => String(s).replace(/[&<>]/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+// ``toggle`` does not bubble, so it is captured rather than listened for on the
+// panel itself - the sections are rebuilt on every selection change.
+document.getElementById('detail').addEventListener('toggle', e => {
+  const d = e.target;
+  if (d.classList && d.classList.contains('sec'))
+    secOpen.set(d.querySelector('summary').textContent, d.open);
+}, true);
+
+// Hiding the panel hands its 310px back to the canvas, so the graph is refit
+// once the width transition has finished rather than against a stale size.
+document.getElementById('sidetog').onclick = () => {
+  const on = document.getElementById('app').classList.toggle('noside');
+  document.getElementById('sidetog').setAttribute('aria-expanded', !on);
+  setTimeout(fit, 200);
+};
+// `d` toggles it from the keyboard, ignored while typing in a field.
+document.addEventListener('keydown', e => {
+  if (e.key === 'd' && !e.metaKey && !e.ctrlKey && !e.altKey &&
+      !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName))
+    document.getElementById('sidetog').click();
+});
 
 document.getElementById('fit').onclick = fit;
 document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(); };
