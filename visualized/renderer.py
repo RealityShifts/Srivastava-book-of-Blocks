@@ -32,14 +32,20 @@ _TEMPLATE = """<!doctype html>
   --bg:#0f1117; --panel:#1b1e28; --line:#2b303d; --fg:#e6e9ef; --muted:#9aa3b8;
   --accent:#8494e4; --skip:#e8944a; --edge:#6b7690; --hi:#ffd166; --err:#ff6b6b;
   --out:#5ec9a7;
-  --card:#252a38; --cardln:#4a5268; --frame:#1f2431; --frameln:#39415a;
+  --card:#252a38; --cardln:#4a5268; --frame:#1f2431; --frameln:#7b87a8;
+  /* Nested frames step towards this tone, one level at a time. */
+  --framestep:#aab4d0;
+  /* Group titles and their borders carry the structure of the graph, so they
+     are held at full strength rather than at the muted tone used for
+     secondary text - dimming them read as "disabled" rather than "quiet". */
+  --flab:#f2f4f9;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg:#ffffff; --panel:#fff; --line:#e2e5ec; --fg:#1f2430;
           --muted:#5f6880; --edge:#8a93a6; --accent:#5b6fd6;
           /* Mermaid's signature pale-lavender node fill. */
           --card:#eceffc; --cardln:#9aa5d8; --frame:#f6f7fd;
-          --frameln:#c7cde8; }
+          --frameln:#7b86bd; --flab:#141824; --framestep:#2b3355; }
 }
 * { box-sizing:border-box; }
 html,body { margin:0; height:100%; overflow:hidden;
@@ -491,12 +497,28 @@ const el = (t, a) => {
   return e;
 };
 
+// Nesting depth as tone. Each level is mixed a fixed step further towards
+// ``--framestep`` (lighter in dark mode, darker in light), so a frame inside a
+// frame separates from its parent without needing transparency - which is what
+// used to bleed the borders through and make them look dim.
+const frameFill = d => `color-mix(in srgb, var(--framestep) ` +
+  `${Math.min(d, 4) * 9}%, var(--frame))`;
+
+// Rough width of a frame title, used only to decide whether two titles would
+// actually overlap horizontally - ~5.6px per char at 10.5px semibold.
+const labText = f => `${f.node.name}  ·  ${f.node.cls}  ·  ${fmt(f.node.params)}`;
+const labW = f => 10 + labText(f).length * 5.6;
+
 function draw() {
   root.textContent = '';
   const { pos } = layout;
 
-  const gF = el('g'), gE = el('g'), gN = el('g');
-  root.append(gF, gE, gN);   // frames sit behind edges and nodes
+  const gF = el('g'), gFL = el('g'), gE = el('g'), gN = el('g');
+  // Frame panels sit behind edges and nodes. Their labels go in a layer of
+  // their own: frames are emitted parent-first, so a nested frame's translucent
+  // panel would otherwise paint over the enclosing frame's title and wash it
+  // out - the titles looked dimmed when they were merely covered.
+  root.append(gF, gFL, gE, gN);
 
   for (const f of layout.frames) {
     const col = colorOf(f.node.cls);
@@ -504,14 +526,34 @@ function draw() {
     g.dataset.id = f.id;
     // Mermaid draws a subgraph as a quiet solid panel with a plain border - no
     // dashes, no per-group hue - so nesting reads as depth rather than as noise.
+    // Each level is stepped a little further from the page background: an
+    // opaque fill alone made a nested frame vanish into its parent, and a
+    // translucent one washed the borders out. Tone carries the nesting, the
+    // stroke keeps every edge crisp.
+    let d = 0;
+    for (const o of layout.frames) if (o !== f && isDesc(f.id, o.id)) d++;
     g.appendChild(el('rect', { x: f.x, y: f.y, width: f.w, height: f.h,
-      rx: 8, fill: 'var(--frame)', 'fill-opacity': .85,
-      stroke: 'var(--frameln)' }));
-    const lab = el('text', { x: f.x + 10, y: f.y + 13, class: 'flab',
-      fill: 'var(--muted)' });
-    lab.textContent = `${f.node.name}  ·  ${f.node.cls}  ·  ${fmt(f.node.params)}`;
-    g.append(lab);
+      rx: 8, fill: frameFill(d),
+      stroke: 'var(--frameln)', 'stroke-width': 1.6 }));
     gF.appendChild(g);
+    // The label carries the frame's id too, so clicking a title still collapses
+    // the group now that it no longer lives inside the frame's own <g>.
+    const lg = el('g', { class: 'frame' });
+    lg.dataset.id = f.id;
+    // A child frame often starts within a few px of its parent's top edge,
+    // which put the two titles on the same baseline. Step this one down past
+    // any ancestor title it would otherwise land on top of.
+    let ly = f.y + 13;
+    for (const o of layout.frames) {
+      if (o === f || !isDesc(f.id, o.id)) continue;
+      if (Math.abs(ly - (o.y + 13)) < 11 && f.x < o.x + labW(o))
+        ly = o.y + 13 + 12;
+    }
+    const lab = el('text', { x: f.x + 10, y: ly, class: 'flab',
+      fill: 'var(--flab)' });
+    lab.textContent = labText(f);
+    lg.append(lab);
+    gFL.appendChild(lg);
   }
 
   for (const e of layout.edges) {
@@ -917,14 +959,15 @@ document.getElementById('svg-dl').onclick = () => {
     .edge{fill:none;stroke:${c('--edge')};stroke-width:1.6px;stroke-linecap:round}
     .edge.skip{stroke:${c('--skip')};stroke-dasharray:5 4}
     .edge.toout{stroke:${c('--out')}}
-    .node rect,.frame rect,.outnode rect{stroke-width:1.2px}
+    .node rect,.outnode rect{stroke-width:1.2px}
+    .frame rect{stroke-width:1.6px}
     .accent{stroke-width:0}
     text{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
     .nm{font-weight:600;font-size:12px;fill:${c('--fg')}}
     .nc{font-size:10.5px;fill:${c('--muted')}}
     .ns{font-size:10px;font-family:ui-monospace,Menlo,monospace;
         fill:${c('--muted')}}
-    .flab{font-size:10.5px;font-weight:600;fill:${c('--muted')}}
+    .flab{font-size:10.5px;font-weight:600;fill:${c('--flab')}}
     .badge{font-size:9.5px;fill:${bg};font-weight:700}
   </style>`;
   out = out.replace('<g id="root">',
