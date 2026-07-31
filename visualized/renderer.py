@@ -120,8 +120,15 @@ button:hover { border-color:var(--accent); }
 .flab { font-size:10.5px; font-weight:600; letter-spacing:.02em;
   cursor:pointer; }
 .frame rect { pointer-events:stroke; cursor:pointer; }
-.node.sel rect, .outnode.sel rect { stroke:var(--hi); stroke-width:2.5px; }
-.node.dim, .outnode.dim { opacity:.28; }
+.node.sel rect, .outnode.sel rect, .innode.sel rect {
+  stroke:var(--hi); stroke-width:2.5px; }
+.node.dim, .outnode.dim, .innode.dim { opacity:.28; }
+.innode { cursor:pointer; }
+.innode text { pointer-events:none; }
+/* Keyboard focus needs a marker distinct from selection: arrowing through the
+   graph moves focus, and without this the cursor is invisible on a dimmed node. */
+.node.kb rect, .outnode.kb rect, .innode.kb rect {
+  stroke:var(--hi); stroke-dasharray:4 3; }
 .edge { fill:none; stroke:var(--edge); stroke-width:1.4px;
   stroke-linecap:round; }
 .edge.skip { stroke:var(--skip); stroke-dasharray:5 4; }
@@ -159,6 +166,8 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
         aria-pressed="true">Shapes</button>
       <button id="legtog" title="Show/hide the legend and colour key"
         aria-pressed="true">Legend</button>
+      <button id="dirtog" title="Lay the model out vertically or horizontally">
+        &darr; Vertical</button>
       <button id="col">&minus; depth</button>
       <button id="exp">+ depth</button>
       <button id="svg-dl" title="Download the current view as SVG">SVG</button>
@@ -252,6 +261,11 @@ const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B'
               : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
               : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
 const shp = t => '(' + t.shape.join(', ') + ')';
+// The parameter name this pill stands for, from ``__call__``'s signature.
+// Falls back to positional labelling for a model whose source is unavailable.
+const IN_NAMES = DATA.input_names || [];
+const inName = n => IN_NAMES[n.index]
+  || (DATA.input_tensors.length > 1 ? `input ${n.index}` : 'input');
 
 // ---------- state ---------------------------------------------------------
 const byId = new Map(DATA.nodes.map(n => [n.id, n]));
@@ -324,6 +338,10 @@ const IN_BASE = __IN_BASE__;
 const isOutput = id => id <= OUT_BASE;
 const isInput = id => id === __INPUT__ || (id <= IN_BASE && id > OUT_BASE);
 let layout = { nodes: [], edges: [], w: 0, h: 0 };
+// Flow direction handed to dagre: 'TB' stacks the model top-to-bottom, 'LR'
+// runs it left-to-right. A deep sequential model is far easier to read wide on
+// a landscape screen, so this is a per-view choice rather than a fixed one.
+let RANKDIR = 'TB';
 
 function relayout() {
   const vis = DATA.nodes.filter(n => !isHidden(n.id));
@@ -413,7 +431,11 @@ function relayout() {
   // ranksep is the gap between *ranks*, and dagre adds a rank per level a long
   // edge spans, so a residual over three modules multiplies the nominal gap.
   // Keep it tight; GAPY was tuned for the old one-row-per-node layout.
-  G.setGraph({ rankdir: 'TB', nodesep: GAPX, ranksep: 34,
+  // Left-to-right needs a wider rank gap: in TB the gap separates rows of
+  // 54px-tall cards, but in LR it separates columns of 190px-wide ones, and 34
+  // leaves the edge labels of adjacent ranks overlapping.
+  G.setGraph({ rankdir: RANKDIR, nodesep: GAPX,
+               ranksep: RANKDIR === 'LR' ? 80 : 34,
                marginx: 24, marginy: 24, ranker: 'network-simplex' });
   G.setDefaultEdgeLabel(() => ({}));
 
@@ -632,11 +654,19 @@ function draw() {
     // Merges are drawn as a circle centred in their slot, so edges meet the
     // circle rather than the (invisible) card bounds.
     const srcMerge = mergeIds.has(e.src), dstMerge = mergeIds.has(e.dst);
-    const x1 = a.x + NW / 2;
-    const y1 = a.y + (isInput(e.src) ? 26 : srcMerge ? 37 : NH);
-    const x2 = b.x + NW / 2;
-    const y2 = b.y + (dstMerge ? 3 : 0);
-    const my = (y1 + y2) / 2;
+    // Where an edge meets a card depends on the flow direction: top-to-bottom
+    // it leaves the bottom edge and arrives at the top, left-to-right it leaves
+    // the right and arrives at the left. Using the TB anchors in LR mode drew
+    // every arrow out of the underside of a box and looped it back.
+    const lr = RANKDIR === 'LR';
+    const srcH = isInput(e.src) ? 26 : srcMerge ? 40 : NH;
+    const dstH = dstMerge ? 40 : NH;
+    const x1 = lr ? a.x + NW : a.x + NW / 2;
+    const y1 = lr ? a.y + srcH / 2
+                  : a.y + (isInput(e.src) ? 26 : srcMerge ? 37 : NH);
+    const x2 = lr ? b.x : b.x + NW / 2;
+    const y2 = lr ? b.y + dstH / 2 : b.y + (dstMerge ? 3 : 0);
+    const my = (y1 + y2) / 2, mxx = (x1 + x2) / 2;
     let d;
     // dagre already routed this edge around whatever lay in its path, so follow
     // its polyline. Drawing our own curve is what put long edges over boxes.
@@ -665,12 +695,20 @@ function draw() {
           + `${p1.x + (p2.x - p1.x) * t2},${p1.y + (p2.y - p1.y) * t2}`;
       }
       d += ` L${q[q.length - 1].x},${q[q.length - 1].y}`;
-    } else if (e.skip && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
+    } else if (e.skip && !lr && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
       // A residual that returns to the same column would be hidden under the
       // main chain. Bow it out sideways so the bypass is actually visible.
       const bow = NW * 0.62;
       d = `M${x1},${y1} C${x1 - bow},${y1 + 20} ${x2 - bow},${y2 - 20} `
         + `${x2},${y2}`;
+    } else if (e.skip && lr && Math.abs(y2 - y1) < 4 && x2 - x1 > NW) {
+      // The same bypass, rotated: in LR a residual runs along its own row, so
+      // bow it vertically instead or it hides under the chain.
+      const bow = NH * 1.1;
+      d = `M${x1},${y1} C${x1 + 20},${y1 - bow} ${x2 - 20},${y2 - bow} `
+        + `${x2},${y2}`;
+    } else if (lr) {
+      d = `M${x1},${y1} C${mxx},${y1} ${mxx},${y2} ${x2},${y2}`;
     } else {
       d = `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
     }
@@ -717,17 +755,20 @@ function draw() {
     gEL.appendChild(lab);
   }
 
-  // one pill per model input
+  // one pill per model input. Carries ``innode`` + ``dataset.id`` so the click
+  // handler and keyboard navigation treat it as a real, selectable node - it
+  // had neither before, which is why an input could not be clicked.
   for (const n of layout.ins) {
     const ip = pos.get(n.id);
     if (!ip) continue;
-    const gi = el('g', { transform: `translate(${ip.x},${ip.y})` });
+    const gi = el('g', { class: 'innode',
+      transform: `translate(${ip.x},${ip.y})` });
+    gi.dataset.id = n.id;
     gi.appendChild(el('rect', { width: NW, height: 26, rx: 13,
       fill: 'var(--panel)', stroke: 'var(--accent)' }));
     const it = el('text', { x: NW / 2, y: 17, 'text-anchor': 'middle',
       class: 'nc', fill: 'var(--accent)' });
-    const label = layout.ins.length > 1 ? `input ${n.index}` : 'input';
-    it.textContent = `${label} ${n.tensor ? shp(n.tensor) : ''}`;
+    it.textContent = `${inName(n)} ${n.tensor ? shp(n.tensor) : ''}`;
     gi.appendChild(it);
     gN.appendChild(gi);
   }
@@ -878,7 +919,7 @@ svg.addEventListener('click', e => {
   // A frame's border/label collapses the group it encloses; a node inside it
   // is matched first, so clicking a child never collapses its parent.
   const g = e.target.closest('.node') || e.target.closest('.outnode')
-         || e.target.closest('.frame');
+         || e.target.closest('.innode') || e.target.closest('.frame');
   if (!g) { selected = null; applySelection(); return; }
   const id = +g.dataset.id;
   const isFrame = g.classList.contains('frame');
@@ -892,6 +933,111 @@ svg.addEventListener('click', e => {
   applySelection();
 });
 
+// ---------- keyboard navigation ------------------------------------------
+// Down/Up follow the dataflow - the edges actually drawn - because that is the
+// structure the reader is tracing; falling back to nearest-by-geometry only
+// when a node has no edge in that direction (an isolated pill, or the ends of
+// the graph). Left/Right move between siblings in the same rank, which is what
+// the eye does across parallel branches.
+const NAV = { ArrowDown: 'down', ArrowUp: 'up',
+              ArrowLeft: 'left', ArrowRight: 'right' };
+
+// Every selectable thing on the canvas, with its drawn position.
+function navNodes() {
+  const out = [];
+  for (const [id, p] of layout.pos) {
+    if (mergeIds.has(id) && !byId.has(id)) continue;
+    out.push({ id, x: p.x, y: p.y });
+  }
+  return out;
+}
+
+function step(from, dir) {
+  const all = navNodes();
+  const cur = all.find(n => n.id === from);
+  if (!cur) return all.length ? all[0].id : null;
+
+  if (dir === 'down' || dir === 'up') {
+    // Successors (or predecessors) along real edges, nearest column first so
+    // a fan-out lands on the branch sitting straight ahead.
+    const linked = layout.edges
+      .filter(e => (dir === 'down' ? e.src : e.dst) === from)
+      .map(e => all.find(n => n.id === (dir === 'down' ? e.dst : e.src)))
+      .filter(Boolean);
+    if (linked.length) {
+      linked.sort((a, b) => Math.abs(a.x - cur.x) - Math.abs(b.x - cur.x));
+      return linked[0].id;
+    }
+    // No edge that way: fall back to the closest node in that direction.
+    const ahead = all.filter(n => dir === 'down' ? n.y > cur.y : n.y < cur.y);
+    if (!ahead.length) return null;
+    ahead.sort((a, b) => (Math.abs(a.y - cur.y) - Math.abs(b.y - cur.y))
+      || (Math.abs(a.x - cur.x) - Math.abs(b.x - cur.x)));
+    return ahead[0].id;
+  }
+
+  // Sideways: prefer nodes on the same rank, so Left/Right walks the parallel
+  // branches rather than drifting diagonally down the graph.
+  const band = all.filter(n => n.id !== from && Math.abs(n.y - cur.y) < NH);
+  const side = (band.length ? band : all.filter(n => n.id !== from))
+    .filter(n => dir === 'right' ? n.x > cur.x : n.x < cur.x);
+  if (!side.length) return null;
+  side.sort((a, b) => (Math.abs(a.x - cur.x) - Math.abs(b.x - cur.x))
+    || (Math.abs(a.y - cur.y) - Math.abs(b.y - cur.y)));
+  return side[0].id;
+}
+
+// Scroll the view so a keyboard-selected node stays on screen. Only nudges
+// when the node is actually outside the viewport, so arrowing around the
+// middle of the graph does not make the canvas twitch.
+function reveal(id) {
+  const p = layout.pos.get(id);
+  if (!p) return;
+  const r = svg.getBoundingClientRect();
+  const sx = p.x * k + tx, sy = p.y * k + ty;
+  const m = 60;
+  if (sx < m) tx += m - sx;
+  if (sx + NW * k > r.width - m) tx -= sx + NW * k - (r.width - m);
+  if (sy < m) ty += m - sy;
+  if (sy + NH * k > r.height - m) ty -= sy + NH * k - (r.height - m);
+  apply();
+}
+
+window.addEventListener('keydown', e => {
+  // Never hijack typing, and leave modified keys to the browser.
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
+            || t.isContentEditable)) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (NAV[e.key]) {
+    e.preventDefault();
+    // Nothing selected yet: start at the first input pill, or the first node.
+    if (selected === null) {
+      const first = (layout.ins[0] && layout.ins[0].id);
+      selected = first !== undefined ? first
+        : (navNodes()[0] || {}).id ?? null;
+    } else {
+      const next = step(selected, NAV[e.key]);
+      if (next === null || next === undefined) return;
+      selected = next;
+    }
+    applySelection();
+    reveal(selected);
+    return;
+  }
+  if (e.key === 'Escape') { selected = null; applySelection(); return; }
+  // Enter/Space collapses or expands the selected container, matching what a
+  // double-click does with the mouse.
+  if ((e.key === 'Enter' || e.key === ' ') && selected !== null
+      && hasKids(selected)) {
+    e.preventDefault();
+    collapsed.has(selected) ? collapsed.delete(selected)
+                            : collapsed.add(selected);
+    relayout();
+  }
+});
+
 function applySelection() {
   const near = new Set();
   if (selected !== null) {
@@ -901,7 +1047,7 @@ function applySelection() {
       if (e.dst === selected) near.add(e.src);
     });
   }
-  root.querySelectorAll('.node, .outnode').forEach(g => {
+  root.querySelectorAll('.node, .outnode, .innode').forEach(g => {
     const id = +g.dataset.id;
     g.classList.toggle('sel', id === selected);
     g.classList.toggle('dim', selected !== null && !near.has(id));
@@ -941,14 +1087,19 @@ function detail() {
          failure.</div>` : '') +
       sec('Model', rows.map(r =>
         `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('')) +
-      sec('Input', DATA.input_tensors.map(t =>
-        `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('')) +
+      sec('Input', DATA.input_tensors.map((t, i) =>
+        `<div class="stat"><span>${esc(IN_NAMES[i] || t.dtype)}</span>` +
+        `<span>${shp(t)}</span></div>`).join('')) +
       sec('Output', DATA.output_tensors.map(t =>
         `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('')) +
       sec('Tips',
         '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
         '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
-        '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>');
+        '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>' +
+        '<div class="stat"><span>&darr;&uarr; arrows</span><span>follow dataflow</span></div>' +
+        '<div class="stat"><span>&larr;&rarr; arrows</span><span>move across a rank</span></div>' +
+        '<div class="stat"><span>Enter / Space</span><span>collapse selected</span></div>' +
+        '<div class="stat"><span>Esc</span><span>clear selection</span></div>');
     return;
   }
   if (isOutput(selected)) {           // an output pill, not a module
@@ -965,6 +1116,24 @@ function detail() {
           `<span>${esc(src.path)}</span></div>`
         : '<div class="stat"><span>no module</span>' +
           '<span>built by array ops</span></div>'));
+    return;
+  }
+  if (isInput(selected)) {            // an input pill, not a module
+    const inp = layout.ins.find(x => x.id === selected);
+    const fed = layout.edges.filter(e => e.src === selected)
+      .map(e => byId.get(e.dst)).filter(Boolean);
+    box.innerHTML = sec('Model input',
+      `<div class="stat"><span>Name</span>` +
+      `<span>${inp ? esc(inName(inp)) : ''}</span></div>` +
+      `<div class="stat"><span>Shape</span>` +
+      `<span>${inp && inp.tensor ? shp(inp.tensor) : ''}</span></div>` +
+      `<div class="stat"><span>dtype</span>` +
+      `<span>${inp && inp.tensor ? inp.tensor.dtype : ''}</span></div>`) +
+      sec('Feeds', fed.length
+        ? fed.map(d => `<div class="stat"><span>${esc(d.cls)}</span>` +
+            `<span>${esc(d.path)}</span></div>`).join('')
+        : '<div class="stat"><span>nothing</span>' +
+          '<span>no consumer traced</span></div>');
     return;
   }
   const n = byId.get(selected);
@@ -1024,6 +1193,13 @@ document.getElementById('shapes').onclick = () => {
 document.getElementById('legtog').onclick = () => {
   const off = document.getElementById('legend').classList.toggle('off');
   document.getElementById('legtog').setAttribute('aria-pressed', !off);
+};
+document.getElementById('dirtog').onclick = () => {
+  RANKDIR = RANKDIR === 'TB' ? 'LR' : 'TB';
+  document.getElementById('dirtog').innerHTML =
+    RANKDIR === 'TB' ? '\\u2193 Vertical' : '\\u2192 Horizontal';
+  relayout();
+  fit();
 };
 document.getElementById('fit').onclick = fit;
 document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(); };

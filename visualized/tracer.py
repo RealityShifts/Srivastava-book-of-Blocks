@@ -136,6 +136,9 @@ class Graph:
     error: Optional[str] = None
     # One entry per returned array: ``{"tensor": Tensor, "src": node id|None}``
     output_sources: list = dataclasses.field(default_factory=list)
+    # Parameter name per input array, read off ``__call__``'s signature, so a
+    # pill reads "reference" rather than "input 0".
+    input_names: list = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -145,6 +148,7 @@ class Graph:
             "total_params": self.total_params,
             "input_tensors": [t.to_dict() for t in self.input_tensors],
             "output_tensors": [t.to_dict() for t in self.output_tensors],
+            "input_names": list(self.input_names),
             "error": self.error,
             "output_sources": [
                 {"tensor": o["tensor"].to_dict(), "src": o["src"]}
@@ -494,6 +498,34 @@ def _config_of(module: nnx.Module) -> dict:
 # ---------------------------------------------------------------------------
 # Tracing
 # ---------------------------------------------------------------------------
+
+def _input_names(model: nnx.Module, args: tuple, kwargs: dict) -> list:
+    """One display name per input *array*, aligned with ``tree_leaves`` order.
+
+    Names come from ``__call__``'s signature, so a two-argument generator shows
+    "reference" and "driver" instead of "input 0" and "input 1". An argument
+    holding several arrays (a list of feature maps) contributes one name per
+    array, suffixed by position - the pills are per-array, not per-parameter.
+    """
+    try:
+        fn = getattr(type(model), "__call__")
+        params = list(inspect.signature(
+            getattr(fn, "__wrapped__", fn)).parameters.values())
+    except (TypeError, ValueError):
+        params = []
+    if params and params[0].name in ("self", "cls"):
+        params = params[1:]
+
+    names: list = []
+    for i, val in enumerate(args):
+        base = params[i].name if i < len(params) else f"input {i}"
+        n = len(_as_tensors(val))
+        names.extend([base] if n == 1 else [f"{base}[{j}]" for j in range(n)])
+    for key, val in kwargs.items():
+        n = len(_as_tensors(val))
+        names.extend([key] if n == 1 else [f"{key}[{j}]" for j in range(n)])
+    return names
+
 
 def trace_model(
     model: nnx.Module,
@@ -1067,6 +1099,7 @@ def trace_model(
         output_tensors=outputs,
         error=error,
         output_sources=out_sources,
+        input_names=_input_names(model, args, kwargs),
     )
 
 
