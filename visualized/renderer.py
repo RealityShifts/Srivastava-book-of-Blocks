@@ -125,6 +125,17 @@ button:hover { border-color:var(--accent); }
 .outnode rect { transition:stroke-width .1s; }
 .edge.hot { stroke:var(--hi); stroke-width:2.6px; }
 .edge.dim { opacity:.12; }
+/* Shape labels on the wires. ``paint-order:stroke`` lays the halo down before
+   the glyphs, so the outline never eats into the letterforms. */
+.elab { font-family:ui-monospace,Menlo,monospace; font-size:9.5px;
+  fill:var(--muted); pointer-events:none;
+  paint-order:stroke; stroke:var(--bg); stroke-width:2.5px;
+  stroke-linejoin:round; }
+.elab.skip { fill:var(--skip); }
+.elabbg { fill:var(--bg); opacity:.72; pointer-events:none; }
+.elab.hot { fill:var(--hi); }
+.elab.dim, .elabbg.dim { opacity:.1; }
+#stage.nolabels .elab, #stage.nolabels .elabbg { display:none; }
 .badge { font-size:9.5px; fill:var(--bg); font-weight:700; }
 #empty { position:absolute; inset:0; display:grid; place-items:center;
   color:var(--muted); }
@@ -140,6 +151,8 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
       <button id="fit">Fit</button>
       <button id="zi">+</button>
       <button id="zo">&minus;</button>
+      <button id="shapes" title="Show/hide the shape on every connection"
+        aria-pressed="true">Shapes</button>
       <button id="col">&minus; depth</button>
       <button id="exp">+ depth</button>
       <button id="svg-dl" title="Download the current view as SVG">SVG</button>
@@ -513,12 +526,14 @@ function draw() {
   root.textContent = '';
   const { pos } = layout;
 
-  const gF = el('g'), gFL = el('g'), gE = el('g'), gN = el('g');
+  const gF = el('g'), gFL = el('g'), gE = el('g'), gEL = el('g'), gN = el('g');
   // Frame panels sit behind edges and nodes. Their labels go in a layer of
   // their own: frames are emitted parent-first, so a nested frame's translucent
   // panel would otherwise paint over the enclosing frame's title and wash it
   // out - the titles looked dimmed when they were merely covered.
-  root.append(gF, gFL, gE, gN);
+  // Shape labels ride above every edge (``gEL``) so a crossing wire cannot be
+  // drawn over the text, but below nodes, which own the foreground.
+  root.append(gF, gFL, gE, gEL, gN);
 
   for (const f of layout.frames) {
     const col = colorOf(f.node.cls);
@@ -611,6 +626,40 @@ function draw() {
     });
     p.dataset.src = e.src; p.dataset.dst = e.dst;
     gE.appendChild(p);
+
+    // The shape travelling this wire, written on the wire itself. Placed with
+    // ``getPointAtLength`` on the path just built rather than at the midpoint
+    // of the endpoints: a routed edge detours around intervening boxes, so the
+    // straight-line middle can sit far off the visible curve - or on top of a
+    // node the edge was routed around.
+    if (!e.tensor || !e.tensor.shape) continue;
+    let mx = (x1 + x2) / 2, myy = (y1 + y2) / 2;
+    try {
+      const L = p.getTotalLength();
+      if (L > 0) {
+        const q = p.getPointAtLength(L * 0.5);
+        mx = q.x; myy = q.y;
+      }
+    } catch (err) { /* not laid out yet: fall back to the chord midpoint */ }
+
+    const txt = shp(e.tensor);
+    const lab = el('text', {
+      x: mx, y: myy, 'text-anchor': 'middle', 'dominant-baseline': 'middle',
+      class: 'elab' + (e.skip ? ' skip' : ''),
+    });
+    lab.textContent = txt;
+    // A halo behind the glyphs keeps them readable where the label lands on
+    // the wire itself; ``paint-order`` draws the stroke first so it never
+    // thickens the visible letterforms.
+    const bg = el('rect', {
+      x: mx - (txt.length * 3.15 + 4), y: myy - 8,
+      width: txt.length * 6.3 + 8, height: 16, rx: 4,
+      class: 'elabbg',
+    });
+    bg.dataset.src = e.src; bg.dataset.dst = e.dst;
+    lab.dataset.src = e.src; lab.dataset.dst = e.dst;
+    gEL.appendChild(bg);
+    gEL.appendChild(lab);
   }
 
   // one pill per model input
@@ -796,7 +845,10 @@ function applySelection() {
     g.classList.toggle('sel', id === selected);
     g.classList.toggle('dim', selected !== null && !near.has(id));
   });
-  root.querySelectorAll('.edge').forEach(p => {
+  // Shape labels share their edge's dataset, so the same test lights the wire
+  // and the text it carries - a selected module reads its own shapes at full
+  // contrast while the rest of the graph recedes.
+  root.querySelectorAll('.edge, .elab, .elabbg').forEach(p => {
     const s = +p.dataset.src, d = +p.dataset.dst;
     const hot = selected !== null && (s === selected || d === selected);
     p.classList.toggle('hot', hot);
@@ -904,6 +956,10 @@ document.addEventListener('keydown', e => {
     document.getElementById('sidetog').click();
 });
 
+document.getElementById('shapes').onclick = () => {
+  const off = document.getElementById('stage').classList.toggle('nolabels');
+  document.getElementById('shapes').setAttribute('aria-pressed', !off);
+};
 document.getElementById('fit').onclick = fit;
 document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(); };
 document.getElementById('zo').onclick = () => { k = Math.max(.12, k / 1.2); apply(); };
@@ -968,6 +1024,11 @@ document.getElementById('svg-dl').onclick = () => {
     .ns{font-size:10px;font-family:ui-monospace,Menlo,monospace;
         fill:${c('--muted')}}
     .flab{font-size:10.5px;font-weight:600;fill:${c('--flab')}}
+    .elab{font-size:9.5px;font-family:ui-monospace,Menlo,monospace;
+        fill:${c('--muted')};paint-order:stroke;stroke:${bg};
+        stroke-width:2.5px;stroke-linejoin:round}
+    .elab.skip{fill:${c('--skip')}}
+    .elabbg{fill:${bg};opacity:.72}
     .badge{font-size:9.5px;fill:${bg};font-weight:700}
   </style>`;
   out = out.replace('<g id="root">',
