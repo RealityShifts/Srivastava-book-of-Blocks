@@ -210,7 +210,9 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
 </head>
 <body>
 <div id="app">
-  <div id="stage">
+  <!-- ``nodrag`` matches ``dragEnabled = false``: dragging starts switched off,
+       so grips must not advertise a grab until it is turned on. -->
+  <div id="stage" class="nodrag">
     <div id="toolbar">
       <!-- Grouped into menus: eleven flat controls read as a wall of buttons,
            and the ones you reach for most (zoom, fit) were lost among the ones
@@ -249,9 +251,9 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
           <button id="sidetog" title="Show/hide the details panel"
             aria-expanded="true">&#10003; Details panel</button>
           <div class="msep"></div>
-          <button id="dragtog" aria-pressed="true"
+          <button id="dragtog" aria-pressed="false"
             title="Allow nodes and groups to be dragged out of the automatic layout">
-            &#10003; Dragging</button>
+            &#8199; Dragging</button>
         </div>
       </div>
       <div class="menu">
@@ -459,10 +461,11 @@ let layout = { nodes: [], edges: [], w: 0, h: 0 };
 // canvas-pan handler below has to test it, and it is installed earlier in the
 // file than the drag handlers themselves.
 let drag = null, dragMoved = false;
-// Whether nodes and groups can be dragged at all. Turning it off makes the
-// whole canvas behave as a plain pan/zoom surface, so a press on a card can
-// never nudge the layout by accident while reading.
-let dragEnabled = true;
+// Whether nodes and groups can be dragged at all. Off by default: reading the
+// graph is the common case, and dragging trades away dagre's edge routing for
+// the nodes it touches, so it should be something you opt into rather than
+// something a stray press can trigger.
+let dragEnabled = false;
 // Flow direction handed to dagre: 'TB' stacks the model top-to-bottom, 'LR'
 // runs it left-to-right. A deep sequential model is far easier to read wide on
 // a landscape screen, so this is a per-view choice rather than a fixed one.
