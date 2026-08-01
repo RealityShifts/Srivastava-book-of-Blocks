@@ -64,7 +64,9 @@ svg { width:100%; height:100%; display:block; }
 #app.noside #side { width:0; padding-left:0; padding-right:0; opacity:0;
   overflow:hidden; visibility:hidden; border-left-width:0; }
 /* The handle rides the panel edge, so it stays clickable either way. */
-#sidetog { position:absolute; top:12px; right:12px; z-index:6; }
+/* ``#sidetog`` used to float at the top right; it lives in the Show menu now,
+   so it must not keep an absolute position - that pulled it out of the popup
+   and stacked it on top of the other items. */
 #side h1 { font-size:15px; margin:0 0 2px; }
 #side .sub { color:var(--muted); font-size:11px; margin-bottom:14px;
   word-break:break-all; }
@@ -89,12 +91,30 @@ h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
   border-bottom:3.5px solid transparent; transition:transform .12s; }
 .sec[open] > summary::before { transform:rotate(90deg); }
 #toolbar { position:absolute; top:12px; left:12px; display:flex; gap:6px;
-  flex-wrap:wrap; align-items:center; z-index:5; }
+  flex-wrap:wrap; align-items:center; z-index:30; }
 #lvl { font-size:11px; color:var(--muted); padding-left:4px; }
 button { font:inherit; font-size:12px; padding:5px 10px; border-radius:6px;
   border:1px solid var(--line); background:var(--panel); color:var(--fg);
   cursor:pointer; }
 button:hover { border-color:var(--accent); }
+/* Dropdown menus. Each .menu holds a trigger and an absolutely-placed popup
+   that only exists while open, so the toolbar stays one row regardless of how
+   many commands hang off it. */
+.menu { position:relative; }
+.mbtn[aria-expanded="true"] { border-color:var(--accent); }
+.mpop { display:none; position:absolute; top:calc(100% + 4px); left:0;
+  min-width:170px; padding:4px; z-index:20;
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.32); }
+.mpop.open { display:block; }
+/* Items fill the popup and read as a list, not a row of chips. */
+.mpop button { display:block; width:100%; text-align:left; border:0;
+  background:none; padding:6px 8px; border-radius:5px; }
+.mpop button:hover { background:var(--accent); color:var(--bg); }
+.msep { height:1px; margin:4px 2px; background:var(--line); }
+/* A toggle that is currently off loses its check and dims a little. */
+.mpop button[aria-pressed="false"], .mpop button[aria-expanded="false"] {
+  color:var(--muted); }
 #legend { position:absolute; bottom:12px; left:12px; font-size:11px;
   color:var(--muted); background:var(--panel); border:1px solid var(--line);
   border-radius:6px; padding:8px 10px; z-index:5; }
@@ -119,7 +139,11 @@ button:hover { border-color:var(--accent); }
    space inside a group does not collapse it. */
 .flab { font-size:10.5px; font-weight:600; letter-spacing:.02em;
   cursor:pointer; }
-.frame rect { pointer-events:stroke; cursor:pointer; }
+/* The frame body is the group's drag surface, so it needs fill events - the
+   old ``pointer-events:stroke`` made only the 1.6px border clickable. */
+.frame rect { cursor:pointer; }
+.fbody { cursor:grab; }
+.fbody:active { cursor:grabbing; }
 .node.sel rect, .outnode.sel rect, .innode.sel rect {
   stroke:var(--hi); stroke-width:2.5px; }
 .node.dim, .outnode.dim, .innode.dim { opacity:.28; }
@@ -129,6 +153,35 @@ button:hover { border-color:var(--accent); }
    graph moves focus, and without this the cursor is invisible on a dimmed node. */
 .node.kb rect, .outnode.kb rect, .innode.kb rect {
   stroke:var(--hi); stroke-dasharray:4 3; }
+/* Explicit expand control on a container card - replaces the double-click,
+   which was undiscoverable and fought with click-to-select. */
+.xbtn { cursor:pointer; }
+.xbtnt { font-size:12px; font-weight:700; pointer-events:none; }
+/* Per-node drag grip: a strip at the card's left edge. Keeping drag on its own
+   target means a plain click stays a plain click - selection and the
+   incoming/outgoing highlight never have to be disambiguated from a drag. */
+.grip { cursor:grab; }
+.grip:hover { fill:var(--accent) !important; opacity:.18; }
+/* Dragging switched off: grips and group bodies stop advertising a grab, and
+   the canvas reads as a plain pan surface. */
+#stage.nodrag .grip, #stage.nodrag .fbody { cursor:default; }
+#stage.nodrag .grip:hover { fill:transparent !important; }
+#stage.nodrag .gripdot { opacity:.35; }
+.gripdot { fill:var(--muted); pointer-events:none; }
+.node:hover .gripdot, .outnode:hover .gripdot, .innode:hover .gripdot {
+  fill:var(--accent); }
+/* Floating panels. The header is the drag handle; the body is a solid surface
+   so the graph underneath does not show through and confuse the reading. */
+/* Expanded-group controls, drawn on the frame's title strip. The handle is a
+   distinct target so dragging a group never fights click-to-select. */
+.ghandle { fill:var(--accent); opacity:.10; cursor:grab; }
+.ghandle:hover { opacity:.24; }
+.ghandle:active { cursor:grabbing; }
+/* The title rides on the strip and drags with it. */
+.flab { cursor:grab; }
+.gbtn { font-size:11px; font-weight:700; fill:var(--muted);
+  cursor:pointer; user-select:none; }
+.gbtn:hover { fill:var(--accent); }
 .edge { fill:none; stroke:var(--edge); stroke-width:1.4px;
   stroke-linecap:round; }
 .edge.skip { stroke:var(--skip); stroke-dasharray:5 4; }
@@ -159,23 +212,60 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
 <div id="app">
   <div id="stage">
     <div id="toolbar">
-      <button id="fit">Fit</button>
-      <button id="zi">+</button>
-      <button id="zo">&minus;</button>
-      <button id="shapes" title="Show/hide the shape on every connection"
-        aria-pressed="true">Shapes</button>
-      <button id="legtog" title="Show/hide the legend and colour key"
-        aria-pressed="true">Legend</button>
-      <button id="dirtog" title="Lay the model out vertically or horizontally">
-        &darr; Vertical</button>
-      <button id="col">&minus; depth</button>
-      <button id="exp">+ depth</button>
-      <button id="svg-dl" title="Download the current view as SVG">SVG</button>
-      <button id="mmd-dl" title="Download Mermaid source for the current view"
-        >Mermaid</button>
+      <!-- Grouped into menus: eleven flat controls read as a wall of buttons,
+           and the ones you reach for most (zoom, fit) were lost among the ones
+           you touch once. Every id is unchanged, so the handlers below bind
+           exactly as before. -->
+      <div class="menu">
+        <button class="mbtn" data-menu="m-view">View &#9662;</button>
+        <div class="mpop" id="m-view">
+          <button id="fit">Fit to window</button>
+          <button id="zi">Zoom in</button>
+          <button id="zo">Zoom out</button>
+          <div class="msep"></div>
+          <button id="dirtog"
+            title="Lay the model out vertically or horizontally">
+            &darr; Vertical</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="mbtn" data-menu="m-depth">Depth &#9662;</button>
+        <div class="mpop" id="m-depth">
+          <button id="exp">Expand a level</button>
+          <button id="col">Collapse a level</button>
+          <div class="msep"></div>
+          <button id="reset"
+            title="Unpin dragged nodes and restore the automatic layout">
+            Reset layout</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="mbtn" data-menu="m-show">Show &#9662;</button>
+        <div class="mpop" id="m-show">
+          <button id="shapes" title="Show/hide the shape on every connection"
+            aria-pressed="true">&#10003; Shapes on edges</button>
+          <button id="legtog" title="Show/hide the legend and colour key"
+            aria-pressed="true">&#10003; Legend</button>
+          <button id="sidetog" title="Show/hide the details panel"
+            aria-expanded="true">&#10003; Details panel</button>
+          <div class="msep"></div>
+          <button id="dragtog" aria-pressed="true"
+            title="Allow nodes and groups to be dragged out of the automatic layout">
+            &#10003; Dragging</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="mbtn" data-menu="m-exp">Export &#9662;</button>
+        <div class="mpop" id="m-exp">
+          <button id="svg-dl" title="Download the current view as SVG">
+            SVG image</button>
+          <button id="mmd-dl"
+            title="Download Mermaid source for the current view">
+            Mermaid source</button>
+        </div>
+      </div>
       <span id="lvl"></span>
     </div>
-    <button id="sidetog" title="Show/hide the details panel">Details</button>
     <svg id="svg"><g id="root"></g></svg>
     <div id="legend">
       <div><i></i> dataflow</div>
@@ -183,8 +273,8 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
            skip / residual</div>
       <div><i style="border-color:var(--out)"></i> model output</div>
       <div id="classkey"></div>
-      <div style="margin-top:4px">scroll = zoom &middot; drag = pan &middot;
-           click = inspect</div>
+      <div style="margin-top:4px">scroll = zoom &middot; drag / arrows = pan
+           &middot; click = inspect</div>
     </div>
   </div>
   <div id="side">
@@ -305,6 +395,33 @@ function expandToDepth(d) {
 }
 let selected = null;
 
+// ---------- expanded groups ----------------------------------------------
+// An expanded container stays *in* the graph: its children are laid out by the
+// same dagre pass as everything else, wired to the rest of the model by their
+// real edges, and wrapped in a frame. What this map adds is per-group state -
+// currently the flow direction its contents are arranged in, so one block can
+// run left-to-right inside a top-to-bottom model.
+const groupDir = new Map();   // id -> 'TB' | 'LR'
+// Accumulated drag offset per expanded group. Dragging a group's frame moves
+// every member by the same delta, so the block travels as one piece and keeps
+// the internal arrangement dagre gave it.
+const groupOffset = new Map();   // id -> {dx, dy}
+
+// Has this node been placed by hand - pinned directly, or carried by a dragged
+// group? Both the layout (which drops dagre's stale waypoints) and the draw
+// step (which switches to a straight line) need the same answer.
+const wasMoved = id => {
+  if (pinned.has(id)) return true;
+  for (const gid of groupOffset.keys())
+    if (id === gid || isDesc(id, gid)) return true;
+  return false;
+};
+
+// Nodes pinned by dragging. dagre still lays out everything else; a pinned node
+// is simply written back to its stored point afterwards, so the untouched part
+// of the graph keeps arranging itself around what you have placed by hand.
+const pinned = new Map();   // id -> {x, y}
+
 const isHidden = id => {          // hidden when any ancestor is collapsed
   let p = byId.get(id).parent;
   while (p !== null && p !== undefined) {
@@ -338,6 +455,14 @@ const IN_BASE = __IN_BASE__;
 const isOutput = id => id <= OUT_BASE;
 const isInput = id => id === __INPUT__ || (id <= IN_BASE && id > OUT_BASE);
 let layout = { nodes: [], edges: [], w: 0, h: 0 };
+// Object-drag state (a group or a pinned node). Declared up here because the
+// canvas-pan handler below has to test it, and it is installed earlier in the
+// file than the drag handlers themselves.
+let drag = null, dragMoved = false;
+// Whether nodes and groups can be dragged at all. Turning it off makes the
+// whole canvas behave as a plain pan/zoom surface, so a press on a card can
+// never nudge the layout by accident while reading.
+let dragEnabled = true;
 // Flow direction handed to dagre: 'TB' stacks the model top-to-bottom, 'LR'
 // runs it left-to-right. A deep sequential model is far easier to read wide on
 // a landscape screen, so this is a per-view choice rather than a fixed one.
@@ -498,9 +623,17 @@ function relayout() {
     if (d) pos.set(id, { x: d.x - NW / 2, y: d.y - 13 });
   });
   // Routed polylines, keyed by edge, for the draw step.
+  //
+  // A waypoint list describes the path to where dagre *put* a node. Once an
+  // endpoint has been moved by hand - pinned, or carried by a dragged group -
+  // those waypoints lead to the old location, so the wire ran out to the
+  // vacated spot and only then cut across to the node's new position. Drop the
+  // route in that case and let the direct curve be drawn between the live
+  // endpoints instead.
   const routed = new Map();
   for (const e of G.edges()) {
     const pts = (G.edge(e).points || []).map(q => ({ x: q.x, y: q.y }));
+    if (wasMoved(+e.v) || wasMoved(+e.w)) continue;
     if (pts.length) routed.set(e.v + '>' + e.w, pts);
   }
 
@@ -510,6 +643,52 @@ function relayout() {
   // Nesting depth is expressed by *inset*, measured inward from the deepest
   // level, so the outermost frame is the largest and every frame still fits
   // inside the row gap regardless of how deep the tree goes.
+  // Per-group flow direction. dagre has no per-cluster ``rankdir``, so a group
+  // marked LR inside a TB graph is transposed after the fact: its members are
+  // reflected about their own bounding box's diagonal, which turns a column of
+  // children into a row while leaving the group where the main layout put it.
+  // Positions are what the frame and every edge endpoint read from, so the
+  // group stays wired to the rest of the model exactly as before.
+  for (const [gid, dir] of groupDir) {
+    if (dir === RANKDIR) continue;                 // already that way round
+    const members = [];
+    for (const n of vis) {
+      if (n.id !== gid && isDesc(n.id, gid) && pos.has(n.id))
+        members.push(n.id);
+    }
+    if (members.length < 2) continue;
+    const xs = members.map(i => pos.get(i).x), ys = members.map(i => pos.get(i).y);
+    const x0 = Math.min(...xs), y0 = Math.min(...ys);
+    // Transpose about the group origin, then rescale so cards keep their real
+    // width: a plain swap would compress a 190px-wide card into a 54px slot.
+    const sx = (NW + GAPX) / (NH + 30), sy = 1 / sx;
+    for (const id of members) {
+      const p = pos.get(id);
+      const dx = p.x - x0, dy = p.y - y0;
+      pos.set(id, { x: x0 + dy * sx, y: y0 + dx * sy });
+    }
+    // The routed polylines inside the group are stale after a transpose; drop
+    // them so those edges fall back to direct curves between live endpoints.
+    const mset = new Set(members);
+    for (const key of [...routed.keys()]) {
+      const [a, b] = key.split('>').map(Number);
+      if (mset.has(a) || mset.has(b)) routed.delete(key);
+    }
+  }
+
+  // A dragged *group* moves all its members together, so the block keeps its
+  // internal arrangement and stays a single object. Applied before the frames
+  // are measured, so each frame is drawn around where its contents ended up.
+  for (const [gid, off] of groupOffset) {
+    for (const n of vis) {
+      if (n.id !== gid && isDesc(n.id, gid) && pos.has(n.id)) {
+        const p = pos.get(n.id);
+        pos.set(n.id, { x: p.x + off.dx, y: p.y + off.dy });
+      }
+    }
+  }
+
+
   const containers = vis.filter(n => !isLeaf(n));
   const frames = [];
   const maxDepth = Math.max(0, ...containers.map(c => c.depth));
@@ -558,15 +737,29 @@ function relayout() {
                  toOutput: true });
   });
 
-  // Normalize so the whole drawing starts at a small positive margin.
-  const dx = 24 - Math.min(...[...pos.values()].map(p => p.x),
+  // A dragged node keeps the point you dropped it at. Applied here - after
+  // dagre *and* after the input/output pills have been written back - so a
+  // pinned pill is not overwritten by its freshly computed position, which is
+  // what stopped output pills from staying where they were dropped.
+  for (const [id, p] of pinned) {
+    if (pos.has(id)) pos.set(id, { x: p.x, y: p.y });
+  }
+
+  // Normalize so the whole drawing starts at a small positive margin. Skipped
+  // once anything is pinned: the shift is recomputed on every relayout, and
+  // applying it to a hand-placed node would slide it a little further each
+  // time something else changed - the node would not stay where it was dropped.
+  const held = pinned.size || groupOffset.size;
+  const dx = held ? 0 : 24 - Math.min(...[...pos.values()].map(p => p.x),
                            ...frames.map(f => f.x));
-  const dy = 24 - Math.min(...[...pos.values()].map(p => p.y),
+  const dy = held ? 0 : 24 - Math.min(...[...pos.values()].map(p => p.y),
                            ...frames.map(f => f.y));
-  pos.forEach(p => { p.x += dx; p.y += dy; });
-  frames.forEach(f => { f.x += dx; f.y += dy; });
-  // Routed polylines live in the same coordinate space, so they shift too.
-  routed.forEach(pts => pts.forEach(q => { q.x += dx; q.y += dy; }));
+  if (dx || dy) {
+    pos.forEach(p => { p.x += dx; p.y += dy; });
+    frames.forEach(f => { f.x += dx; f.y += dy; });
+    // Routed polylines live in the same coordinate space, so they shift too.
+    routed.forEach(pts => pts.forEach(q => { q.x += dx; q.y += dy; }));
+  }
 
   layout = {
     nodes: leaves, edges: eds, pos, frames, outs, ins, routed,
@@ -613,7 +806,13 @@ function draw() {
   // drawn over the text, but below nodes, which own the foreground.
   root.append(gF, gFL, gE, gEL, gN);
 
-  for (const f of layout.frames) {
+  // Shallowest first, so a nested frame paints *over* its parent. Now that the
+  // body is the drag surface, the deepest frame under the cursor has to be the
+  // one that receives the press - otherwise an outer group covers its children
+  // and dragging an inner block is impossible.
+  const framesByDepth = [...layout.frames].sort(
+    (a, b) => (a.node.depth || 0) - (b.node.depth || 0));
+  for (const f of framesByDepth) {
     const g = el('g', { class: 'frame' });
     g.dataset.id = f.id;
     // Mermaid draws a subgraph as a quiet solid panel with a plain border - no
@@ -624,9 +823,17 @@ function draw() {
     // stroke keeps every edge crisp.
     let d = 0;
     for (const o of layout.frames) if (o !== f && isDesc(f.id, o.id)) d++;
-    g.appendChild(el('rect', { x: f.x, y: f.y, width: f.w, height: f.h,
+    // The frame's whole body is the drag surface. A title strip alone was a
+    // 20px band that shrank with zoom - accurate to aim at only when zoomed in.
+    // The panel already spans the group, so making it the handle costs nothing
+    // and turns a sliver into thousands of square pixels. Cards sit above it
+    // and take their own clicks, so this only ever catches the empty space
+    // between them.
+    const body = el('rect', { x: f.x, y: f.y, width: f.w, height: f.h,
       rx: 8, fill: frameFill(d),
-      stroke: 'var(--frameln)', 'stroke-width': 1.6 }));
+      stroke: 'var(--frameln)', 'stroke-width': 1.6, class: 'fbody' });
+    body.dataset.drag = f.id;
+    g.appendChild(body);
     gF.appendChild(g);
     // The label carries the frame's id too, so clicking a title still collapses
     // the group now that it no longer lives inside the frame's own <g>.
@@ -645,6 +852,44 @@ function draw() {
       fill: 'var(--flab)' });
     lab.textContent = labText(f);
     lg.append(lab);
+
+    // The whole title strip is the drag handle. A small dedicated grip was the
+    // obvious design but it is a ~22x14px target that shrinks with zoom, so
+    // grabbing a group was fiddly; spanning the frame's full width makes it
+    // hard to miss. The buttons sit on top and take their clicks first.
+    const tw = labW(f);
+    const btnW = 44;
+    const strip = el('rect', { x: f.x, y: ly - 13, width: f.w, height: 20,
+      rx: 5, class: 'ghandle' });
+    strip.dataset.drag = f.id;
+    // Behind the label, so the text stays legible and still drags.
+    lg.insertBefore(strip, lab);
+    lab.dataset.drag = f.id;
+    // Grip dots directly after the title, marking the strip as grabbable.
+    for (let i = 0; i < 2; i++) {
+      for (let j = 0; j < 3; j++) {
+        const dot = el('circle', { cx: f.x + 10 + tw + 4 + i * 5,
+          cy: ly - 8 + j * 4, r: 1, class: 'gripdot' });
+        dot.dataset.drag = f.id;
+        lg.appendChild(dot);
+      }
+    }
+    // Buttons are right-aligned in the strip, clear of the label. The root
+    // module gets none: collapsing it would hide the entire model behind a
+    // single card, which reads as the graph having vanished.
+    const bx = f.x + f.w - btnW;
+    if (f.node.depth > 0) {
+      const db = el('text', { x: bx + 10, y: ly, 'text-anchor': 'middle',
+        class: 'gbtn' });
+      db.textContent = (groupDir.get(f.id) || RANKDIR) === 'TB'
+        ? '\\u2193' : '\\u2192';
+      db.dataset.gdir = f.id;
+      const cb = el('text', { x: bx + 30, y: ly, 'text-anchor': 'middle',
+        class: 'gbtn' });
+      cb.textContent = '\\u2212';
+      cb.dataset.gclose = f.id;
+      lg.append(db, cb);
+    }
     gFL.appendChild(lg);
   }
 
@@ -695,6 +940,13 @@ function draw() {
           + `${p1.x + (p2.x - p1.x) * t2},${p1.y + (p2.y - p1.y) * t2}`;
       }
       d += ` L${q[q.length - 1].x},${q[q.length - 1].y}`;
+    } else if (wasMoved(e.src) || wasMoved(e.dst)) {
+      // An endpoint placed by hand. The S-curves below leave a node along its
+      // rank axis and arrive along the same axis, which reads well for a
+      // top-to-bottom flow but bulges absurdly once a node has been dragged
+      // sideways - the wire sets off downward, loops around, and comes back.
+      // A straight line says exactly what the connection is.
+      d = `M${x1},${y1} L${x2},${y2}`;
     } else if (e.skip && !lr && Math.abs(x2 - x1) < 4 && y2 - y1 > NH) {
       // A residual that returns to the same column would be hidden under the
       // main chain. Bow it out sideways so the bypass is actually visible.
@@ -770,6 +1022,7 @@ function draw() {
       class: 'nc', fill: 'var(--accent)' });
     it.textContent = `${inName(n)} ${n.tensor ? shp(n.tensor) : ''}`;
     gi.appendChild(it);
+    gi.appendChild(pillGrip(n.id, 26));
     gN.appendChild(gi);
   }
 
@@ -787,11 +1040,49 @@ function draw() {
     const label = layout.outs.length > 1 ? `output ${o.index}` : 'output';
     t.textContent = `${label} ${shp(o.tensor)}`;
     g.appendChild(t);
+    g.appendChild(pillGrip(o.id, 30));
     gN.appendChild(g);
   }
 
   for (const n of layout.nodes) {
     const p = pos.get(n.id);
+    gN.appendChild(drawCard(n, p));
+  }
+
+  const defs = el('defs');
+  const mk = el('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: 9,
+    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
+  mk.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--edge)' }));
+  defs.appendChild(mk);
+  const mo = el('marker', { id: 'arrowout', viewBox: '0 0 10 10', refX: 9,
+    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
+  mo.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--out)' }));
+  defs.appendChild(mo);
+  root.appendChild(defs);
+
+  applySelection();
+}
+
+// Drag grip for an input/output pill. Pills are rounded and short, so the grip
+// sits at the left end inside the curve rather than spanning the full height.
+function pillGrip(id, h) {
+  const g = el('g');
+  const r = el('rect', { x: 2, y: 0, width: 14, height: h,
+    class: 'grip', fill: 'transparent' });
+  r.dataset.ndrag = id;
+  g.appendChild(r);
+  for (let i = 0; i < 3; i++) {
+    const d = el('circle', { cx: 9, cy: h / 2 - 5 + i * 5, r: 1.1,
+      class: 'gripdot' });
+    d.dataset.ndrag = id;
+    g.appendChild(d);
+  }
+  return g;
+}
+
+// One module card. Shared by the main graph and by panel contents, so a node
+// looks and behaves identically wherever it is drawn.
+function drawCard(n, p) {
     const g = el('g', { class: 'node', transform: `translate(${p.x},${p.y})` });
     g.dataset.id = n.id;
 
@@ -820,8 +1111,20 @@ function draw() {
         class: 'ns' });
       sh.textContent = n.outputs.length ? shp(n.outputs[0]) : '';
       g.appendChild(sh);
-      gN.appendChild(g);
-      continue;
+      // Array ops (leaky_relu, concat, a residual +) are real steps in the
+      // forward pass and move like any other node, so they get a grip too.
+      // Theirs rides the left of the pill rather than a card edge.
+      const mg = el('rect', { x: cx - w / 2 - 3, y: cy - h / 2,
+        width: 12, height: h, class: 'grip', fill: 'transparent' });
+      mg.dataset.ndrag = n.id;
+      g.appendChild(mg);
+      for (let i = 0; i < 3; i++) {
+        const dot = el('circle', { cx: cx - w / 2 + 2, cy: cy - 5 + i * 5,
+          r: 1.1, class: 'gripdot' });
+        dot.dataset.ndrag = n.id;
+        g.appendChild(dot);
+      }
+      return g;
     }
     const tied = isTied(n);
     const col = n.error ? 'var(--err)' : colorOf(n);
@@ -857,21 +1160,37 @@ function draw() {
       tb.textContent = fmt(n.params);
       g.appendChild(tb);
     }
-    gN.appendChild(g);
-  }
 
-  const defs = el('defs');
-  const mk = el('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: 9,
-    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
-  mk.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--edge)' }));
-  defs.appendChild(mk);
-  const mo = el('marker', { id: 'arrowout', viewBox: '0 0 10 10', refX: 9,
-    refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse' });
-  mo.appendChild(el('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--out)' }));
-  defs.appendChild(mo);
-  root.appendChild(defs);
+    // Drag grip: a narrow strip down the left edge of the card. Grabbing it
+    // moves (and pins) the node; everywhere else on the card stays a click
+    // target, so selection and the neighbour highlight are unaffected.
+    const grip = el('rect', { x: 0, y: 0, width: 10, height: NH,
+      class: 'grip', fill: 'transparent' });
+    grip.dataset.ndrag = n.id;
+    g.appendChild(grip);
+    for (let i = 0; i < 3; i++) {
+      const d = el('circle', { cx: 5, cy: NH / 2 - 5 + i * 5, r: 1.1,
+        class: 'gripdot' });
+      d.dataset.ndrag = n.id;
+      g.appendChild(d);
+    }
 
-  applySelection();
+    // A container shows an explicit expand control rather than relying on a
+    // double-click: the gesture was undiscoverable, and it collided with
+    // click-to-select. The button expands the module in place.
+    if (hasKids(n.id) && n.depth > 0) {
+      const open = !collapsed.has(n.id);
+      const bg = el('rect', { x: NW - 24, y: NH - 22, width: 18, height: 16,
+        rx: 4, class: 'xbtn',
+        fill: open ? 'var(--accent)' : 'var(--card)', stroke: 'var(--cardln)' });
+      bg.dataset.expand = n.id;
+      const tx2 = el('text', { x: NW - 15, y: NH - 10, 'text-anchor': 'middle',
+        class: 'xbtnt', fill: open ? 'var(--bg)' : 'var(--muted)' });
+      tx2.textContent = open ? '\\u2212' : '+';
+      tx2.dataset.expand = n.id;
+      g.append(bg, tx2);
+    }
+    return g;
 }
 
 // ---------- interaction ---------------------------------------------------
@@ -892,17 +1211,28 @@ function fit() {
   apply();
 }
 
-let drag = null;
+// Canvas panning. Distinct from ``drag`` above, which moves objects: a
+// pointerdown that grabbed a panel or a node must not also pan the view, so
+// this bails whenever an object drag is in progress.
+let pan = null;
 svg.addEventListener('mousedown', e => {
-  drag = { x: e.clientX - tx, y: e.clientY - ty };
+  if (drag) return;
+  // Only the interactive targets block panning. Pressing on the body of a card
+  // used to block it too, which made the canvas feel dead wherever the graph
+  // was dense; now a card press pans, its grip drags, and its buttons click.
+  const ds = e.target.dataset || {};
+  if (ds.drag !== undefined || ds.expand !== undefined
+      || ds.ndrag !== undefined || ds.pclose !== undefined
+      || ds.pdir !== undefined) return;
+  pan = { x: e.clientX - tx, y: e.clientY - ty };
   document.getElementById('stage').classList.add('drag');
 });
 addEventListener('mousemove', e => {
-  if (!drag) return;
-  tx = e.clientX - drag.x; ty = e.clientY - drag.y; apply();
+  if (!pan || drag) return;
+  tx = e.clientX - pan.x; ty = e.clientY - pan.y; apply();
 });
 addEventListener('mouseup', () => {
-  drag = null;
+  pan = null;
   document.getElementById('stage').classList.remove('drag');
 });
 svg.addEventListener('wheel', e => {
@@ -915,22 +1245,156 @@ svg.addEventListener('wheel', e => {
   apply();
 }, { passive: false });
 
+// Expand a container in place. Its children join the main dagre pass and stay
+// wired to the rest of the model by their real edges; the frame drawn around
+// them is what makes the group readable as one block.
+function groupOpen(id) {
+  collapsed.delete(id);
+  relayout();
+}
+
+function groupClose(id) {
+  collapsed.add(id);
+  groupDir.delete(id);
+  groupOffset.delete(id);
+  relayout();
+}
+
 svg.addEventListener('click', e => {
+  // The explicit +/- control on a card expands or collapses it in place.
+  // Checked before selection so the button never doubles as a select.
+  const xb = e.target.dataset && e.target.dataset.expand;
+  if (xb !== undefined) {
+    const id = +xb;
+    collapsed.has(id) ? groupOpen(id) : groupClose(id);
+    return;
+  }
+  // Per-group direction toggle, drawn on the frame's title bar.
+  const gd = e.target.dataset && e.target.dataset.gdir;
+  if (gd !== undefined) {
+    const id = +gd;
+    const cur = groupDir.get(id) || RANKDIR;
+    groupDir.set(id, cur === 'TB' ? 'LR' : 'TB');
+    relayout();
+    return;
+  }
+  const gc = e.target.dataset && e.target.dataset.gclose;
+  if (gc !== undefined) { groupClose(+gc); return; }
+  if (dragMoved) { dragMoved = false; return; }   // a drag, not a click
+
   // A frame's border/label collapses the group it encloses; a node inside it
   // is matched first, so clicking a child never collapses its parent.
   const g = e.target.closest('.node') || e.target.closest('.outnode')
          || e.target.closest('.innode') || e.target.closest('.frame');
   if (!g) { selected = null; applySelection(); return; }
   const id = +g.dataset.id;
-  const isFrame = g.classList.contains('frame');
-  if (isFrame || (e.detail === 2 && hasKids(id))) {
-    collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+  if (g.classList.contains('frame')) {
+    // The frame is a drag surface now, so clicking it must not collapse the
+    // group - a press that turns into a drag would otherwise fold the block
+    // shut the moment you let go. Collapsing is the explicit - button on the
+    // title strip. A plain click on empty group space just clears selection.
     selected = null;
-    relayout();
+    applySelection();
     return;
   }
   selected = id;
   applySelection();
+});
+
+// ---------- dragging ------------------------------------------------------
+// Two draggable things: a panel (by its header, moving the whole group) and a
+// single node in the main graph (which pins it). Both run off one pointer
+// handler so a drag can never be interpreted as a click. State lives at the
+// top of the file, next to ``layout``.
+svg.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || !dragEnabled) return;
+  // The card's +/- control and the panel header buttons are click targets, not
+  // drag handles. Starting a drag here would capture the pointer and the
+  // subsequent ``click`` would be retargeted to the SVG, so the button simply
+  // never fired - which is exactly what made expand look broken.
+  const ds = e.target.dataset || {};
+  if (ds.expand !== undefined || ds.pclose !== undefined
+      || ds.pdir !== undefined) return;
+  const ph = ds.drag;
+  if (ph !== undefined) {
+    // A group drags by its frame handle and carries every member with it, so
+    // an expanded block behaves as one object rather than a pile of cards.
+    const off = groupOffset.get(+ph) || { dx: 0, dy: 0 };
+    drag = { kind: 'group', id: +ph, ox: off.dx, oy: off.dy,
+             sx: e.clientX, sy: e.clientY };
+  } else if (ds.ndrag !== undefined) {
+    // Nodes move only by their own grip. Dragging from anywhere on the card
+    // meant every click had to be disambiguated from a drag, and capturing the
+    // pointer to do that swallowed the click - so selecting a node, and the
+    // neighbour highlight it drives, stopped working. An explicit grip keeps
+    // the two gestures apart with no guessing.
+    const id = +ds.ndrag;
+    const p = layout.pos.get(id);
+    if (!p) return;
+    drag = { kind: 'node', id, ox: p.x, oy: p.y,
+             sx: e.clientX, sy: e.clientY };
+  } else return;
+  dragMoved = false;
+  svg.setPointerCapture(e.pointerId);
+  e.stopPropagation();
+});
+
+svg.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = (e.clientX - drag.sx) / k, dy = (e.clientY - drag.sy) / k;
+  if (Math.abs(dx) + Math.abs(dy) > 3) dragMoved = true;
+  if (!dragMoved) return;
+  if (drag.kind === 'group') {
+    groupOffset.set(drag.id, { dx: drag.ox + dx, dy: drag.oy + dy });
+    // Shift the members in the live layout and redraw. Calling relayout() here
+    // would re-run dagre on every pointer move, which on a graph this size is
+    // slow enough that the group visibly lags the cursor.
+    const step = { x: dx - (drag.lx || 0), y: dy - (drag.ly || 0) };
+    drag.lx = dx; drag.ly = dy;
+    for (const n of DATA.nodes) {
+      if (n.id !== drag.id && isDesc(n.id, drag.id) && layout.pos.has(n.id)) {
+        const p = layout.pos.get(n.id);
+        layout.pos.set(n.id, { x: p.x + step.x, y: p.y + step.y });
+      }
+    }
+    for (const f of layout.frames) {
+      if (f.id === drag.id || isDesc(f.id, drag.id)) {
+        f.x += step.x; f.y += step.y;
+      }
+    }
+    // Discard the routes touching the moving group, so the wires follow the
+    // cursor directly instead of first running out to the vacated position.
+    if (layout.routed) {
+      for (const key of [...layout.routed.keys()]) {
+        const [a, b] = key.split('>').map(Number);
+        if (a === drag.id || b === drag.id
+            || isDesc(a, drag.id) || isDesc(b, drag.id))
+          layout.routed.delete(key);
+      }
+    }
+    draw();
+  } else {
+    pinned.set(drag.id, { x: drag.ox + dx, y: drag.oy + dy });
+    layout.pos.set(drag.id, { x: drag.ox + dx, y: drag.oy + dy });
+    // Same as for groups: the recorded route ends at the old position, so it
+    // has to go the moment the node starts moving.
+    if (layout.routed) {
+      for (const key of [...layout.routed.keys()]) {
+        const [a, b] = key.split('>').map(Number);
+        if (a === drag.id || b === drag.id) layout.routed.delete(key);
+      }
+    }
+    draw();
+  }
+});
+
+svg.addEventListener('pointerup', e => {
+  if (!drag) return;
+  if (dragMoved) {
+    relayout();          // re-route edges around the newly placed node/group
+  }
+  try { svg.releasePointerCapture(e.pointerId); } catch (err) {}
+  drag = null;
 });
 
 // ---------- keyboard navigation ------------------------------------------
@@ -1008,10 +1472,27 @@ window.addEventListener('keydown', e => {
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
             || t.isContentEditable)) return;
+  // Shift is meaningful here (it switches arrows from panning to stepping the
+  // selection), so only the browser-owned modifiers bail out.
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
   if (NAV[e.key]) {
     e.preventDefault();
+    // Bare arrows pan the canvas - on a graph that is tens of thousands of
+    // pixels tall, scrolling around is the thing you do constantly, and
+    // dragging for it gets tiring. Shift+arrow keeps the structural walk:
+    // stepping selection along the dataflow.
+    if (!e.shiftKey) {
+      // A screen-space step, so the distance felt is the same at any zoom.
+      const d = e.repeat ? 90 : 45;
+      const dir = NAV[e.key];
+      if (dir === 'left')  tx += d;
+      if (dir === 'right') tx -= d;
+      if (dir === 'up')    ty += d;
+      if (dir === 'down')  ty -= d;
+      apply();
+      return;
+    }
     // Nothing selected yet: start at the first input pill, or the first node.
     if (selected === null) {
       const first = (layout.ins[0] && layout.ins[0].id);
@@ -1027,14 +1508,12 @@ window.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape') { selected = null; applySelection(); return; }
-  // Enter/Space collapses or expands the selected container, matching what a
-  // double-click does with the mouse.
+  // Enter/Space opens the selected container into a panel - the keyboard
+  // equivalent of its +/- button.
   if ((e.key === 'Enter' || e.key === ' ') && selected !== null
       && hasKids(selected)) {
     e.preventDefault();
-    collapsed.has(selected) ? collapsed.delete(selected)
-                            : collapsed.add(selected);
-    relayout();
+    collapsed.has(selected) ? groupOpen(selected) : groupClose(selected);
   }
 });
 
@@ -1094,11 +1573,13 @@ function detail() {
         `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`).join('')) +
       sec('Tips',
         '<div class="stat"><span>Click node</span><span>trace neighbours</span></div>' +
-        '<div class="stat"><span>Click group border</span><span>collapse</span></div>' +
+        '<div class="stat"><span>Drag group body</span><span>move whole block</span></div>' +
+        '<div class="stat"><span>+ / &minus; on card</span><span>expand / collapse</span></div>' +
         '<div class="stat"><span>&plusmn; depth</span><span>expand a level</span></div>' +
-        '<div class="stat"><span>&darr;&uarr; arrows</span><span>follow dataflow</span></div>' +
-        '<div class="stat"><span>&larr;&rarr; arrows</span><span>move across a rank</span></div>' +
-        '<div class="stat"><span>Enter / Space</span><span>collapse selected</span></div>' +
+        '<div class="stat"><span>Arrow keys</span><span>pan the view</span></div>' +
+        '<div class="stat"><span>Shift + &darr;&uarr;</span><span>step along dataflow</span></div>' +
+        '<div class="stat"><span>Shift + &larr;&rarr;</span><span>step across a rank</span></div>' +
+        '<div class="stat"><span>Enter / Space</span><span>expand selected</span></div>' +
         '<div class="stat"><span>Esc</span><span>clear selection</span></div>');
     return;
   }
@@ -1177,6 +1658,7 @@ document.getElementById('detail').addEventListener('toggle', e => {
 document.getElementById('sidetog').onclick = () => {
   const on = document.getElementById('app').classList.toggle('noside');
   document.getElementById('sidetog').setAttribute('aria-expanded', !on);
+  mark('sidetog', !on);
   setTimeout(fit, 200);
 };
 // `d` toggles it from the keyboard, ignored while typing in a field.
@@ -1186,13 +1668,76 @@ document.addEventListener('keydown', e => {
     document.getElementById('sidetog').click();
 });
 
+// ---------- toolbar menus -------------------------------------------------
+// One popup open at a time; a click anywhere else closes it, and Escape backs
+// out. Commands inside close the menu too, so the canvas is never left with a
+// popup covering it after an action has run.
+const closeMenus = () => {
+  document.querySelectorAll('.mpop.open').forEach(p => p.classList.remove('open'));
+  document.querySelectorAll('.mbtn').forEach(b =>
+    b.setAttribute('aria-expanded', 'false'));
+};
+document.querySelectorAll('.mbtn').forEach(btn => {
+  btn.setAttribute('aria-expanded', 'false');
+  btn.onclick = ev => {
+    ev.stopPropagation();
+    const pop = document.getElementById(btn.dataset.menu);
+    const wasOpen = pop.classList.contains('open');
+    closeMenus();
+    if (!wasOpen) {
+      pop.classList.add('open');
+      btn.setAttribute('aria-expanded', 'true');
+    }
+  };
+});
+document.querySelectorAll('.mpop').forEach(pop => {
+  pop.addEventListener('click', ev => {
+    if (ev.target.tagName === 'BUTTON') closeMenus();
+    ev.stopPropagation();
+  });
+});
+document.addEventListener('click', closeMenus);
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') closeMenus();
+});
+
+// Keep a toggle's label in step with its state, so the tick in the menu is
+// the source of truth for whether the thing is on.
+// The label is rebuilt from a stored base rather than by stripping a prefix
+// off the previous text: the "off" marker is a figure space, which is itself
+// whitespace, so a strip-and-prepend left a growing run of blanks each time
+// the item was toggled.
+const mark = (id, on) => {
+  const b = document.getElementById(id);
+  if (!b.dataset.base)
+    b.dataset.base = b.textContent.replace(/^[\\u2713\\u2007\\s]+/, '');
+  b.textContent = (on ? '\\u2713 ' : '\\u2007 ') + b.dataset.base;
+};
+
 document.getElementById('shapes').onclick = () => {
   const off = document.getElementById('stage').classList.toggle('nolabels');
   document.getElementById('shapes').setAttribute('aria-pressed', !off);
+  mark('shapes', !off);
 };
 document.getElementById('legtog').onclick = () => {
   const off = document.getElementById('legend').classList.toggle('off');
   document.getElementById('legtog').setAttribute('aria-pressed', !off);
+  mark('legtog', !off);
+};
+document.getElementById('dragtog').onclick = () => {
+  dragEnabled = !dragEnabled;
+  document.getElementById('dragtog').setAttribute('aria-pressed', dragEnabled);
+  mark('dragtog', dragEnabled);
+  // Drives the cursor on grips and frame bodies: with dragging off they should
+  // not advertise a grab that will not happen.
+  document.getElementById('stage').classList.toggle('nodrag', !dragEnabled);
+};
+document.getElementById('reset').onclick = () => {
+  pinned.clear();
+  groupDir.clear();
+  groupOffset.clear();
+  relayout();
+  fit();
 };
 document.getElementById('dirtog').onclick = () => {
   RANKDIR = RANKDIR === 'TB' ? 'LR' : 'TB';
