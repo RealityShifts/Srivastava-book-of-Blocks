@@ -119,6 +119,12 @@ class Edge:
     tensor: Tensor
     skip: bool = False       # True when it bypasses the immediate predecessor
     inferred: bool = False   # from execution order, not array identity
+    # Which of ``dst``'s consumed arrays this edge carries. One module pair can
+    # exchange several arrays (an encoder handing a whole feature pyramid to a
+    # decoder); the port keeps those apart so each stays its own wire and can be
+    # labelled by what ``dst`` *received* rather than by what ``src`` emitted.
+    # -1 marks an edge whose tensor was inferred rather than observed.
+    port: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +133,7 @@ class Edge:
             "tensor": self.tensor.to_dict(),
             "skip": self.skip,
             "inferred": self.inferred,
+            "port": self.port,
         }
 
 
@@ -660,7 +667,7 @@ def trace_model(
             # would claim the feature map's shape.
             in_leaves = [l for l in jax.tree_util.tree_leaves((a, kw))
                          if hasattr(l, "shape") and hasattr(l, "dtype")]
-            for leaf in in_leaves:
+            for port, leaf in enumerate(in_leaves):
                 src = producer.get(id(leaf))
                 if src is None or src == node.id or src in stack:
                     continue
@@ -668,7 +675,8 @@ def trace_model(
                     continue  # the root receiving the input is not an edge
                 edges.append(Edge(
                     src, node.id,
-                    Tensor(tuple(leaf.shape), str(leaf.dtype))))
+                    Tensor(tuple(leaf.shape), str(leaf.dtype)),
+                    port=port))
 
             try:
                 out = fn(self, *a, **kw)
@@ -1111,15 +1119,25 @@ def trace_model(
     for e in edges:
         if e.src < 0 or e.src >= len(nodes):
             continue                     # an input pill: nothing to read off
+        if e.port >= 0:
+            continue    # observed at the consumer: it already carries its own
+                        # array, and ``outputs[0]`` would relabel every wire
+                        # after the first with the producer's *first* output.
         out = nodes[e.src].outputs
         if out:
             e.tensor = out[0]
 
-    # Deduplicate: one module pair can exchange several arrays.
+    # Deduplicate. One module pair can exchange several arrays - an encoder
+    # handing a decoder a six-level feature pyramid is one (src, dst) pair and
+    # six genuinely distinct wires. Keying on the pair alone collapsed them to
+    # one, so five inputs vanished from the graph; the port (and the tensor it
+    # carries) keeps them apart. Repeats of the *same* port still collapse,
+    # which is what drops the duplicate bookkeeping edges.
     seen = set()
     unique_edges = []
     for e in edges:
-        sig = (e.src, e.dst)
+        sig = (e.src, e.dst, e.port,
+               e.tensor.shape, e.tensor.dtype)
         if sig in seen:
             continue
         seen.add(sig)
@@ -1130,12 +1148,15 @@ def trace_model(
     # further along is a shortcut that bypasses it. This is the residual
     # shape (``x`` going to both ``conv1`` and ``shortcut``); a purely
     # sequential chain has fan-out 1 everywhere and stays unmarked.
+    # Fan-out counts distinct *consumers*, not wires: several arrays travelling
+    # from one module to the same consumer (a feature pyramid) is one path, not
+    # a bundle of shortcuts, so group by destination before judging.
     outgoing: dict = {}
     for e in unique_edges:
         if not e.inferred:      # order-based links are never branches
             outgoing.setdefault(e.src, []).append(e)
     for group in outgoing.values():
-        if len(group) < 2:
+        if len({e.dst for e in group}) < 2:
             continue
         main = min(e.dst for e in group)
         for e in group:
