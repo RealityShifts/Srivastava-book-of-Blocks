@@ -73,6 +73,12 @@ class Node:
     # appended after tracing, so they carry the order of the call they belong
     # to and still sort next to their siblings.
     order: int = -1
+    # Forward-pass FLOPs for this call, measured (not estimated) by the
+    # framework's own op-level counter. ``flops`` includes children; ``own_flops``
+    # is what the module itself contributed. -1 means "not measured" - the
+    # counter is optional, and the JAX tracer does not populate these.
+    flops: int = -1
+    own_flops: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -91,6 +97,8 @@ class Node:
             "kind": self.kind,
             "op": self.op,
             "order": self.order if self.order >= 0 else self.id,
+            "flops": self.flops,
+            "own_flops": self.own_flops,
         }
 
 
@@ -130,6 +138,8 @@ class Graph:
     # Parameter name per input array, read off ``__call__``'s signature, so a
     # pill reads "reference" rather than "input 0".
     input_names: list = dataclasses.field(default_factory=list)
+    # Whole-model forward FLOPs for the traced inputs; -1 when not measured.
+    total_flops: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +147,7 @@ class Graph:
             "edges": [e.to_dict() for e in self.edges],
             "model_name": self.model_name,
             "total_params": self.total_params,
+            "total_flops": self.total_flops,
             "input_tensors": [t.to_dict() for t in self.input_tensors],
             "output_tensors": [t.to_dict() for t in self.output_tensors],
             "input_names": list(self.input_names),
@@ -480,6 +491,11 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     for n in nodes:
         child_total = sum(nodes[c].params for c in children.get(n.id, []))
         n.own_params = max(0, n.params - child_total)
+        # Same roll-up for FLOPs, skipped when the counter did not run.
+        if n.flops >= 0:
+            kid_flops = sum(nodes[c].flops for c in children.get(n.id, [])
+                            if nodes[c].flops >= 0)
+            n.own_flops = max(0, n.flops - kid_flops)
 
     # Array identity only survives while a value passes straight from one
     # module to the next. A bare ``jnp``/``jax.nn`` call in between (an

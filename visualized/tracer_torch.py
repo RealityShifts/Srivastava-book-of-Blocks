@@ -35,6 +35,11 @@ import torch
 from torch import nn
 from torch.utils import _pytree as pytree
 
+try:                                   # pragma: no cover - older torch
+    from torch.utils.flop_counter import FlopCounterMode
+except ImportError:                    # counter is optional; -1 means unmeasured
+    FlopCounterMode = None
+
 from ._core import (
     Edge,
     Graph,
@@ -196,6 +201,20 @@ def trace_model(
     # makes residual adds and ``torch.cat`` visible, and it does not change
     # between calls of the same class.
     ops_cache: dict = {}
+    # FLOPs are read off the framework's own op-level counter rather than
+    # estimated per layer type, so attention, einsum and custom ops are counted
+    # the same way conv is. ``flop_at_entry`` holds the running total when each
+    # node opened; the delta at exit is that call's cost, children included.
+    counter = FlopCounterMode(display=False) if FlopCounterMode else None
+    flop_at_entry: dict = {}
+
+    def _flops_now() -> int:
+        if counter is None:
+            return -1
+        try:
+            return counter.get_total_flops()
+        except Exception:              # pragma: no cover - counter API drift
+            return -1
 
     def _register(obj: Any, node_id: int, *, claim: bool = True) -> None:
         """Record ``node_id`` as the producer of every tensor leaf in ``obj``.
@@ -232,6 +251,7 @@ def trace_model(
         if node.parent is not None:
             child_of.setdefault(node.parent, []).append(node.id)
         stack.append(node.id)
+        flop_at_entry[node.id] = _flops_now()
 
         in_leaves = _leaves((inp, kw))
         keepalive.extend(in_leaves)
@@ -263,6 +283,11 @@ def trace_model(
         order.append(nid)
         node = nodes[nid]
         node.outputs = _as_tensors(out)
+        entry = flop_at_entry.pop(nid, -1)
+        if entry >= 0:
+            now = _flops_now()
+            if now >= 0:
+                node.flops = max(0, now - entry)
 
         cls = type(mod)
         if cls not in ops_cache:
@@ -321,10 +346,21 @@ def trace_model(
         _register(leaf, INPUT_NODE if i == 0 else IN_BASE - i)
 
     was_training = model.training
+    total_flops = -1
     try:
         model.eval()
         with torch.no_grad():
-            result = model(*args, **kwargs)
+            if counter is not None:
+                # A dispatch mode, so it has to wrap the call the hooks run
+                # inside. Any failure here propagates like a normal trace error
+                # rather than being retried - a half-built node list cannot be
+                # reused, and silently re-running the model could have side
+                # effects.
+                with counter:
+                    result = model(*args, **kwargs)
+                total_flops = _flops_now()
+            else:
+                result = model(*args, **kwargs)
         outputs = _as_tensors(result)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -360,6 +396,7 @@ def trace_model(
         error=error,
         output_sources=out_sources,
         input_names=_input_names(model, args, kwargs),
+        total_flops=total_flops,
     )
 
 

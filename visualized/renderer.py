@@ -352,6 +352,14 @@ const isTied = n => !!(n && _hue.has(n.path));
 const fmt = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B'
               : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
               : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
+// FLOPs span a far wider range than parameter counts, so they get their own
+// scale. -1 is the "counter did not run" sentinel and renders as a dash.
+const fmtFlops = n => n < 0 ? '\\u2014'
+              : n >= 1e12 ? (n/1e12).toFixed(2)+' TFLOP'
+              : n >= 1e9  ? (n/1e9).toFixed(2)+' GFLOP'
+              : n >= 1e6  ? (n/1e6).toFixed(2)+' MFLOP'
+              : n >= 1e3  ? (n/1e3).toFixed(1)+' KFLOP'
+              : n + ' FLOP';
 const shp = t => '(' + t.shape.join(', ') + ')';
 // The parameter name this pill stands for, from ``__call__``'s signature.
 // Falls back to positional labelling for a model whose source is unavailable.
@@ -1563,6 +1571,8 @@ function detail() {
       ['Connections', DATA.edges.length],
       ['Skip edges', DATA.edges.filter(e => e.skip).length],
     ];
+    if (DATA.total_flops >= 0)
+      rows.splice(2, 0, ['FLOPs (forward)', fmtFlops(DATA.total_flops)]);
     box.innerHTML =
       (DATA.error ? `<div class="err"><b>Forward pass failed</b><br>
          <code>${esc(DATA.error)}</code><br>Graph shows progress up to the
@@ -1630,6 +1640,13 @@ function detail() {
   if (DATA.total_params > 0)
     rows.push(['Share of model',
       (100 * n.params / DATA.total_params).toFixed(1) + '%']);
+  if (n.flops >= 0) {
+    rows.push(['FLOPs (total)', fmtFlops(n.flops)]);
+    rows.push(['FLOPs (own)', fmtFlops(n.own_flops)]);
+    if (DATA.total_flops > 0)
+      rows.push(['Share of FLOPs',
+        (100 * n.flops / DATA.total_flops).toFixed(1) + '%']);
+  }
   const cfg = Object.entries(n.config);
   box.innerHTML =
     (n.error ? `<div class="err"><code>${esc(n.error)}</code></div>` : '') +
@@ -1886,7 +1903,8 @@ document.getElementById('mmd-dl').onclick = () => {
 
 document.getElementById('title').textContent = DATA.model_name;
 document.getElementById('subtitle').textContent =
-  DATA.nodes.length + ' modules \\u00B7 ' + fmt(DATA.total_params) + ' params';
+  DATA.nodes.length + ' modules \\u00B7 ' + fmt(DATA.total_params) + ' params'
+  + (DATA.total_flops >= 0 ? ' \\u00B7 ' + fmtFlops(DATA.total_flops) : '');
 setLevel(1);
 addEventListener('resize', fit);
 </script>
