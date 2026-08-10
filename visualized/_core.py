@@ -214,6 +214,15 @@ _OP_SYMBOLS = {
     "interpolate": "⤢", "softmax": "σ",
 }
 
+# Ops that join several values into one. Both spellings live here: JAX writes
+# ``jnp.concatenate``, PyTorch writes ``torch.cat``/``hstack``/``vstack``, and
+# the join logic below must recognise either. Listing only the JAX names left
+# every ``torch.cat`` drawn as a unary op with a single incoming arrow.
+_JOIN_OPS = frozenset({
+    "concat", "concatenate", "stack",
+    "cat", "hstack", "vstack", "column_stack", "row_stack", "dstack",
+})
+
 
 # Builtins that return a plain Python number, so arithmetic on their result
 # is index/shape bookkeeping rather than dataflow.
@@ -571,7 +580,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
             if anchors and not op_info.in_loop:
                 anchors = anchors[-1:]
 
-            if op in ("concat", "concatenate", "stack") and not anchors:
+            if op in _JOIN_OPS and not anchors:
                 # A join of several *incoming* values, before any child runs -
                 # ``jnp.concat([motion, id])`` at the top of an adapter. Its
                 # operands are the host's own inputs, and everything the host
@@ -642,8 +651,8 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 continue                # a leaf module: no flow to splice into
 
             merged = False
-            if cand["tail_combine"] and op in ("add", "sub", "mul", "concat",
-                                               "concatenate", "div"):
+            if cand["tail_combine"] and (op in _JOIN_OPS
+                                         or op in ("add", "sub", "mul", "div")):
                 # A trailing combine that closes a residual: ``out + x``.
                 # Operands are the children whose output nothing consumed -
                 # the ends of each branch. In ``conv2(conv1(x)) + shortcut(x)``
@@ -753,7 +762,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 # the host's own inputs that no child produced. Without this the
                 # node draws a single arrow and the joined operand never
                 # connects, which also makes its width look unexplained.
-                if op in ("concat", "concatenate", "stack") and tensor is not None:
+                if op in _JOIN_OPS and tensor is not None:
                     used = {e.src for e in edges if e.dst == node.id}
                     extra = []
                     for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
