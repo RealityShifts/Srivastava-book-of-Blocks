@@ -82,6 +82,11 @@ class Node:
     # appended after tracing, so they carry the order of the call they belong
     # to and still sort next to their siblings.
     order: int = -1
+    # Forward-pass FLOPs for this call, from XLA's cost analysis. ``flops``
+    # includes children; ``own_flops`` is what this module itself contributed.
+    # -1 means "not measured" - the analysis is optional and can fail per call.
+    flops: int = -1
+    own_flops: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +105,8 @@ class Node:
             "kind": self.kind,
             "op": self.op,
             "order": self.order if self.order >= 0 else self.id,
+            "flops": self.flops,
+            "own_flops": self.own_flops,
         }
 
 
@@ -139,6 +146,8 @@ class Graph:
     # Parameter name per input array, read off ``__call__``'s signature, so a
     # pill reads "reference" rather than "input 0".
     input_names: list = dataclasses.field(default_factory=list)
+    # Whole-model forward FLOPs for the traced inputs; -1 when not measured.
+    total_flops: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -146,6 +155,7 @@ class Graph:
             "edges": [e.to_dict() for e in self.edges],
             "model_name": self.model_name,
             "total_params": self.total_params,
+            "total_flops": self.total_flops,
             "input_tensors": [t.to_dict() for t in self.input_tensors],
             "output_tensors": [t.to_dict() for t in self.output_tensors],
             "input_names": list(self.input_names),
@@ -184,6 +194,35 @@ def _count_params(module: nnx.Module) -> int:
         if isinstance(leaf, nnx.Param) and hasattr(leaf.value, "size"):
             total += int(leaf.value.size)
     return total
+
+
+def _module_flops(module: nnx.Module, args: tuple, kwargs: dict) -> int:
+    """Forward FLOPs for one module call, from XLA's own cost analysis.
+
+    There is no JAX equivalent of a dispatch-mode counter that accumulates
+    during eager execution: cost analysis runs on a *compiled* HLO module. So
+    each call is lowered and compiled on its own, which is why the numbers
+    include the fused bias-add and activation that a hand-written per-layer
+    formula would miss.
+
+    Returns -1 when the call cannot be lowered - a module closing over
+    non-array state, a shape XLA rejects - so the field degrades to "not
+    measured" rather than failing the trace.
+    """
+    try:
+        graphdef, state = nnx.split(module)
+
+        def _fn(state, *a, **kw):
+            return nnx.merge(graphdef, state)(*a, **kw)
+
+        compiled = jax.jit(_fn).lower(state, *args, **kwargs).compile()
+        cost = compiled.cost_analysis()
+        if isinstance(cost, (list, tuple)):    # older jax returns a list
+            cost = cost[0] if cost else {}
+        flops = cost.get("flops", -1)
+        return int(flops) if flops and flops >= 0 else -1
+    except Exception:
+        return -1
 
 
 # Attributes worth surfacing in the details panel. NNX modules keep their
@@ -531,6 +570,7 @@ def trace_model(
     model: nnx.Module,
     *args: Any,
     model_name: Optional[str] = None,
+    measure_flops: bool = True,
     **kwargs: Any,
 ) -> Graph:
     """Run one forward pass of ``model`` and record its module graph.
@@ -539,6 +579,11 @@ def trace_model(
     runs eagerly (no ``jit``) so shapes are concrete. If the forward pass
     raises, the partial graph is still returned with ``error`` set - a
     failed model is exactly when the picture is most useful.
+
+    ``measure_flops`` adds per-module FLOP counts from XLA's cost analysis.
+    Unlike the PyTorch side - where the counter rides along with the eager
+    pass for free - this lowers and compiles each module separately, so it
+    costs real time on a large graph. Pass ``False`` to skip it.
     """
     # Real attribute paths for every reachable module, keyed by identity.
     paths: dict = {}
@@ -638,6 +683,8 @@ def trace_model(
                     order.append(node.id)
 
             node.outputs = _as_tensors(out)
+            if measure_flops:
+                node.flops = _module_flops(self, a, kw)
 
             # Bare array ops (``x + skip``, ``jnp.concat([a, b])``,
             # ``nnx.leaky_relu(x)``) are not modules, so nothing above recorded
@@ -734,6 +781,11 @@ def trace_model(
     for n in nodes:
         child_total = sum(nodes[c].params for c in children.get(n.id, []))
         n.own_params = max(0, n.params - child_total)
+        # Same roll-up for FLOPs, skipped when the analysis did not run.
+        if n.flops >= 0:
+            kid_flops = sum(nodes[c].flops for c in children.get(n.id, [])
+                            if nodes[c].flops >= 0)
+            n.own_flops = max(0, n.flops - kid_flops)
 
     # Array identity only survives while a value passes straight from one
     # module to the next. A bare ``jnp``/``jax.nn`` call in between (an
@@ -1090,6 +1142,14 @@ def trace_model(
             if e.dst != main:
                 e.skip = True
 
+    # The root call already covers every child, so its own count is the model
+    # total. Falls back to -1 ("not measured") when the root could not lower.
+    total_flops = -1
+    for n in nodes:
+        if n.depth == 0 and n.flops >= 0:
+            total_flops = n.flops
+            break
+
     return Graph(
         nodes=nodes,
         edges=unique_edges,
@@ -1100,6 +1160,7 @@ def trace_model(
         error=error,
         output_sources=out_sources,
         input_names=_input_names(model, args, kwargs),
+        total_flops=total_flops,
     )
 
 
