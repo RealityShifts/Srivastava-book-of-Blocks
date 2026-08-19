@@ -1078,11 +1078,26 @@ def trace_model(
                 # connects, which also makes its width look unexplained.
                 if op in ("concat", "concatenate", "stack") and tensor is not None:
                     used = {e.src for e in edges if e.dst == node.id}
+                    h_inside = {host.id} | {
+                        n.id for n in nodes
+                        if _is_descendant(n.id, host.id, nodes)}
                     extra = []
                     for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
                         s = producer.get(aid)
                         if (s is None or s == host.id or s == node.id
                                 or s in used or s in kids_ids):
+                            continue
+                        # An input a child already consumed is upstream of the
+                        # join, not an operand - ``x[i+1]`` eaten by
+                        # ``self.warp`` before the concat. Wiring it here would
+                        # draw a second arrow that bypasses that child. The
+                        # consuming edge may leave a node spliced inside the
+                        # producer's subtree (an activation op), so test the
+                        # whole subtree, not just ``s``.
+                        s_inside = {s} | {n.id for n in nodes
+                                          if _is_descendant(n.id, s, nodes)}
+                        if any(e.src in s_inside and e.dst != node.id
+                               and e.dst in h_inside for e in edges):
                             continue
                         # A genuine operand agrees on every axis but the one
                         # being joined. Matching on rank alone is far too loose:
@@ -1092,6 +1107,35 @@ def trace_model(
                         if not _concat_compatible(tsr, tensor):
                             continue
                         extra.append((s, tsr))
+                    # The partner is often a *sibling child's* output rather
+                    # than one of the host's inputs - ``self.changer[i](out)``
+                    # feeding ``jnp.concat([out, skip])`` whose anchor is
+                    # ``self.warp``. Such a sibling is recognisable by a
+                    # dangling subtree: nothing consumes anything it produced.
+                    # Same unambiguity rule as above - wire only a lone,
+                    # shape-compatible match.
+                    if not extra:
+                        for kid in kids_ids:
+                            if kid in (prev, src_kid) or kid in used:
+                                continue
+                            inside_k = {kid} | {
+                                n.id for n in nodes
+                                if _is_descendant(n.id, kid, nodes)}
+                            if prev in inside_k:
+                                continue     # the anchor's own subtree
+                            if any(e.src in inside_k and e.dst not in inside_k
+                                   for e in edges):
+                                continue     # its output already flows on
+                            # A child whose output the host *returns* is not
+                            # dangling - it is the end of the pipeline (the
+                            # final layer), never a join operand.
+                            if produced_by.get(kid, set()) & produced_by.get(
+                                    cand["node"], set()):
+                                continue
+                            kt = next(iter(nodes[kid].outputs), None)
+                            if kt is None or not _concat_compatible(kt, tensor):
+                                continue
+                            extra.append((kid, kt))
                     # ``jnp.concat([out, feat])`` takes exactly one partner. If
                     # several inputs are shape-compatible the trace cannot say
                     # which, and guessing draws confidently wrong arrows - so
