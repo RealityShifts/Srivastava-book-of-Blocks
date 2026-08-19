@@ -364,6 +364,21 @@ class _Op:
     # AST nesting depth. Within one statement the deepest op evaluates first,
     # which is the order the synthesized nodes must chain in.
     depth: int = 0
+    # For a join: the variable names of its operands, as written -
+    # ``jnp.concat([out, skip])`` -> ("out", "skip").
+    operand_names: tuple = ()
+    # True when every named operand is a local intermediate (not a parameter,
+    # not a module output) - ``jnp.stack([gx, gy])`` over meshgrid results.
+    # Such a join has no drawable producers; synthesizing a node for it
+    # invents arrows from unrelated inputs.
+    local_only: bool = False
+    # Those names resolved to the ``self.<attr>`` last assigned to each one
+    # above the op, so operands can be wired exactly instead of guessed.
+    operand_attrs: tuple = ()
+    # True when the op sits inside a module call's arguments -
+    # ``self.fuse(jnp.concat([h, g]))`` - so it runs *before* that call and
+    # feeds it, rather than consuming its result.
+    wrapped: bool = False
 
 
 def _scan_ops(fn: Optional[Callable]) -> list:
@@ -420,6 +435,7 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 index_ctx.add(id(sub))
 
     ops: list = []
+    op_asts: list = []       # the AST node behind each op, for wrapped checks
     for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
             # Index/shape bookkeeping, not dataflow. Either side being a plain
@@ -431,6 +447,7 @@ def _scan_ops(fn: Optional[Callable]) -> list:
             ops.append(_Op(name, sym, name, node.lineno, node.col_offset, 2,
                            in_loop=id(node) in looped,
                            depth=depth_of.get(id(node), 0)))
+            op_asts.append(node)
         elif isinstance(node, ast.Call):
             root = _op_root(node.func)
             if root not in _OP_ROOTS:
@@ -438,11 +455,19 @@ def _scan_ops(fn: Optional[Callable]) -> list:
             attr = getattr(node.func, "attr", None)
             if attr is None or attr.startswith("_"):
                 continue
+            operand_names: tuple = ()
+            if attr in ("concat", "concatenate", "stack") and node.args:
+                first = node.args[0]
+                if isinstance(first, (ast.List, ast.Tuple)):
+                    operand_names = tuple(e.id for e in first.elts
+                                          if isinstance(e, ast.Name))
             ops.append(_Op(
                 attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
                 node.lineno, node.col_offset, len(node.args),
                 in_loop=id(node) in looped,
-                depth=depth_of.get(id(node), 0)))
+                depth=depth_of.get(id(node), 0),
+                operand_names=operand_names))
+            op_asts.append(node)
 
     # ``for layer in self.layers:`` binds a submodule to a plain name, so the
     # call inside the body reads ``layer(x)`` and names no attribute. Map each
@@ -495,6 +520,42 @@ def _scan_ops(fn: Optional[Callable]) -> list:
         prior = [q for ln, cl, q in calls
                  if (ln, cl) < (op.lineno, op.col) and ln != op.lineno]
         op.prev_call = prior[-1] if prior else None
+
+    # Which ``self.<attr>`` call each local variable last came from, so a
+    # join's operands resolve by *name*: ``jnp.concatenate([h, g])`` with
+    # ``h = self.conv_in(...)`` above it names conv_in as an operand even when
+    # conv_in's output also feeds the main path (a skip connection), which no
+    # consumption-based heuristic can see.
+    assigns: list = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        tgt = next((_call_target(sub) for sub in ast.walk(node.value)
+                    if isinstance(sub, ast.Call)
+                    and _call_target(sub) is not None), None)
+        if tgt is not None:
+            assigns.append((node.lineno, node.targets[0].id, tgt))
+    assigns.sort()
+    self_calls = [c for c in ast.walk(tree)
+                  if isinstance(c, ast.Call) and _call_target(c) is not None]
+    fn_def = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)), None)
+    param_names = {a.arg for a in fn_def.args.args} if fn_def else set()
+    for op, op_ast in zip(ops, op_asts):
+        attrs = []
+        for nm in op.operand_names:
+            prior = [a for ln, n, a in assigns
+                     if n == nm and ln < op.lineno]
+            if prior:
+                attrs.append(prior[-1])
+        op.operand_attrs = tuple(attrs)
+        op.local_only = bool(op.operand_names) and not attrs and not any(
+            nm in param_names for nm in op.operand_names)
+        op.wrapped = any(
+            c.lineno == op.lineno
+            and any(sub is op_ast for a in c.args for sub in ast.walk(a))
+            for c in self_calls)
 
     # Statements run top to bottom; within one, the deepest op runs first.
     ops.sort(key=lambda o: (o.lineno, -o.depth, o.col))
@@ -882,6 +943,9 @@ def trace_model(
 
         for op_info in cand["ops"]:
             op, sym, qual = op_info.op, op_info.sym, op_info.qual
+            if (op in ("concat", "concatenate", "stack")
+                    and op_info.local_only):
+                continue    # joins local intermediates: no drawable producers
             # Which child ran in the same statement? That anchors the op in
             # execution order and gives it its operand. Failing that, the
             # nearest module call above it produced the value it consumes.
@@ -1024,6 +1088,49 @@ def trace_model(
             if merged or not anchors:
                 continue                # placed, or cannot be placed reliably
 
+            if (op in ("concat", "concatenate", "stack")
+                    and op_info.wrapped and op_info.operand_attrs):
+                # The anchor call *wraps* the join -
+                # ``self.fuse(jnp.concatenate([h, g]))`` - so the join runs
+                # first and feeds the anchor. Its operands are named in the
+                # source: each name maps to the ``self.<attr>`` last assigned
+                # to it, and that attr to its invocation nearest before the
+                # anchor. This wires a skip operand (``h`` also feeding the
+                # main path) that no consumption-based guess can find.
+                for src_kid in anchors:
+                    named = []
+                    for qual_attr in op_info.operand_attrs:
+                        cands = [k for k in kid_by_attr.get(qual_attr, [])
+                                 if k < src_kid]
+                        if cands:
+                            named.append(max(cands))
+                    named = list(dict.fromkeys(named))
+                    if not named:
+                        continue
+                    joined = next(iter(nodes[src_kid].inputs), None)
+                    node = _new_op_node(host, op, sym, qual, joined,
+                                        order=src_kid - 1)
+                    in_anchor = {src_kid} | {
+                        n.id for n in nodes
+                        if _is_descendant(n.id, src_kid, nodes)}
+                    rewired = False
+                    for k in named:
+                        k_inside = {k} | {n.id for n in nodes
+                                          if _is_descendant(n.id, k, nodes)}
+                        for e in edges:
+                            if e.src in k_inside and e.dst in in_anchor:
+                                e.src = node.id
+                                rewired = True
+                    if not rewired:
+                        edges.append(Edge(node.id, src_kid,
+                                          joined or Tensor((), "")))
+                    for i, k in enumerate(named):
+                        kt = next(iter(nodes[k].outputs), None)
+                        edges.append(Edge(k, node.id,
+                                          kt or joined or Tensor((), ""),
+                                          skip=i > 0))
+                continue
+
             # An elementwise op applied to a child's output - an activation
             # (``x = nnx.leaky_relu(x)`` after ``x = layer(x)``) or a reshape.
             # Splice it onto the wire leaving that child: everything
@@ -1082,31 +1189,52 @@ def trace_model(
                         n.id for n in nodes
                         if _is_descendant(n.id, host.id, nodes)}
                     extra = []
-                    for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
-                        s = producer.get(aid)
-                        if (s is None or s == host.id or s == node.id
-                                or s in used or s in kids_ids):
+                    # Operands named in the source resolve exactly: each name
+                    # maps to the ``self.<attr>`` last assigned to it, and that
+                    # attr to its invocation nearest before the anchor. Skip an
+                    # attr that resolves to the anchor itself - that operand is
+                    # already wired as the anchor.
+                    for qual_attr in op_info.operand_attrs:
+                        pool = kid_by_attr.get(qual_attr, [])
+                        if src_kid in pool:
                             continue
-                        # An input a child already consumed is upstream of the
-                        # join, not an operand - ``x[i+1]`` eaten by
-                        # ``self.warp`` before the concat. Wiring it here would
-                        # draw a second arrow that bypasses that child. The
-                        # consuming edge may leave a node spliced inside the
-                        # producer's subtree (an activation op), so test the
-                        # whole subtree, not just ``s``.
-                        s_inside = {s} | {n.id for n in nodes
-                                          if _is_descendant(n.id, s, nodes)}
-                        if any(e.src in s_inside and e.dst != node.id
-                               and e.dst in h_inside for e in edges):
+                        cands = [k for k in pool
+                                 if k <= src_kid and k not in used
+                                 and k not in (prev, src_kid)]
+                        if not cands:
                             continue
-                        # A genuine operand agrees on every axis but the one
-                        # being joined. Matching on rank alone is far too loose:
-                        # in a pyramid every feature map is rank 4, so all of
-                        # them looked like operands and the join lit up three
-                        # unrelated inputs instead of the one it consumes.
-                        if not _concat_compatible(tsr, tensor):
-                            continue
-                        extra.append((s, tsr))
+                        k = max(cands)
+                        kt = next(iter(nodes[k].outputs), None)
+                        if (kt is not None and _concat_compatible(kt, tensor)
+                                and (k, kt) not in extra):
+                            extra.append((k, kt))
+                    if not extra:
+                        for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
+                            s = producer.get(aid)
+                            if (s is None or s == host.id or s == node.id
+                                    or s in used or s in kids_ids):
+                                continue
+                            # An input a child already consumed is upstream of
+                            # the join, not an operand - ``x[i+1]`` eaten by
+                            # ``self.warp`` before the concat. Wiring it here
+                            # would draw a second arrow that bypasses that
+                            # child. The consuming edge may leave a node
+                            # spliced inside the producer's subtree (an
+                            # activation op), so test the whole subtree.
+                            s_inside = {s} | {n.id for n in nodes
+                                              if _is_descendant(n.id, s, nodes)}
+                            if any(e.src in s_inside and e.dst != node.id
+                                   and e.dst in h_inside for e in edges):
+                                continue
+                            # A genuine operand agrees on every axis but the
+                            # one being joined. Matching on rank alone is far
+                            # too loose: in a pyramid every feature map is rank
+                            # 4, so all of them looked like operands and the
+                            # join lit up three unrelated inputs instead of the
+                            # one it consumes.
+                            if not _concat_compatible(tsr, tensor):
+                                continue
+                            extra.append((s, tsr))
                     # The partner is often a *sibling child's* output rather
                     # than one of the host's inputs - ``self.changer[i](out)``
                     # feeding ``jnp.concat([out, skip])`` whose anchor is
