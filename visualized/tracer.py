@@ -1118,6 +1118,13 @@ def trace_model(
                         for kid in kids_ids:
                             if kid in (prev, src_kid) or kid in used:
                                 continue
+                            # A child invoked *after* the anchor also ran
+                            # after the concat - its output did not exist yet,
+                            # so it cannot be an operand. Without this a later
+                            # head (``mask_head``) that merely looked dangling
+                            # was wired into the trunk it never touches.
+                            if kid > src_kid:
+                                continue
                             inside_k = {kid} | {
                                 n.id for n in nodes
                                 if _is_descendant(n.id, kid, nodes)}
@@ -1170,6 +1177,42 @@ def trace_model(
         out = nodes[e.src].outputs
         if out:
             e.tensor = out[0]
+
+    # A synthesized join that ended up with a single operand is not a join at
+    # all: the source scanner attaches a loop's ``jnp.concat`` to every
+    # invocation of the module it follows, including call sites of the same
+    # attribute *outside* the loop, where no concat actually runs. Splice such
+    # degenerate nodes out - reconnect their lone input to their consumers -
+    # rather than drawing a pass-through circle with one arrow.
+    incoming_of: dict = {}
+    for e in edges:
+        incoming_of.setdefault(e.dst, []).append(e)
+    drop = {n.id for n in nodes
+            if n.kind == "merge" and n.op in ("concat", "concatenate", "stack")
+            and len(incoming_of.get(n.id, [])) < 2}
+    if drop:
+        def _resolve(nid: int) -> Optional[int]:
+            seen_ids = set()
+            while nid in drop:
+                if nid in seen_ids:
+                    return None
+                seen_ids.add(nid)
+                ins = incoming_of.get(nid, [])
+                if not ins:
+                    return None
+                nid = ins[0].src
+            return nid
+        for e in edges:
+            if e.src in drop:
+                src = _resolve(e.src)
+                if src is not None:
+                    e.src = src
+        for o in out_sources:
+            if o["src"] in drop:
+                o["src"] = _resolve(o["src"])
+        edges = [e for e in edges
+                 if e.dst not in drop and e.src not in drop]
+        nodes = [n for n in nodes if n.id not in drop]
 
     # Deduplicate. One module pair can exchange several arrays - an encoder
     # handing a decoder a six-level feature pyramid is one (src, dst) pair and

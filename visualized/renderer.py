@@ -504,7 +504,10 @@ function relayout() {
   // the real endpoint, prefer the descendant that actually carries this edge
   // instead of the subtree's first/last leaf. Without it every input feeding
   // different children of one container lands on the same leaf.
-  const resolve = (id, wantLast, hint) => {
+  const sameShape = (a, b) =>
+    a && b && a.shape && b.shape && a.shape.length === b.shape.length
+    && a.shape.every((v, i) => v === b.shape[i]);
+  const resolve = (id, wantLast, hint, tsr) => {
     let cur = id;
     while (expanded(cur)) {
       const ds = descOf(cur).filter(c => visSet.has(c) && !expanded(c));
@@ -515,9 +518,17 @@ function relayout() {
         // edge. The far endpoint may itself be a container, so accept an edge
         // landing anywhere in its subtree.
         const far = new Set([hint, ...descOf(hint)]);
-        const linked = ds.filter(c => DATA.edges.some(e => wantLast
+        const linkTest = (c, shapeToo) => DATA.edges.some(e => (wantLast
           ? (e.src === c && far.has(e.dst))
-          : (e.dst === c && far.has(e.src))));
+          : (e.dst === c && far.has(e.src)))
+          && (!shapeToo || sameShape(e.tensor, tsr)));
+        // Several edges can join one collapsed container to another (a
+        // feature pyramid), and each must land on the descendant that
+        // consumes *its* tensor - otherwise all of them collapse onto the
+        // first descendant and dedup keeps a single, mislabelled arrow.
+        // Match by shape first; fall back to any recorded link.
+        let linked = tsr ? ds.filter(c => linkTest(c, true)) : [];
+        if (!linked.length) linked = ds.filter(c => linkTest(c, false));
         if (linked.length) pool = linked;
       }
       cur = pick(pool, wantLast);
@@ -540,8 +551,8 @@ function relayout() {
     // Hint with the raw recorded endpoints, not the already-resolved ones, so
     // the two lookups stay independent of each other's outcome.
     const s0 = s, d0 = d;
-    s = isInput(s) ? s : resolve(s, true, d0);    // producer: its last leaf
-    d = resolve(d, false, s0);                   // consumer: its first leaf
+    s = isInput(s) ? s : resolve(s, true, d0, e.tensor);  // producer: last leaf
+    d = resolve(d, false, s0, e.tensor);                  // consumer: first leaf
     if (s === d) continue;
     const k = s + '>' + d;
     if (seen.has(k)) continue;
