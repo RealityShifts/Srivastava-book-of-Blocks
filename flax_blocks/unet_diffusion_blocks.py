@@ -108,6 +108,11 @@ class UpsampleBlock(nnx.Module):
         elif mode == "shuffle":
             self.conv = nnx.Conv(channels, channels * 4, (3, 3),
                                  padding="SAME", rngs=rngs)
+        elif mode == "blur":
+            self.conv = nnx.Conv(channels, channels, (3, 3),
+                                 padding="SAME", rngs=rngs)
+            from .filters import Blur2d
+            self.blur = Blur2d(channels)
         else:
             raise ValueError(mode)
 
@@ -118,6 +123,11 @@ class UpsampleBlock(nnx.Module):
         if self.mode == "interp":
             B, H, W, C = x.shape
             x = jax.image.resize(x, (B, H * 2, W * 2, C), method="nearest")
+            return self.conv(x)
+        if self.mode == "blur":
+            B, H, W, C = x.shape
+            x = jax.image.resize(x, (B, H * 2, W * 2, C), method="nearest")
+            x = self.blur(x)
             return self.conv(x)
         if self.mode == "transpose":
             return self.op(x)
