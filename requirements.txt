@@ -1,8 +1,12 @@
-# Requires Python >=3.11 (jax 0.10.x / flax 0.10.x). System pip3 on macOS is
+# Requires Python >=3.11 (jax 0.11.x / flax 0.12.x). System pip3 on macOS is
 # often 3.9 — use: python3.12 -m venv .venv && source .venv/bin/activate
 torch>=2.0           # for pytorch_blocks/
-jax==0.10.0          # for flax_blocks/
-flax==0.10.2         # for flax_blocks/
+jax==0.11.1          # for flax_blocks/ - GPU: also install the matching
+                     # jax-cuda12-plugin/jax-cuda12-pjrt (see ../requirements.txt)
+flax==0.12.9         # for flax_blocks/ - nnx.Module list-of-submodule
+                     # attributes must be wrapped in nnx.data(...) under this
+                     # version (0.10.2's nnx also calls a jax.core API removed
+                     # in jax 0.11)
 jaxtyping>=0.3.0     # shape/dtype annotations for flax_blocks/ and pytorch_blocks/
 beartype>=0.18       # runtime type checker used when CHECK_TYPES=1 (default)
 einops>=0.8          # required by Rearrange built-in node (web UI + shape_runner)
