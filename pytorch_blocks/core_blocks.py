@@ -236,6 +236,25 @@ def spectral_norm(module: nn.Module, name: str = "weight",
                                   n_power_iterations=n_power_iterations)
 
 
+class L2Norm(nn.Module):
+    """Projects the last axis onto the unit hypersphere ``S^(D-1)``.
+
+    Unlike the statistical norms in this section, this rescales each vector
+    to ``||x|| == 1`` without learnable parameters: direction is preserved,
+    magnitude is discarded. Bounds an otherwise unbounded latent (e.g. the
+    output of a final affine layer) regardless of input scale.
+    """
+
+    def __init__(self, *, epsilon: float = 1e-8) -> None:
+        super().__init__()
+        self.epsilon = epsilon
+
+    @typecheck
+    def forward(self, x: Float[Tensor, "*B D"]) -> Float[Tensor, "*B D"]:
+        return x * torch.rsqrt(
+            torch.sum(x * x, dim=-1, keepdim=True) + self.epsilon)
+
+
 def _build_norm2d(kind: str, num_features: int) -> nn.Module:
     kind = kind.lower()
     if kind == "batch":
@@ -278,6 +297,23 @@ class ResidualBlock(nn.Module):
         self, x: Float[Tensor, "B C_in H W"]
     ) -> Float[Tensor, "B C_out H_out W_out"]:
         return self.act(self.conv2(self.conv1(x)) + self.shortcut(x))
+
+
+class L2Norm(nn.Module):
+    """Projects the last axis onto the unit hypersphere ``S^(D-1)``.
+
+    Parameter-free: direction is preserved, magnitude discarded. Bounds an
+    otherwise unbounded latent regardless of input scale.
+    """
+
+    def __init__(self, *, epsilon: float = 1e-8) -> None:
+        super().__init__()
+        self.epsilon = epsilon
+
+    @typecheck
+    def forward(self, x: Float[Tensor, "... D"]) -> Float[Tensor, "... D"]:
+        return x * torch.rsqrt(
+            torch.sum(x * x, dim=-1, keepdim=True) + self.epsilon)
 
 
 class SkipConnection(nn.Module):

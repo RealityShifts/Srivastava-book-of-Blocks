@@ -98,7 +98,14 @@ class DownsampleBlock(nn.Module):
 
 
 class UpsampleBlock(nn.Module):
-    """Restores spatial resolution via interpolation, transposed conv, or pixel shuffle."""
+    """Restores spatial resolution via interpolation, transposed conv, pixel shuffle, or blur.
+
+    ``"blur"`` is the StyleGAN2 recipe: nearest-neighbour 2x, an anti-alias
+    blur, then the conv. Worth preferring over ``"interp"`` in a generator - a
+    bare nearest-neighbour upsample injects high-frequency stair-stepping that
+    the following conv then bakes in as texture, and the blur is what removes
+    it before that happens.
+    """
 
     def __init__(self, channels: int, mode: str = "interp") -> None:
         super().__init__()
@@ -113,6 +120,13 @@ class UpsampleBlock(nn.Module):
             self.op = nn.Sequential(
                 nn.Conv2d(channels, channels * 4, 3, 1, 1),
                 nn.PixelShuffle(2),
+            )
+        elif mode == "blur":
+            from .filters import Blur2d       # local: keeps filters optional
+            self.op = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                Blur2d(channels),
+                nn.Conv2d(channels, channels, 3, 1, 1),
             )
         else:
             raise ValueError(mode)

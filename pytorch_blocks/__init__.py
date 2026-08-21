@@ -41,6 +41,7 @@ from . import (
     multimodal_blocks,
     efficient_blocks,
     specialized_blocks,
+    filters,
 )
 
 __all__ = [
@@ -61,4 +62,5 @@ __all__ = [
     "multimodal_blocks",
     "efficient_blocks",
     "specialized_blocks",
+    "filters",
 ]
