@@ -275,7 +275,7 @@ code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
            skip / residual</div>
       <div><i style="border-color:var(--out)"></i> model output</div>
       <div id="classkey"></div>
-      <div style="margin-top:4px">scroll = zoom &middot; drag / arrows = pan
+      <div style="margin-top:4px">scroll / drag / arrows = pan &middot; shift+scroll / +/- = zoom
            &middot; click = inspect</div>
     </div>
   </div>
@@ -1259,13 +1259,29 @@ addEventListener('mouseup', () => {
 });
 svg.addEventListener('wheel', e => {
   e.preventDefault();
+  // Plain scroll pans; shift+scroll zooms on the cursor, same modifier
+  // convention as Google Maps and most drawing tools. A trackpad pinch
+  // also lands here as a wheel event with ctrlKey set - that's the
+  // browser's own signal for "this gesture means zoom, not scroll."
+  if (e.shiftKey || e.ctrlKey) {
+    const r = svg.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    const nk = Math.min(3, Math.max(0.12, k * f));
+    tx = mx - (mx - tx) * (nk / k); ty = my - (my - ty) * (nk / k); k = nk;
+  } else {
+    tx -= e.deltaX; ty -= e.deltaY;
+  }
+  apply();
+}, { passive: false });
+
+function zoomBy(f) {
   const r = svg.getBoundingClientRect();
-  const mx = e.clientX - r.left, my = e.clientY - r.top;
-  const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const mx = r.width / 2, my = r.height / 2;
   const nk = Math.min(3, Math.max(0.12, k * f));
   tx = mx - (mx - tx) * (nk / k); ty = my - (my - ty) * (nk / k); k = nk;
   apply();
-}, { passive: false });
+}
 
 // Expand a container in place. Its children join the main dagre pass and stay
 // wired to the rest of the model by their real edges; the frame drawn around
@@ -1529,6 +1545,8 @@ window.addEventListener('keydown', e => {
     reveal(selected);
     return;
   }
+  if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomBy(1.12); return; }
+  if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomBy(1 / 1.12); return; }
   if (e.key === 'Escape') { selected = null; applySelection(); return; }
   // Enter/Space opens the selected container into a panel - the keyboard
   // equivalent of its +/- button.
