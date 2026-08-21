@@ -18,7 +18,9 @@ Flax NNX::
     x = jax.random.normal(jax.random.key(0), (1, 128, 128, 3))
     visualize(model, x, path="model.html", open_browser=True)
 
-PyTorch - any ``nn.Module``, not just the blocks in this repo::
+PyTorch - any ``nn.Module``, not just the blocks in this repo. This writes two
+files: the module-level graph at the given path, and torchvista's
+operation-level graph beside it as ``rn18.torchvista.html``::
 
     import torch
     from Blocks.visualized import visualize_torch
@@ -49,6 +51,8 @@ _TORCH_EXPORTS = {
     "summary_torch": "summary",
     "trace_model_torch": "trace_model",
     "visualize_notebook_torch": "visualize_notebook",
+    "visualize_torchvista": "visualize_torchvista",
+    "torchvista_path_for": "torchvista_path_for",
 }
 
 
@@ -72,6 +76,8 @@ __all__ = [
     "summary_torch",
     "trace_model_torch",
     "visualize_notebook_torch",
+    "visualize_torchvista",
+    "torchvista_path_for",
     "render_html",
     "save_html",
     "Graph",
