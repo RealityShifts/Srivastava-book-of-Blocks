@@ -214,9 +214,11 @@ class InstanceNorm(nnx.Module):
     """
 
     def __init__(self, num_features: int, *, epsilon: float = 1e-5,
+                 use_bias: bool = True, use_scale: bool = True,
                  rngs: nnx.Rngs) -> None:
         self.norm = nnx.GroupNorm(num_features, num_groups=num_features,
-                                  epsilon=epsilon, rngs=rngs)
+                                  epsilon=epsilon, use_bias=use_bias,
+                                  use_scale=use_scale, rngs=rngs)
 
     @typecheck
     def __call__(
@@ -318,8 +320,8 @@ class SPADE(nnx.Module):
 
     def __init__(self, num_features: int, label_nc: int, hidden: int = 128,
                  *, rngs: nnx.Rngs) -> None:
-        self.norm = nnx.BatchNorm(num_features, use_bias=False, use_scale=False,
-                                  rngs=rngs)
+        self.norm = InstanceNorm(num_features, use_bias=False, use_scale=False,
+                                 rngs=rngs)
         self.shared = nnx.Conv(label_nc, hidden, (3, 3), padding="SAME", rngs=rngs)
         self.gamma = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
         self.beta = nnx.Conv(hidden, num_features, (3, 3), padding="SAME", rngs=rngs)
@@ -346,7 +348,11 @@ def build_norm(kind: NormLike, num_features: int, *,
             f"unknown norm '{kind}', choose from {[n.value for n in Norm]}"
         ) from None
     if kind is Norm.BATCH:
-        return nnx.BatchNorm(num_features, rngs=rngs)
+        # BatchNorm's running-stat mutation crosses trace boundaries when the
+        # generator is merged/called inside another jit'd function's grad
+        # (see model.train_multi_gpu.disc_step) - InstanceNorm has no running
+        # state, so there's nothing to mutate and no TraceContextError.
+        return InstanceNorm(num_features, rngs=rngs)
     if kind is Norm.LAYER:
         return nnx.LayerNorm(num_features, rngs=rngs)
     if kind is Norm.RMS:
