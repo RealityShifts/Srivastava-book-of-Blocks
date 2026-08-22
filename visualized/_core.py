@@ -813,6 +813,57 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
                 tip[src_kid] = node.id
 
+    def _outside(nid: int, container_id: int) -> bool:
+        """Does ``nid`` sit outside ``container_id``'s own subtree?
+
+        An input pill (negative id) is outside everything - it has no parent
+        chain to walk.
+        """
+        if nid < 0:
+            return True
+        if nid == container_id:
+            return False
+        return not _is_descendant(nid, container_id, nodes)
+
+    # A wrapper with no computation of its own (``ConvBlock``'s Conv->Norm->
+    # Act, or a whole submodule like ``Synthesis``) shares its pre/post hooks'
+    # view of the world with its innermost child: its own input is the exact
+    # same tensor its first child consumes. So when a child's edge exists only
+    # because of a repair above - the id() fallback a few lines up, or an op
+    # synthesized from bare source such as ``torch.cat`` - that repair fixes
+    # up the child alone. The wrapper's own pill, which never had a real edge
+    # to begin with (its pre_hook saw the same "no known producer" the child's
+    # did), is left looking disconnected even though its insides are wired
+    # correctly. Mirror every edge onto each ancestor it crosses into, so a
+    # collapsed container reads exactly as connected as its expanded insides
+    # are - this is exactly what already happens by chance whenever a child's
+    # input arrives via a real hooked module instead of a bare op, since then
+    # both the child *and* its parent independently see the same real producer.
+    mirrored: list = []
+    seen_mirror: set = set()
+    for e in edges:
+        p = nodes[e.dst].parent
+        while p is not None and _outside(e.src, p):
+            # The root receiving the model's own input is deliberately not an
+            # edge (see the matching skip in the pre-hook) - preserve that.
+            if not (e.src < 0 and nodes[p].depth == 0):
+                key = (e.src, p)
+                if key not in seen_mirror:
+                    seen_mirror.add(key)
+                    mirrored.append(Edge(e.src, p, e.tensor,
+                                        skip=e.skip, inferred=e.inferred))
+            p = nodes[p].parent
+        if e.src >= 0:
+            p = nodes[e.src].parent
+            while p is not None and _outside(e.dst, p):
+                key = (p, e.dst)
+                if key not in seen_mirror:
+                    seen_mirror.add(key)
+                    mirrored.append(Edge(p, e.dst, e.tensor,
+                                        skip=e.skip, inferred=e.inferred))
+                p = nodes[p].parent
+    edges.extend(mirrored)
+
     # An edge carries whatever its source emits. Splicing an op into the flow
     # reassigns ``src`` on the edges downstream of it, but those edges kept the
     # tensor recorded for the *old* producer - so an arrow out of an activation
