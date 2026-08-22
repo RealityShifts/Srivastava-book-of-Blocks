@@ -308,6 +308,21 @@ class _Op:
     # AST nesting depth. Within one statement the deepest op evaluates first,
     # which is the order the synthesized nodes must chain in.
     depth: int = 0
+    # For a join, the local names it was handed: ``jnp.concat([out, skip])``
+    # -> ``("out", "skip")``.
+    operand_names: tuple = ()
+    # True when every named operand is a local intermediate (not a parameter,
+    # not a module output) - ``torch.stack([gx, gy])`` over meshgrid results.
+    # Such a join has no drawable producers; synthesizing a node for it
+    # invents arrows from unrelated inputs.
+    local_only: bool = False
+    # Those names resolved to the ``self.<attr>`` last assigned to each one
+    # above the op, so operands can be wired exactly instead of guessed.
+    operand_attrs: tuple = ()
+    # True when the op sits inside a module call's arguments -
+    # ``self.fuse(torch.cat([h, g]))`` - so it runs *before* that call and
+    # feeds it, rather than consuming its result.
+    wrapped: bool = False
 
 
 def _scan_ops(fn: Optional[Callable]) -> list:
@@ -364,6 +379,7 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 index_ctx.add(id(sub))
 
     ops: list = []
+    op_asts: list = []       # the AST node behind each op, for wrapped checks
     for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
             # Index/shape bookkeeping, not dataflow. Either side being a plain
@@ -375,6 +391,7 @@ def _scan_ops(fn: Optional[Callable]) -> list:
             ops.append(_Op(name, sym, name, node.lineno, node.col_offset, 2,
                            in_loop=id(node) in looped,
                            depth=depth_of.get(id(node), 0)))
+            op_asts.append(node)
         elif isinstance(node, ast.Call):
             root = _op_root(node.func)
             if root not in _OP_ROOTS:
@@ -382,11 +399,22 @@ def _scan_ops(fn: Optional[Callable]) -> list:
             attr = getattr(node.func, "attr", None)
             if attr is None or attr.startswith("_"):
                 continue
+            # A join is handed a list; the names in it are what identify its
+            # operands, and a name resolves to a module far more reliably than
+            # any shape-matching heuristic can.
+            operand_names: tuple = ()
+            if attr in ("concat", "concatenate", "cat", "stack") and node.args:
+                first = node.args[0]
+                if isinstance(first, (ast.List, ast.Tuple)):
+                    operand_names = tuple(e.id for e in first.elts
+                                          if isinstance(e, ast.Name))
             ops.append(_Op(
                 attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
                 node.lineno, node.col_offset, len(node.args),
                 in_loop=id(node) in looped,
-                depth=depth_of.get(id(node), 0)))
+                depth=depth_of.get(id(node), 0),
+                operand_names=operand_names))
+            op_asts.append(node)
 
     # ``for layer in self.layers:`` binds a submodule to a plain name, so the
     # call inside the body reads ``layer(x)`` and names no attribute. Map each
@@ -439,6 +467,42 @@ def _scan_ops(fn: Optional[Callable]) -> list:
         prior = [q for ln, cl, q in calls
                  if (ln, cl) < (op.lineno, op.col) and ln != op.lineno]
         op.prev_call = prior[-1] if prior else None
+
+    # Which ``self.<attr>`` call each local variable last came from, so a
+    # join's operands resolve by *name*: ``torch.cat([out, skip])`` with
+    # ``skip = self.warp(...)`` above it names warp as an operand even when
+    # warp's output also feeds the main path (a skip connection), which no
+    # consumption-based heuristic can see.
+    assigns: list = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        tgt = next((_call_target(sub) for sub in ast.walk(node.value)
+                    if isinstance(sub, ast.Call)
+                    and _call_target(sub) is not None), None)
+        if tgt is not None:
+            assigns.append((node.lineno, node.targets[0].id, tgt))
+    assigns.sort()
+    self_calls = [c for c in ast.walk(tree)
+                  if isinstance(c, ast.Call) and _call_target(c) is not None]
+    fn_def = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)), None)
+    param_names = {a.arg for a in fn_def.args.args} if fn_def else set()
+    for op, op_ast in zip(ops, op_asts):
+        attrs = []
+        for nm in op.operand_names:
+            prior = [a for ln, n, a in assigns
+                     if n == nm and ln < op.lineno]
+            if prior:
+                attrs.append(prior[-1])
+        op.operand_attrs = tuple(attrs)
+        op.local_only = bool(op.operand_names) and not attrs and not any(
+            nm in param_names for nm in op.operand_names)
+        op.wrapped = any(
+            c.lineno == op.lineno
+            and any(sub is op_ast for a in c.args for sub in ast.walk(a))
+            for c in self_calls)
 
     # Statements run top to bottom; within one, the deepest op runs first.
     ops.sort(key=lambda o: (o.lineno, -o.depth, o.col))
@@ -602,6 +666,8 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
         for op_info in cand["ops"]:
             op, sym, qual = op_info.op, op_info.sym, op_info.qual
+            if op in _JOIN_OPS and op_info.local_only:
+                continue    # joins local intermediates: no drawable producers
             # Which child ran in the same statement? That anchors the op in
             # execution order and gives it its operand. Failing that, the
             # nearest module call above it produced the value it consumes.
@@ -749,6 +815,48 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
             if merged or not anchors:
                 continue                # placed, or cannot be placed reliably
 
+            if op in _JOIN_OPS and op_info.wrapped and op_info.operand_attrs:
+                # The anchor call *wraps* the join -
+                # ``self.fuse(torch.cat([h, g]))`` - so the join runs first and
+                # feeds the anchor. Its operands are named in the source: each
+                # name maps to the ``self.<attr>`` last assigned to it, and that
+                # attr to its invocation nearest before the anchor. This wires a
+                # skip operand (``h`` also feeding the main path) that no
+                # consumption-based guess can find.
+                for src_kid in anchors:
+                    named = []
+                    for qual_attr in op_info.operand_attrs:
+                        cands = [k for k in kid_by_attr.get(qual_attr, [])
+                                 if k < src_kid]
+                        if cands:
+                            named.append(max(cands))
+                    named = list(dict.fromkeys(named))
+                    if not named:
+                        continue
+                    joined = next(iter(nodes[src_kid].inputs), None)
+                    node = _new_op_node(host, op, sym, qual, joined,
+                                        order=src_kid - 1)
+                    in_anchor = {src_kid} | {
+                        n.id for n in nodes
+                        if _is_descendant(n.id, src_kid, nodes)}
+                    rewired = False
+                    for k in named:
+                        k_inside = {k} | {n.id for n in nodes
+                                          if _is_descendant(n.id, k, nodes)}
+                        for e in edges:
+                            if e.src in k_inside and e.dst in in_anchor:
+                                e.src = node.id
+                                rewired = True
+                    if not rewired:
+                        edges.append(Edge(node.id, src_kid,
+                                          joined or Tensor((), "")))
+                    for i, k in enumerate(named):
+                        kt = next(iter(nodes[k].outputs), None)
+                        edges.append(Edge(k, node.id,
+                                          kt or joined or Tensor((), ""),
+                                          skip=i > 0))
+                continue
+
             # An elementwise op applied to a child's output - an activation
             # (``x = nnx.leaky_relu(x)`` after ``x = layer(x)``) or a reshape.
             # Splice it onto the wire leaving that child: everything
@@ -804,10 +912,47 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 if op in _JOIN_OPS and tensor is not None:
                     used = {e.src for e in edges if e.dst == node.id}
                     extra = []
-                    for aid, tsr in zip(cand["in_ids"], cand["in_arrays"]):
+                    # Prefer the operands the *source* names. ``skip =
+                    # self.warp(...)`` then ``torch.cat([out, skip])`` says
+                    # outright that warp's latest call is the partner - no
+                    # shape or consumption heuristic can establish that when
+                    # warp also feeds the main path.
+                    h_inside = {host.id} | {n.id for n in nodes
+                                            if _is_descendant(n.id, host.id,
+                                                              nodes)}
+                    for qual_attr in op_info.operand_attrs:
+                        pool = kid_by_attr.get(qual_attr, [])
+                        if src_kid in pool:
+                            continue    # that operand *is* the anchor
+                        cands = [k for k in pool
+                                 if k <= src_kid and k not in used
+                                 and k not in (prev, src_kid)]
+                        if not cands:
+                            continue
+                        k = max(cands)
+                        kt = next(iter(nodes[k].outputs), None)
+                        if (kt is not None
+                                and _concat_compatible(kt, tensor, channel_axis)
+                                and (k, kt) not in extra):
+                            extra.append((k, kt))
+                    for aid, tsr in (
+                            [] if extra
+                            else zip(cand["in_ids"], cand["in_arrays"])):
                         s = producer.get(aid)
                         if (s is None or s == host.id or s == node.id
                                 or s in used or s in kids_ids):
+                            continue
+                        # An input a child already consumed is upstream of the
+                        # join, not an operand - ``x[i+1]`` eaten by
+                        # ``self.warp`` before the concat. Wiring it here would
+                        # draw a second arrow bypassing that child. The
+                        # consuming edge may leave a node spliced inside the
+                        # producer's subtree (an activation op), so test the
+                        # whole subtree.
+                        s_inside = {s} | {n.id for n in nodes
+                                          if _is_descendant(n.id, s, nodes)}
+                        if any(e.src in s_inside and e.dst != node.id
+                               and e.dst in h_inside for e in edges):
                             continue
                         # A genuine operand agrees on every axis but the one
                         # being joined. Matching on rank alone is far too loose:
@@ -836,44 +981,47 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
                 tip[src_kid] = node.id
 
-    # A container normally gets its own incoming edge for free: its pre-hook
-    # sees the same producer its first child does, so both record one. That
-    # breaks only when the value arrived from something the trace never
-    # intercepted - a bare ``torch.cat``/``jnp.concatenate`` - because the
-    # repairs above (the id() fallback, and the op synthesis) rewire the *leaf*
-    # that consumed it and nothing else. The container is then the only node in
-    # its own subtree with no way in, and renders as a detached box even though
-    # its insides are wired correctly (every ``Synthesis.mixer.N`` did).
+    # A synthesized join that resolved fewer than two operands is not a join.
+    # ``torch.cat`` inside a loop body attaches to every call its ``prev_call``
+    # made, including the one before the loop that no concat followed - so an
+    # iteration-0 phantom appears, drawing a single arrow in and out and
+    # reporting an unwidened shape. Drop those: a node with one input is
+    # exactly the wrapper the flow already passes through.
     #
-    # Fill exactly those holes: a container with no incoming edge borrows the
-    # one entering its earliest descendant from outside the subtree. Mirroring
-    # every edge onto every ancestor it crosses would also close them, but it
-    # invents hundreds of arrows the trace never saw and turns a collapsed
-    # group into a hairball.
-    inside_of: dict = {}
-    for n in nodes:
-        p = n.parent
-        while p is not None:
-            inside_of.setdefault(p, set()).add(n.id)
-            p = nodes[p].parent
-
-    has_in = {e.dst for e in edges}
-    holes: list = []
-    for n in nodes:
-        subtree = inside_of.get(n.id)
-        if not subtree or n.id in has_in:
-            continue                      # a leaf, or already reachable
-        entering = [e for e in edges
-                    if e.dst in subtree
-                    and (e.src < 0 or e.src not in subtree)
-                    and e.src != n.id]
-        if not entering:
-            continue
-        # The edge into the earliest descendant is the one that fed the block.
-        best = min(entering, key=lambda e: (nodes[e.dst].order, e.dst))
-        holes.append(Edge(best.src, n.id, best.tensor,
-                          skip=best.skip, inferred=True))
-    edges.extend(holes)
+    # Containers are deliberately left as they are. One often has no incoming
+    # edge of its own - a bare op fed its first child, and only that child was
+    # rewired - but the renderer resolves a collapsed container to its
+    # descendants' edges at draw time, so nothing is missing on screen. The
+    # Flax graph is built the same way.
+    join_ids = {n.id for n in nodes
+                if n.kind == "merge" and n.op in _JOIN_OPS}
+    phantom: set = set()
+    if join_ids:
+        fan_in: dict = {}
+        for e in edges:
+            if e.dst in join_ids:
+                fan_in.setdefault(e.dst, set()).add(e.src)
+        phantom = {i for i in join_ids if len(fan_in.get(i, ())) < 2}
+        if phantom:
+            # Reconnect through the dropped node so the chain stays whole.
+            bypass: list = []
+            for p in phantom:
+                srcs = [e.src for e in edges if e.dst == p]
+                for e in edges:
+                    if e.src == p:
+                        for s in srcs:
+                            bypass.append(Edge(s, e.dst, e.tensor,
+                                               skip=e.skip,
+                                               inferred=e.inferred))
+                for o in out_sources:
+                    if o["src"] == p and srcs:
+                        o["src"] = srcs[0]
+            edges[:] = [e for e in edges
+                        if e.src not in phantom and e.dst not in phantom]
+            edges.extend(bypass)
+    # The nodes themselves are dropped at the very end: ``nodes`` is indexed by
+    # id (``nodes[e.src]``) all through the rest of this function, so shrinking
+    # it here would shift every id past the first removal.
 
     # An edge carries whatever its source emits. Splicing an op into the flow
     # reassigns ``src`` on the edges downstream of it, but those edges kept the
@@ -938,6 +1086,11 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
         for e in group:
             if e.dst != main:
                 e.skip = True
+    # Safe here: every id-indexed lookup above is done, and the renderer keys
+    # nodes by id rather than by position, so the gaps left behind are fine.
+    if phantom:
+        nodes[:] = [n for n in nodes if n.id not in phantom]
+
     return unique_edges
 
 
