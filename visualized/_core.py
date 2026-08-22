@@ -445,24 +445,36 @@ def _scan_ops(fn: Optional[Callable]) -> list:
     return ops
 
 
-def _concat_axis(a: Tensor, b: Tensor) -> Optional[int]:
+def _concat_axis(a: Tensor, b: Tensor,
+                 channel_axis: int = -1) -> Optional[int]:
     """The single axis on which ``a`` and ``b`` differ, if there is exactly one.
 
     Two arrays can be concatenated only when they agree on every other axis, so
-    a lone mismatch identifies the join axis. Equal shapes are joinable on any
-    axis; report the last, which is the overwhelmingly common channel concat.
+    a lone mismatch identifies the join axis.
+
+    Equal shapes are joinable on *any* axis, and that case is the common one -
+    a residual/skip concat of two same-width feature maps. Which axis is meant
+    then depends on the memory layout, so ``channel_axis`` has to say: ``-1``
+    for the Flax tracer's NHWC, ``1`` for the PyTorch tracer's NCHW. Assuming
+    channels-last for both is what made every ``torch.cat`` in the PyTorch
+    graph report a doubled *width* - ``(1,256,64,64)`` joining to
+    ``(1,256,64,128)`` instead of ``(1,512,64,64)``.
     """
     if len(a.shape) != len(b.shape) or not a.shape:
         return None
     diff = [i for i, (x, y) in enumerate(zip(a.shape, b.shape)) if x != y]
     if not diff:
-        return len(a.shape) - 1
+        # A rank-2 (B, D) activation has no spatial axes, so the channel axis
+        # is its last one whatever the image layout is.
+        if len(a.shape) < 3:
+            return len(a.shape) - 1
+        return channel_axis % len(a.shape)
     return diff[0] if len(diff) == 1 else None
 
 
-def _concat_compatible(a: Tensor, b: Tensor) -> bool:
+def _concat_compatible(a: Tensor, b: Tensor, channel_axis: int = -1) -> bool:
     """Could ``a`` and ``b`` be operands of the same concatenate?"""
-    return _concat_axis(a, b) is not None
+    return _concat_axis(a, b, channel_axis) is not None
 
 
 
@@ -471,7 +483,7 @@ def _concat_compatible(a: Tensor, b: Tensor) -> bool:
 # ---------------------------------------------------------------------------
 
 def finalize_graph(nodes, edges, producer, child_of, out_sources,
-                   merge_candidates):
+                   merge_candidates, channel_axis: int = -1):
     """Turn a raw trace into the graph the renderer draws.
 
     Everything here is pure bookkeeping over the recorded nodes and edges -
@@ -479,6 +491,12 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     broke it, synthesizing nodes for those ops, and marking skip edges. None of
     it touches an array, which is why the JAX and PyTorch tracers share it
     verbatim rather than growing two copies that drift apart.
+
+    ``channel_axis`` is the one thing the two frameworks genuinely disagree
+    about: Flax is NHWC (``-1``), PyTorch is NCHW (``1``). It only matters for
+    concatenation - which axis a join of two equal-shaped feature maps widens -
+    but getting it wrong silently reports every skip concat as doubling the
+    image width instead of the channel count.
 
     ``nodes``, ``edges`` and ``out_sources`` are mutated in place; the
     deduplicated edge list is returned.
@@ -621,14 +639,19 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 # ``min(kids_ids)`` alone assumes the first child consumes the
                 # join, which is not true in general.
                 joined = None
-                op_widths = [t.shape[-1] for t in src_tensor.values()
+                # Widths are measured on the axis the join actually widens, so
+                # this recognises the concatenated array under either layout.
+                def _cax(t):
+                    return channel_axis % len(t.shape) if len(t.shape) >= 3 \
+                        else len(t.shape) - 1
+                op_widths = [t.shape[_cax(t)] for t in src_tensor.values()
                              if t is not None and t.shape]
                 total = sum(op_widths) if op_widths else None
                 for kid in sorted(kids_ids):
                     cand_t = next(iter(nodes[kid].inputs), None)
                     if cand_t is None or not cand_t.shape:
                         continue
-                    if total is not None and cand_t.shape[-1] == total:
+                    if total is not None and cand_t.shape[_cax(cand_t)] == total:
                         joined = cand_t
                         break
                 if joined is None and kids_ids:
@@ -791,7 +814,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                         # in a pyramid every feature map is rank 4, so all of
                         # them looked like operands and the join lit up three
                         # unrelated inputs instead of the one it consumes.
-                        if not _concat_compatible(tsr, tensor):
+                        if not _concat_compatible(tsr, tensor, channel_axis):
                             continue
                         extra.append((s, tsr))
                     # ``jnp.concat([out, feat])`` takes exactly one partner. If
@@ -805,7 +828,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                         # The join widens the concat axis; the recorded output
                         # was read off a consumer and is often the pre-join
                         # shape. Correct it from the operands actually wired.
-                        ax = _concat_axis(tsr, tensor)
+                        ax = _concat_axis(tsr, tensor, channel_axis)
                         if ax is not None:
                             dims = list(tensor.shape)
                             dims[ax] = tensor.shape[ax] + tsr.shape[ax]
@@ -813,56 +836,44 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
                 tip[src_kid] = node.id
 
-    def _outside(nid: int, container_id: int) -> bool:
-        """Does ``nid`` sit outside ``container_id``'s own subtree?
-
-        An input pill (negative id) is outside everything - it has no parent
-        chain to walk.
-        """
-        if nid < 0:
-            return True
-        if nid == container_id:
-            return False
-        return not _is_descendant(nid, container_id, nodes)
-
-    # A wrapper with no computation of its own (``ConvBlock``'s Conv->Norm->
-    # Act, or a whole submodule like ``Synthesis``) shares its pre/post hooks'
-    # view of the world with its innermost child: its own input is the exact
-    # same tensor its first child consumes. So when a child's edge exists only
-    # because of a repair above - the id() fallback a few lines up, or an op
-    # synthesized from bare source such as ``torch.cat`` - that repair fixes
-    # up the child alone. The wrapper's own pill, which never had a real edge
-    # to begin with (its pre_hook saw the same "no known producer" the child's
-    # did), is left looking disconnected even though its insides are wired
-    # correctly. Mirror every edge onto each ancestor it crosses into, so a
-    # collapsed container reads exactly as connected as its expanded insides
-    # are - this is exactly what already happens by chance whenever a child's
-    # input arrives via a real hooked module instead of a bare op, since then
-    # both the child *and* its parent independently see the same real producer.
-    mirrored: list = []
-    seen_mirror: set = set()
-    for e in edges:
-        p = nodes[e.dst].parent
-        while p is not None and _outside(e.src, p):
-            # The root receiving the model's own input is deliberately not an
-            # edge (see the matching skip in the pre-hook) - preserve that.
-            if not (e.src < 0 and nodes[p].depth == 0):
-                key = (e.src, p)
-                if key not in seen_mirror:
-                    seen_mirror.add(key)
-                    mirrored.append(Edge(e.src, p, e.tensor,
-                                        skip=e.skip, inferred=e.inferred))
+    # A container normally gets its own incoming edge for free: its pre-hook
+    # sees the same producer its first child does, so both record one. That
+    # breaks only when the value arrived from something the trace never
+    # intercepted - a bare ``torch.cat``/``jnp.concatenate`` - because the
+    # repairs above (the id() fallback, and the op synthesis) rewire the *leaf*
+    # that consumed it and nothing else. The container is then the only node in
+    # its own subtree with no way in, and renders as a detached box even though
+    # its insides are wired correctly (every ``Synthesis.mixer.N`` did).
+    #
+    # Fill exactly those holes: a container with no incoming edge borrows the
+    # one entering its earliest descendant from outside the subtree. Mirroring
+    # every edge onto every ancestor it crosses would also close them, but it
+    # invents hundreds of arrows the trace never saw and turns a collapsed
+    # group into a hairball.
+    inside_of: dict = {}
+    for n in nodes:
+        p = n.parent
+        while p is not None:
+            inside_of.setdefault(p, set()).add(n.id)
             p = nodes[p].parent
-        if e.src >= 0:
-            p = nodes[e.src].parent
-            while p is not None and _outside(e.dst, p):
-                key = (p, e.dst)
-                if key not in seen_mirror:
-                    seen_mirror.add(key)
-                    mirrored.append(Edge(p, e.dst, e.tensor,
-                                        skip=e.skip, inferred=e.inferred))
-                p = nodes[p].parent
-    edges.extend(mirrored)
+
+    has_in = {e.dst for e in edges}
+    holes: list = []
+    for n in nodes:
+        subtree = inside_of.get(n.id)
+        if not subtree or n.id in has_in:
+            continue                      # a leaf, or already reachable
+        entering = [e for e in edges
+                    if e.dst in subtree
+                    and (e.src < 0 or e.src not in subtree)
+                    and e.src != n.id]
+        if not entering:
+            continue
+        # The edge into the earliest descendant is the one that fed the block.
+        best = min(entering, key=lambda e: (nodes[e.dst].order, e.dst))
+        holes.append(Edge(best.src, n.id, best.tensor,
+                          skip=best.skip, inferred=True))
+    edges.extend(holes)
 
     # An edge carries whatever its source emits. Splicing an op into the flow
     # reassigns ``src`` on the edges downstream of it, but those edges kept the

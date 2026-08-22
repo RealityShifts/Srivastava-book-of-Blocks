@@ -383,8 +383,11 @@ def trace_model(
                 "src": producer.get(id(leaf)),
             })
 
+    # channel_axis=1: everything here is NCHW, so a concat of two equal-shaped
+    # feature maps widens dim 1. The default (-1) is the Flax tracer's NHWC.
     unique_edges = finalize_graph(nodes, edges, producer, child_of,
-                                  out_sources, merge_candidates)
+                                  out_sources, merge_candidates,
+                                  channel_axis=1)
 
     return Graph(
         nodes=nodes,
