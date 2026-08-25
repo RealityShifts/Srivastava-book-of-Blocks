@@ -170,6 +170,69 @@ _INTERESTING = (
 )
 
 
+def _scan_ops_deep(fn, cls=None, _seen=None) -> list:
+    """``_scan_ops``, following calls into the class's own helper methods.
+
+    ``_scan_ops`` reads exactly one function body, so an op written in a helper
+    that ``forward`` calls - ``self.resize(x)`` doing ``F.interpolate`` - is
+    invisible to it, and the graph silently omits a real step in the forward
+    pass. Submodule calls are *not* followed: those are ``nn.Module``s the
+    runtime trace already records as their own nodes, and inlining them would
+    draw every op twice.
+
+    A helper's ops are renumbered onto the call site's line so they order
+    against the surrounding module calls the way they actually execute; within
+    one helper their relative order is preserved by a fractional column. The
+    ``_seen`` set makes recursion (direct or mutual) terminate.
+    """
+    ops = _scan_ops(fn)
+    if cls is None:
+        return ops
+
+    fn_raw = getattr(fn, "__wrapped__", fn)
+    _seen = set() if _seen is None else _seen
+    _seen.add(getattr(fn_raw, "__qualname__", repr(fn_raw)))
+
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn_raw)))
+    except (OSError, TypeError, SyntaxError, IndentationError):
+        return ops
+
+    # ``self.<attr>(...)`` where <attr> is a plain method on the class - not a
+    # submodule, not a parameter. ``inspect.isfunction`` on the *class*
+    # attribute is what separates the two: a submodule is an instance
+    # attribute and does not appear here at all.
+    inlined: list = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        if _op_root(call.func) != "self":
+            continue
+        attr = getattr(call.func, "attr", None)
+        if attr is None or attr.startswith("__"):
+            continue
+        target = getattr(cls, attr, None)
+        if target is None or not inspect.isfunction(target):
+            continue
+        if getattr(target, "__qualname__", repr(target)) in _seen:
+            continue
+        sub = _scan_ops_deep(target, cls, _seen)
+        if not sub:
+            continue
+        # Order the helper's ops among the caller's: same line as the call,
+        # with a fractional column so they stay in their own source order and
+        # land just before whatever else sits on that line.
+        base_col = call.col_offset
+        for i, op in enumerate(sorted(sub, key=lambda o: (o.lineno, o.col))):
+            op.lineno = call.lineno
+            op.col = base_col + (i + 1) / (len(sub) + 1.0)
+            inlined.append(op)
+
+    if not inlined:
+        return ops
+    return sorted(ops + inlined, key=lambda o: (o.lineno, o.col))
+
+
 def _is_descendant(node_id: int, ancestor_id: int, nodes: list) -> bool:
     """Is ``node_id`` inside ``ancestor_id``'s subtree?"""
     cur = nodes[node_id].parent
@@ -812,6 +875,47 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                         tip[b] = node.id
                     merged = True
 
+            if not merged and not anchors and not op_info.after \
+                    and not op_info.prev_call and kids_ids:
+                # A unary op applied to the host's own input, before any child
+                # has run: ``x = self.resize(x)`` (an inlined ``F.interpolate``)
+                # or a bare ``x = x.float()`` at the top of a forward. There is
+                # no prior child to anchor to, so the join branch above does not
+                # apply and the op would be dropped - which is what hid the
+                # motion encoder's downscale from the graph entirely. Splice it
+                # between the host's inputs and the first child instead.
+                srcs = []
+                for aid in cand["in_ids"]:
+                    src = producer.get(aid)
+                    if src is not None and src != host.id and src not in kids_ids:
+                        srcs.append(src)
+                srcs = list(dict.fromkeys(srcs))
+                first_kid = min(kids_ids)
+                # The op's output is what that first child received.
+                produced = next(iter(nodes[first_kid].inputs), None)
+                node = _new_op_node(host, op, sym, qual, produced,
+                                    order=first_kid - 1)
+                # Everything those sources fed inside this host now goes
+                # through the op instead.
+                rewired = False
+                for e in edges:
+                    if (e.src in set(srcs) and e.dst != node.id
+                            and (e.dst in kids_ids
+                                 or any(_is_descendant(e.dst, k, nodes)
+                                        for k in kids_ids))):
+                        e.src = node.id
+                        rewired = True
+                for src in srcs:
+                    edges.append(Edge(src, node.id,
+                                      cand["in_tensors"][0]
+                                      if cand["in_tensors"] else Tensor((), "")))
+                # When the host's input reached the first child directly there
+                # was no edge to redirect, so the op would hang with no output.
+                if not rewired:
+                    edges.append(Edge(node.id, first_kid,
+                                      produced or Tensor((), "")))
+                continue
+
             if merged or not anchors:
                 continue                # placed, or cannot be placed reliably
 
@@ -1097,7 +1201,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 __all__ = [
     "Tensor", "Node", "Edge", "Graph",
     "INPUT_NODE", "IN_BASE", "finalize_graph",
-    "_is_descendant", "_scan_ops", "_concat_axis", "_concat_compatible",
+    "_is_descendant", "_scan_ops", "_scan_ops_deep", "_concat_axis", "_concat_compatible",
     "_Op", "_BINOPS", "_OP_ROOTS", "_OP_SYMBOLS", "_SHAPE_PRESERVING",
     "_INTERESTING",
 ]

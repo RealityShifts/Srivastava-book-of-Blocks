@@ -47,7 +47,7 @@ from ._core import (
     IN_BASE,
     Node,
     Tensor,
-    _scan_ops,
+    _scan_ops_deep,
     finalize_graph,
 )
 
@@ -291,7 +291,7 @@ def trace_model(
 
         cls = type(mod)
         if cls not in ops_cache:
-            ops_cache[cls] = _scan_ops(cls.forward)
+            ops_cache[cls] = _scan_ops_deep(cls.forward, cls)
         source_ops = ops_cache[cls]
 
         out_ids = set(_array_ids(out))
