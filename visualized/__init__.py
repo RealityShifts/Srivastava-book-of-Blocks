@@ -38,33 +38,44 @@ From the command line::
         --args 32 --input 5,128,128,32
 """
 
+# Framework-free: the graph model and the renderer touch neither jax nor torch,
+# so they are safe to import eagerly in either environment.
+from ._core import Edge, Graph, Node, Tensor
 from .renderer import render_html, save_html
-from .tracer import Edge, Graph, Node, Tensor, trace_model
-from .visualize import summary, visualize, visualize_notebook
 
 
-# The torch entry points are resolved on first use rather than imported here:
-# this package is usable in a JAX-only environment (and the torch modules in a
-# torch-only one), so importing either framework eagerly would break the other.
-_TORCH_EXPORTS = {
-    "visualize_torch": "visualize",
-    "summary_torch": "summary",
-    "trace_model_torch": "trace_model",
-    "visualize_notebook_torch": "visualize_notebook",
-    "visualize_torchvista": "visualize_torchvista",
-    "torchvista_path_for": "torchvista_path_for",
+# Both frameworks' entry points are resolved on first use rather than imported
+# here: this package is usable in a JAX-only environment and in a torch-only
+# one, so importing either framework eagerly would break the other.
+_LAZY_EXPORTS = {
+    # name here -> (submodule, attribute there)
+    "visualize": ("visualize", "visualize"),
+    "visualize_notebook": ("visualize", "visualize_notebook"),
+    "summary": ("visualize", "summary"),
+    "trace_model": ("tracer", "trace_model"),
+    "visualize_torch": ("visualize_torch", "visualize"),
+    "summary_torch": ("visualize_torch", "summary"),
+    "trace_model_torch": ("visualize_torch", "trace_model"),
+    "visualize_notebook_torch": ("visualize_torch", "visualize_notebook"),
+    "visualize_torchvista": ("visualize_torch", "visualize_torchvista"),
+    "torchvista_path_for": ("visualize_torch", "torchvista_path_for"),
 }
 
 
 def __getattr__(name: str):
-    if name in _TORCH_EXPORTS:
+    if name in _LAZY_EXPORTS:
         # ``import_module`` by full path, not ``from . import visualize_torch``:
         # the submodule shares its name with one of the exports above, so the
         # relative form re-enters this very function and recurses forever.
         from importlib import import_module
-        mod = import_module(f"{__name__}.visualize_torch")
-        return getattr(mod, _TORCH_EXPORTS[name])
+        submodule, attribute = _LAZY_EXPORTS[name]
+        mod = import_module(f"{__name__}.{submodule}")
+        return getattr(mod, attribute)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
 __all__ = [

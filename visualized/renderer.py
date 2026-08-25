@@ -14,7 +14,10 @@ import json
 import os
 from typing import Optional
 
-from .tracer import Graph, INPUT_NODE, IN_BASE
+# ``_core``, not ``.tracer``: this renderer serves both frameworks, and the
+# Flax tracer imports jax at module scope - reaching through it for three
+# framework-free symbols made every torch-only import of this package fail.
+from ._core import Graph, INPUT_NODE, IN_BASE
 
 
 _TEMPLATE = """<!doctype html>
