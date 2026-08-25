@@ -115,7 +115,37 @@ Consequences worth knowing:
 - **Dataflow edges come from array identity** (`id()` of the arrays a module
   consumed vs. produced). Values that pass through pure `jnp` operations
   between modules are new arrays, which breaks the chain; those links are
-  recovered from execution order instead and tagged `inferred`.
+  recovered from execution order instead and tagged `inferred`. The recovery
+  runs in both directions - a consumer with no recorded producer, and a
+  producer with no recorded consumer. The second case is what otherwise leaves
+  a norm or an interpolate trailing off the diagram with its output going
+  nowhere.
+
+  Execution order alone is not proof of dataflow, so both directions require
+  the shapes to agree: a residual shortcut consumes the block's *input*, and
+  the first module of a separately-called branch consumes the model's input,
+  neither of which has any edge from whichever leaf merely finished last.
+  Without that check the graph grows arrows from `id_encoder` into
+  `motion_encoder`, which never exchange a tensor at all. Joins are the one
+  legitimate exception in each direction - an operand is narrower than the
+  concatenated result - and are matched on that basis for join nodes only.
+  The consumer search is also bounded to the leaf's own top-level branch, and
+  a genuinely terminal branch (an auxiliary head that returns its result
+  directly) is left terminal rather than wired into an unrelated node.
+- **Bare ops that change shape are relabelled from their consumer.** Nothing
+  intercepts a bare op, so `x.mean(dim=(2, 3))` and `torch.cat([a, b])` have no
+  recorded output shape and would otherwise report their *input* - a global
+  average pool rendering as `(B, C, H, W)` feeding a Linear, or a concat
+  reporting one operand's width while the Linear reads the sum. Both are read
+  back from the module that received the value, once op synthesis has placed
+  every edge. Reductions are matched only against smaller shapes and joins only
+  against wider ones, so neither pass can rewrite the other's nodes.
+- **Ops written as tensor methods are included.** `x.mean(dim=(2, 3))` is a
+  call on a local name rather than on `jnp`/`torch`, so a root-based scan skips
+  it and the graph silently drops a real reduction. A whitelist of
+  shape-changing methods (`mean`, `flatten`, `permute`, ...) is admitted;
+  it is deliberately not "every tensor method", since that would draw a node
+  for every `.to(dtype)` and `.detach()` and bury the structure.
 - **Op nodes come from the source.** Which array ops a container runs is
   decided by parsing its `__call__`, because array identity alone cannot tell
   a residual add from an ordinary activation - `ConvBlock` also returns a

@@ -252,6 +252,22 @@ def _is_descendant(node_id: int, ancestor_id: int, nodes: list) -> bool:
 _OP_ROOTS = ("jnp", "jax", "nnx", "np", "numpy", "lax", "F",
              "torch", "nn", "tf")
 
+# Ops written as a *method on the array itself* - ``x.mean(dim=(2, 3))``,
+# ``x.flatten(1)`` - rather than as a module-level function. The root of such a
+# call is the local variable, not a name in _OP_ROOTS, so the scan below would
+# skip it and the graph would silently omit a real reduction: the classic
+# symptom is a (B, C, H, W) feature map appearing to feed a Linear directly,
+# with the global average pool that made it (B, C) nowhere in the picture.
+#
+# Deliberately a whitelist of *shape-changing* methods. Almost every tensor
+# method is a call on a local name, so admitting them all would turn every
+# ``.to(dtype)``, ``.clamp()`` or ``.detach()`` into a drawn node and bury the
+# structure the diagram exists to show.
+_TENSOR_METHODS = frozenset({
+    "mean", "sum", "flatten", "reshape", "view", "permute", "transpose",
+    "squeeze", "unsqueeze", "expand", "repeat", "chunk", "split",
+})
+
 # Binary/unary operators, mapped to the symbol drawn inside the op circle.
 _BINOPS = {
     ast.Add: ("add", "+"), ast.Sub: ("sub", "−"),
@@ -457,9 +473,15 @@ def _scan_ops(fn: Optional[Callable]) -> list:
             op_asts.append(node)
         elif isinstance(node, ast.Call):
             root = _op_root(node.func)
-            if root not in _OP_ROOTS:
-                continue                 # a module call or an unrelated helper
             attr = getattr(node.func, "attr", None)
+            if root not in _OP_ROOTS:
+                # Not rooted at an array module - but a tensor method is still
+                # a real op. ``self.<attr>(...)`` is a submodule call the
+                # runtime trace already records, so it stays excluded.
+                if (root == "self" or attr not in _TENSOR_METHODS
+                        or isinstance(node.func.value, ast.Attribute)
+                        and _op_root(node.func) == "self"):
+                    continue
             if attr is None or attr.startswith("_"):
                 continue
             # A join is handed a list; the names in it are what identify its
@@ -658,10 +680,141 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 and nid not in has_producer
                 and node.inputs                       # consumes something
                 and nodes[prev_leaf].outputs):        # predecessor produced
-            edges.append(Edge(prev_leaf, nid,
-                              next(iter(node.inputs), Tensor((), "")),
-                              inferred=True))
+            # Execution order alone is not proof of dataflow. A module that
+            # opens a fresh branch consumes a value from further back - a
+            # residual shortcut takes the block's *input*, and the first module
+            # of an independently-called encoder takes the model's input - and
+            # neither has any edge from the leaf that merely happened to finish
+            # last. Requiring the shapes to agree is what separates the two
+            # cases; without it the graph grows arrows from id_encoder into
+            # motion_encoder, which never exchange a tensor at all.
+            want = next(iter(node.inputs), Tensor((), ""))
+            got = nodes[prev_leaf].outputs[0]
+            gs, ws = tuple(got.shape), tuple(want.shape)
+            # Equal shapes are the ordinary sequential case. A join is the
+            # exception in the other direction: ``mixer`` consumes the *result*
+            # of ``torch.cat([out, skip])``, so what it wants is wider than
+            # what the preceding leaf emitted, agreeing on every other axis.
+            ok = gs == ws
+            if not ok and len(gs) == len(ws) and len(gs) >= 2:
+                differing = [i for i in range(len(gs)) if gs[i] != ws[i]]
+                ok = len(differing) == 1 and gs[differing[0]] < ws[differing[0]]
+            if ok:
+                edges.append(Edge(prev_leaf, nid, want, inferred=True))
         prev_leaf = nid
+
+    # The mirror image of the repair above, and needed for the same reason.
+    # That pass fixes a leaf with no *producer*; this one fixes a leaf with no
+    # *consumer*. Both arise from the same lost array identity, but they are
+    # not the same node: when a bare op sits between two modules, the op's
+    # result is a new array, so the downstream module gets its incoming edge
+    # repaired by execution order while the upstream leaf keeps no outgoing
+    # edge at all. It then renders as a branch that simply stops - a norm or an
+    # interpolate trailing off the diagram with its output going nowhere.
+    #
+    # A leaf that produced a value and has no consumer is linked to the next
+    # leaf that consumes something, which is what actually received it. Two
+    # exclusions matter:
+    #
+    # - The op-synthesis pass below has not run yet, so a leaf whose real
+    #   consumer is a not-yet-created op node must not be linked past it. Those
+    #   ops splice themselves onto the chain when they are built, so this pass
+    #   deliberately runs *after* op synthesis instead (see the call site).
+    # - A tensor the model actually returns is terminal by definition. An
+    #   auxiliary head is exactly this: it reads off the trunk and leaves via
+    #   the return tuple, so it has no consumer and correctly has none.
+    def _top_ancestor(nid: int) -> int:
+        """The outermost module ``nid`` sits in, i.e. its top-level branch."""
+        cur, seen = nid, set()
+        while True:
+            parent = nodes[cur].parent
+            if parent is None or parent in seen or nodes[parent].parent is None:
+                return cur
+            seen.add(parent)
+            cur = parent
+
+    def _accepts(consumer, tensor) -> bool:
+        """Could ``consumer`` have received ``tensor``?
+
+        An exact match against one of its recorded inputs is the common case.
+        A join is the exception: ``torch.cat`` widens along the channel axis,
+        so an operand's shape never equals the joined result - it agrees on
+        every *other* axis while contributing part of the concatenated one.
+        Requiring exact equality there would reject every genuine operand and
+        leave the branches that feed a concat dangling.
+        """
+        want = tuple(tensor.shape)
+        for t in consumer.inputs:
+            got = tuple(t.shape)
+            if got == want:
+                return True
+        return False
+
+    def _is_join_operand(consumer, tensor) -> bool:
+        """``tensor`` looks like one operand of a join ``consumer`` receives.
+
+        ``torch.cat`` widens one axis, so an operand never equals the joined
+        result: it agrees on every other axis while contributing part of the
+        concatenated one. Checked separately from ``_accepts`` and only for
+        join nodes, because the same "agrees except on one axis" test applied
+        to arbitrary consumers is far too loose - it would happily wire a
+        3-channel auxiliary output into a 64-channel upsample.
+        """
+        want = tuple(tensor.shape)
+        for t in consumer.inputs:
+            got = tuple(t.shape)
+            if len(got) != len(want) or len(got) < 2:
+                continue
+            differing = [i for i in range(len(got)) if got[i] != want[i]]
+            if len(differing) == 1 and want[differing[0]] < got[differing[0]]:
+                return True
+        return False
+
+    def _link_orphan_consumers(nodes, edges, children, out_sources):
+        terminal = {o["src"] for o in out_sources}
+        leaf_ids = [n.id for n in nodes if not children.get(n.id)]
+        has_consumer = {e.src for e in edges}
+        has_producer = {e.dst for e in edges}
+        consumers = [nid for nid in leaf_ids
+                     if nodes[nid].inputs or nodes[nid].outputs]
+        for pos, nid in enumerate(consumers):
+            node = nodes[nid]
+            if nid in has_consumer or nid in terminal or not node.outputs:
+                continue
+            # Only link where the value actually fits what the candidate
+            # consumes. Execution order alone is not enough evidence: a head
+            # that reads off the trunk and returns its result directly (an
+            # auxiliary output) is followed in call order by the trunk's own
+            # next module, which consumes the *trunk* tensor, not the head's.
+            # Linking those would draw a 3-channel RGB frame feeding a
+            # 64-channel upsample. A genuinely terminal branch is left
+            # terminal, which is the honest picture.
+            out_t = node.outputs[0]
+            # Only look inside the module this leaf belongs to. A value never
+            # crosses from one top-level branch into another (id_encoder does
+            # not feed motion_encoder), and bounding the search is what keeps
+            # a leaf at the end of one branch from being wired into the start
+            # of the next.
+            host = _top_ancestor(nid)
+            nxt = None
+            for m in consumers[pos + 1:]:
+                cand = nodes[m]
+                if not cand.inputs or _top_ancestor(m) != host:
+                    continue
+                if _accepts(cand, out_t):
+                    nxt = m
+                    break
+                # A join operand is the one legitimate non-equal match. Accept
+                # it only for an actual join node - the same test applied
+                # generally would wire a 3-channel auxiliary head into a
+                # 64-channel upsample, or an occlusion mask into a concat it
+                # never reaches.
+                if cand.op in _JOIN_OPS and _is_join_operand(cand, out_t):
+                    nxt = m
+                    break
+            if nxt is None:
+                continue
+            edges.append(Edge(nid, nxt, out_t, inferred=True))
 
     # Bare array ops - residual adds, ``jnp.concat``, activations, reshapes -
     # are written as plain expressions, not modules, so nothing above records
@@ -978,13 +1131,36 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 # unchanged input shape, which would simply be wrong.
                 out_t = None
                 if op not in _SHAPE_PRESERVING:
+                    # Take the *changed* shape, not merely the first one found.
+                    # A producer often feeds several consumers - the reduction
+                    # this op represents plus one or more skip connections that
+                    # carry the unreduced array onward. Picking the first edge
+                    # can land on a skip and report the input shape unchanged,
+                    # which is exactly the case a reducing op must not report:
+                    # a global average pool would render as (B, C, H, W) going
+                    # straight into a Linear. Fall back to the first consumer
+                    # only when no consumer disagrees with the input.
+                    in_shape = tuple(tensor.shape) if tensor is not None else ()
                     for e in edges:
                         if e.src != prev:
                             continue
                         cons = next(iter(nodes[e.dst].inputs), None)
-                        if cons is not None:
+                        if cons is None:
+                            continue
+                        if out_t is None:
+                            out_t = cons
+                        if tuple(cons.shape) != in_shape:
                             out_t = cons
                             break
+                    # If nothing above found a changed shape, leave out_t
+                    # unset rather than guessing: the op's real consumer is
+                    # often a module this pass has not wired up yet, and every
+                    # order- or id-based guess at "what came next" lands on a
+                    # skip connection as readily as on the true consumer. The
+                    # sweep after op synthesis fixes these from the edges that
+                    # actually end up leaving the node - see _relabel_reducers.
+                    if out_t is not None and tuple(out_t.shape) == in_shape:
+                        out_t = None
                 node = _new_op_node(host, op, sym, qual, tensor,
                                     order=_subtree_max(src_kid),
                                     out_tensor=out_t)
@@ -1097,6 +1273,78 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # rewired - but the renderer resolves a collapsed container to its
     # descendants' edges at draw time, so nothing is missing on screen. The
     # Flax graph is built the same way.
+    # A reducing op (``x.mean(dim=(2, 3))``) emits a different shape than it
+    # consumed, and bare ops are never intercepted, so nothing recorded that
+    # shape at trace time. It can only be read off the module that received the
+    # value - and reliably only *here*, once op synthesis has finished and the
+    # edges leaving the op point at its real consumers. Earlier the op's own
+    # output edge does not exist yet, so any guess has to fall back on
+    # execution order and lands on a skip connection as often as on the true
+    # consumer.
+    for n in nodes:
+        if not n.op or n.op in _SHAPE_PRESERVING or not n.outputs:
+            continue
+        in_shape = tuple(n.outputs[0].shape)
+        relabelled = False
+        for e in edges:
+            if e.src != n.id:
+                continue
+            cons = next(iter(nodes[e.dst].inputs), None)
+            if cons is not None and tuple(cons.shape) != in_shape:
+                n.outputs = [cons]
+                relabelled = True
+                break
+        if relabelled or not n.inputs:
+            continue
+        # No outgoing edge yet to read the real shape from. Restricting the
+        # search to reductions - where the result is strictly smaller than the
+        # input - is what keeps this from rewriting a join's output: a concat
+        # widens, and mislabelling it wires every mixer to the wrong level.
+        host = n.parent
+        later = sorted((m for m in nodes
+                        if m.parent == host and m.order > n.order and m.inputs),
+                       key=lambda m: m.order)
+        for m in later:
+            cons = next(iter(m.inputs), None)
+            if cons is None:
+                break
+            cs = tuple(cons.shape)
+            smaller = (len(cs) < len(in_shape)
+                       or (len(cs) == len(in_shape)
+                           and all(a <= b for a, b in zip(cs, in_shape))
+                           and cs != in_shape))
+            if smaller:
+                n.outputs = [cons]
+            break
+
+    # A join's output was never recorded either, and defaults to one operand's
+    # shape - so ``torch.cat([a, b])`` feeding a Linear reports the width of
+    # ``a`` alone while the Linear reads the sum. Take the consumer's recorded
+    # input, which is the concatenated width. Guarded to widening only, so this
+    # never rewrites a reduction handled above.
+    for n in nodes:
+        if n.op not in _JOIN_OPS or not n.outputs:
+            continue
+        have = tuple(n.outputs[0].shape)
+        for e in edges:
+            if e.src != n.id:
+                continue
+            cons = next(iter(nodes[e.dst].inputs), None)
+            if cons is None:
+                continue
+            cs = tuple(cons.shape)
+            if (len(cs) == len(have)
+                    and all(a <= b for a, b in zip(have, cs))
+                    and cs != have):
+                n.outputs = [cons]
+            break
+
+    # Now that every synthesized op is placed, repair leaves whose consumer
+    # was never recorded. Running it here rather than beside the producer
+    # repair matters: before op synthesis, a leaf feeding a residual add would
+    # be linked past the add to whatever came next.
+    _link_orphan_consumers(nodes, edges, children, out_sources)
+
     join_ids = {n.id for n in nodes
                 if n.kind == "merge" and n.op in _JOIN_OPS}
     phantom: set = set()
@@ -1166,30 +1414,6 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
             if e.dst != main:
                 e.skip = True
 
-    # Deduplicate: one module pair can exchange several arrays.
-    seen = set()
-    unique_edges = []
-    for e in edges:
-        sig = (e.src, e.dst)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        unique_edges.append(e)
-
-    # Mark skip connections by fan-out: when one value feeds several consumers,
-    # the immediate next one is the "main" path and any consumer further along
-    # is a shortcut that bypasses it.
-    outgoing: dict = {}
-    for e in unique_edges:
-        if not e.inferred:      # order-based links are never branches
-            outgoing.setdefault(e.src, []).append(e)
-    for group in outgoing.values():
-        if len(group) < 2:
-            continue
-        main = min(e.dst for e in group)
-        for e in group:
-            if e.dst != main:
-                e.skip = True
     # Safe here: every id-indexed lookup above is done, and the renderer keys
     # nodes by id rather than by position, so the gaps left behind are fine.
     if phantom:
