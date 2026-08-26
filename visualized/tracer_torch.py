@@ -177,6 +177,12 @@ _TRACED_OPS = {
     "transpose": "⇄", "squeeze": "↓", "unsqueeze": "↑",
     "chunk": "✂", "split": "✂", "pad": "▣", "clamp": "clamp",
     "normalize": "norm", "layer_norm": "norm",
+    # Grid builders. These construct a value rather than transform one, so it
+    # is tempting to treat them as invisible - but then whatever consumes the
+    # grid shows an operand arriving from an anonymous "constant", and the
+    # coordinate grid is precisely what makes a warp readable. Naming them is
+    # what torchvista does too.
+    "meshgrid": "grid", "linspace": "grid", "arange": "grid",
 }
 
 #: Ops that only shuffle metadata. They are followed for *edges* - the value
@@ -184,9 +190,13 @@ _TRACED_OPS = {
 #: style code across a feature map becomes a box.
 _INVISIBLE_OPS = {
     "expand", "expand_as", "to", "detach", "contiguous", "type_as", "float",
-    "half", "clone", "requires_grad_", "meshgrid", "linspace", "arange",
+    "half", "clone", "requires_grad_",
     "tensor", "as_tensor", "empty", "zeros", "ones", "full", "zeros_like",
     "ones_like", "__get__", "size", "dim", "item", "numel",
+    # Slices and views re-present an existing value rather than computing a new
+    # one. Untagged, ``flow[:, 0]`` severs the flow field's provenance and the
+    # add that consumes it appears to take an operand from nowhere.
+    "__getitem__", "select", "narrow", "index_select", "unbind", "split_with_sizes",
 }
 
 
@@ -344,8 +354,43 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
                             self.on_produce(leaf, scope)
                 return out
 
+        # Every operand belongs on a wire. An op against a value nothing
+        # produced - ``resize_flow``'s ``resized * scale``, a modulated conv's
+        # own weight - would otherwise draw a single arrow in, leaving
+        # "times what?" unanswerable from the diagram. Rather than describe the
+        # missing side in text on the card, give it a node of its own and a
+        # real edge, so the graph stays a graph. Parameters are distinguished
+        # from plain constants because a trainable weight and a hard-coded
+        # scale factor are different things to a reader.
+        extras = []
+        tagged = {id(a) for a in _leaves(args) if id(a) in self.tags}
+        for a in _leaves(args):
+            if id(a) in tagged:
+                continue
+            extras.append({
+                "kind": ("parameter" if isinstance(a, torch.nn.Parameter)
+                         else "constant"),
+                "tensor": Tensor(tuple(a.shape), _dtype(a)),
+                "value": ([round(float(v), 4) for v in a.flatten().tolist()]
+                          if a.numel() <= 4 else None),
+            })
+        # ``_leaves`` keeps only tensors, but a bare Python scalar is an
+        # operand too - ``2.0 * sx`` normalizing pixel coordinates - and is the
+        # whole answer to "times what?" on that card.
+        try:
+            flat = pytree.tree_leaves(args)
+        except Exception:                  # pragma: no cover - exotic types
+            flat = list(args)
+        scalars = [a for a in flat
+                   if isinstance(a, (int, float)) and not isinstance(a, bool)]
+        for v in scalars:
+            extras.append({"kind": "scalar",
+                           "tensor": Tensor((), "float32"),
+                           "value": v})
+
         nid = -(len(self.nodes) + 1)      # provisional; renumbered on merge
         self.nodes.append({
+            "extras": extras,
             "tmp_id": nid,
             "op": name,
             "sym": glyph,
@@ -657,6 +702,40 @@ def trace_model(
         ))
     # Edges recorded against provisional ids, plus the ones the module hooks
     # wrote while the producer map still held a provisional id.
+    # Constants, parameters and scalars become nodes of their own, each with an
+    # edge into the op that consumed it. This is what keeps a binary op looking
+    # like a binary op: ``grid_x + flow[:, 0]`` shows two arrows in, and
+    # ``resized * scale`` shows the scale factor as a labelled source rather
+    # than as prose on the card.
+    for rec in op_tracer.nodes:
+        op_id = tmp_to_id[rec["tmp_id"]]
+        host = nodes[op_id].parent
+        for extra in rec.get("extras", ()):
+            kind = extra["kind"]
+            val = extra["value"]
+            if kind == "scalar":
+                label = f"{val:g}" if isinstance(val, float) else str(val)
+            elif val is not None:
+                label = str(val)
+            else:
+                label = kind
+            cid = len(nodes)
+            nodes.append(Node(
+                id=cid,
+                path=(f"{nodes[host].path}.{label}"
+                      if host is not None and nodes[host].path != "<root>"
+                      else label),
+                name=label,
+                cls=kind,
+                depth=nodes[host].depth + 1 if host is not None else 0,
+                parent=host,
+                params=0, own_params=0,
+                inputs=[], outputs=[extra["tensor"]],
+                config={}, kind="merge", op=kind,
+                order=cid, flops=-1, own_flops=0,
+            ))
+            edges.append(Edge(cid, op_id, extra["tensor"]))
+
     for src, dst, tsr in op_tracer.edges:
         s_id = tmp_to_id.get(src, src)
         d_id = tmp_to_id.get(dst, dst)
