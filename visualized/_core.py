@@ -228,6 +228,37 @@ def _scan_ops_deep(fn, cls=None, _seen=None) -> list:
             op.col = base_col + (i + 1) / (len(sub) + 1.0)
             inlined.append(op)
 
+    # Plain module-level helpers, resolved through the defining module's
+    # globals: ``resize_flow(flow, h, w)`` in synthesis.py is an ordinary
+    # function, not a method and not a submodule, so the loop above never sees
+    # it - yet its body holds a real ``F.interpolate`` that moves the whole
+    # flow field to a new grid. Left unfollowed, the graph shows one resize
+    # where two happen and the missing one is the shape change a reader is
+    # looking for.
+    #
+    # nn.Module subclasses are excluded: those get called as submodules and the
+    # runtime trace already draws them, so inlining would duplicate every op.
+    module_globals = getattr(fn_raw, "__globals__", {})
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+            continue
+        target = module_globals.get(call.func.id)
+        if target is None or not inspect.isfunction(target):
+            continue
+        if isinstance(target, type):
+            continue
+        qual = getattr(target, "__qualname__", repr(target))
+        if qual in _seen:
+            continue
+        sub = _scan_ops_deep(target, cls, _seen)
+        if not sub:
+            continue
+        base_col = call.col_offset
+        for i, op in enumerate(sorted(sub, key=lambda o: (o.lineno, o.col))):
+            op.lineno = call.lineno
+            op.col = base_col + (i + 1) / (len(sub) + 1.0)
+            inlined.append(op)
+
     if not inlined:
         return ops
     return sorted(ops + inlined, key=lambda o: (o.lineno, o.col))
@@ -493,6 +524,16 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 if isinstance(first, (ast.List, ast.Tuple)):
                     operand_names = tuple(e.id for e in first.elts
                                           if isinstance(e, ast.Name))
+            elif node.args and isinstance(node.args[0], ast.Name):
+                # A one-argument op names the value it transforms:
+                # ``F.interpolate(mask, ...)``. Recording that name lets the
+                # op be anchored to whichever module actually produced ``mask``
+                # rather than to whatever call happens to sit nearest above it
+                # in the source. Without it, an op on a value carried down from
+                # far earlier - a mask resized inside a loop, say - attaches to
+                # the loop body's previous statement and reports that value's
+                # shapes instead of its own.
+                operand_names = (node.args[0].id,)
             ops.append(_Op(
                 attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
                 node.lineno, node.col_offset, len(node.args),
@@ -560,14 +601,26 @@ def _scan_ops(fn: Optional[Callable]) -> list:
     # consumption-based heuristic can see.
     assigns: list = []
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        target = node.targets[0]
+        # ``x = self.layer(...)`` and ``a, b = self.layer(...)`` alike: a
+        # module returning several values (flow *and* mask) binds each to its
+        # own name, and an op on any one of them still traces back to that
+        # module. Only single-name targets were handled before, so every value
+        # from a multi-output module was invisible to this resolution.
+        if isinstance(target, ast.Name):
+            names = [target.id]
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names = [e.id for e in target.elts if isinstance(e, ast.Name)]
+        else:
             continue
         tgt = next((_call_target(sub) for sub in ast.walk(node.value)
                     if isinstance(sub, ast.Call)
                     and _call_target(sub) is not None), None)
         if tgt is not None:
-            assigns.append((node.lineno, node.targets[0].id, tgt))
+            for nm in names:
+                assigns.append((node.lineno, nm, tgt))
     assigns.sort()
     self_calls = [c for c in ast.walk(tree)
                   if isinstance(c, ast.Call) and _call_target(c) is not None]
