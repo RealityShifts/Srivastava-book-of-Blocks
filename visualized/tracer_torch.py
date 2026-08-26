@@ -160,30 +160,33 @@ def _input_names(model: nn.Module, args: tuple, kwargs: dict) -> list:
 # Tracing
 # ---------------------------------------------------------------------------
 
-#: Bare ops worth drawing as their own node, mapped to the glyph the renderer
-#: shows. Anything not listed passes through untouched: a graph with a node per
-#: ``__getitem__`` and ``.to(dtype)`` buries the structure it exists to show.
+#: Bare ops worth drawing as their own node, labelled with the op's own name -
+#: no glyphs: one symbol per op family made distinct operations look identical
+#: (``interpolate`` and ``grid_sample`` both rendered as an arrow, though only
+#: one of them changes resolution). A curated allowlist rather than "every
+#: torch function": a graph with a node per ``__getitem__`` and ``.to(dtype)``
+#: buries the structure it exists to show.
 #: Names are ``func.__name__`` as ``TorchFunctionMode`` reports them.
 _TRACED_OPS = {
-    "interpolate": "⤢", "grid_sample": "⤢", "upsample": "⤢",
-    "cat": "⧺", "concat": "⧺", "concatenate": "⧺", "stack": "⧺",
-    "add": "+", "__add__": "+", "sub": "−", "__sub__": "−",
-    "mul": "×", "__mul__": "×", "div": "÷", "__truediv__": "÷",
-    "matmul": "@", "__matmul__": "@",
-    "mean": "μ", "sum": "∑",
-    "sigmoid": "σ", "tanh": "tanh", "softmax": "σ", "logit": "logit",
-    "relu": "relu", "leaky_relu": "leaky_relu", "gelu": "gelu", "silu": "silu",
-    "reshape": "↳", "view": "↳", "flatten": "↳", "permute": "⇄",
-    "transpose": "⇄", "squeeze": "↓", "unsqueeze": "↑",
-    "chunk": "✂", "split": "✂", "pad": "▣", "clamp": "clamp",
-    "normalize": "norm", "layer_norm": "norm",
+    "interpolate", "grid_sample", "upsample",
+    "cat", "concat", "concatenate", "stack",
+    "add", "__add__", "sub", "__sub__",
+    "mul", "__mul__", "div", "__truediv__",
+    "matmul", "__matmul__",
+    "mean", "sum",
+    "sigmoid", "tanh", "softmax", "logit",
+    "relu", "leaky_relu", "gelu", "silu",
+    "reshape", "view", "flatten", "permute",
+    "transpose", "squeeze", "unsqueeze",
+    "chunk", "split", "pad", "clamp",
+    "normalize", "layer_norm",
     # Grid builders. These construct a value rather than transform one, so it
     # is tempting to treat them as invisible - but then whatever consumes the
-    # grid shows an operand arriving from an anonymous "constant", and the
-    # coordinate grid is precisely what makes a warp readable. Naming them is
-    # what torchvista does too.
-    "meshgrid": "grid", "linspace": "grid", "arange": "grid",
+    # grid shows an operand arriving from an anonymous constant, and the
+    # coordinate grid is precisely what makes a warp readable.
+    "meshgrid", "linspace", "arange",
 }
+
 
 #: Ops that only shuffle metadata. They are followed for *edges* - the value
 #: keeps flowing - but never get a node, or every ``.expand`` broadcasting a
@@ -282,8 +285,7 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
                     self.tag(out, src)
             return out
 
-        glyph = _TRACED_OPS.get(name)
-        if glyph is None or self._depth:
+        if name not in _TRACED_OPS or self._depth:
             return func(*args, **kwargs)
 
         # Producers are read *before* the call: an in-place op would otherwise
@@ -383,17 +385,27 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
             flat = list(args)
         scalars = [a for a in flat
                    if isinstance(a, (int, float)) and not isinstance(a, bool)]
-        for v in scalars:
-            extras.append({"kind": "scalar",
-                           "tensor": Tensor((), "float32"),
-                           "value": v})
+        if scalars:
+            # One node for all of a call's scalars, labelled generically -
+            # torchvista's "N scalars". Naming each by its value spawned a node
+            # called "191" and another called "767" for what are really just
+            # ``interpolate``'s size arguments, and a graph full of loose
+            # integers hides the ops it is supposed to show. The values live in
+            # the node's config, where they are still readable on the card.
+            extras.append({
+                "kind": "scalar",
+                "tensor": Tensor((), "float32"),
+                "value": scalars[0] if len(scalars) == 1 else scalars,
+                "label": ("scalar" if len(scalars) == 1
+                          else f"{len(scalars)} scalars"),
+            })
 
         nid = -(len(self.nodes) + 1)      # provisional; renumbered on merge
         self.nodes.append({
             "extras": extras,
             "tmp_id": nid,
             "op": name,
-            "sym": glyph,
+            "sym": name,
             "scope": self.scope[-1] if self.scope else None,
             "in": Tensor(tuple(first.shape), _dtype(first)),
             "out": Tensor(tuple(res.shape), _dtype(res)),
@@ -713,12 +725,10 @@ def trace_model(
         for extra in rec.get("extras", ()):
             kind = extra["kind"]
             val = extra["value"]
-            if kind == "scalar":
-                label = f"{val:g}" if isinstance(val, float) else str(val)
-            elif val is not None:
-                label = str(val)
-            else:
-                label = kind
+            # Generic label, value in the config: a card reading "constant"
+            # with ``value: [2.0, 2.0]`` beneath it stays scannable, where a
+            # node *named* "[2.0, 2.0]" competes with the ops for attention.
+            label = extra.get("label") or kind
             cid = len(nodes)
             nodes.append(Node(
                 id=cid,
@@ -731,7 +741,8 @@ def trace_model(
                 parent=host,
                 params=0, own_params=0,
                 inputs=[], outputs=[extra["tensor"]],
-                config={}, kind="merge", op=kind,
+                config=({} if val is None else {"value": val}),
+                kind="merge", op=kind,
                 order=cid, flops=-1, own_flops=0,
             ))
             edges.append(Edge(cid, op_id, extra["tensor"]))
