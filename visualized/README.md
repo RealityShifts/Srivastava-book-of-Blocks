@@ -113,39 +113,45 @@ Consequences worth knowing:
   partial graph is returned with the error attached and the failing module
   marked in red - which is exactly when the picture is most useful.
 - **Dataflow edges come from array identity** (`id()` of the arrays a module
-  consumed vs. produced). Values that pass through pure `jnp` operations
-  between modules are new arrays, which breaks the chain; those links are
-  recovered from execution order instead and tagged `inferred`. The recovery
-  runs in both directions - a consumer with no recorded producer, and a
-  producer with no recorded consumer. The second case is what otherwise leaves
-  a norm or an interpolate trailing off the diagram with its output going
-  nowhere.
+  consumed vs. produced).
 
-  Execution order alone is not proof of dataflow, so both directions require
-  the shapes to agree: a residual shortcut consumes the block's *input*, and
-  the first module of a separately-called branch consumes the model's input,
-  neither of which has any edge from whichever leaf merely finished last.
-  Without that check the graph grows arrows from `id_encoder` into
-  `motion_encoder`, which never exchange a tensor at all. Joins are the one
-  legitimate exception in each direction - an operand is narrower than the
-  concatenated result - and are matched on that basis for join nodes only.
-  The consumer search is also bounded to the leaf's own top-level branch, and
-  a genuinely terminal branch (an auxiliary head that returns its result
-  directly) is left terminal rather than wired into an unrelated node.
-- **Bare ops that change shape are relabelled from their consumer.** Nothing
-  intercepts a bare op, so `x.mean(dim=(2, 3))` and `torch.cat([a, b])` have no
-  recorded output shape and would otherwise report their *input* - a global
-  average pool rendering as `(B, C, H, W)` feeding a Linear, or a concat
-  reporting one operand's width while the Linear reads the sum. Both are read
-  back from the module that received the value, once op synthesis has placed
-  every edge. Reductions are matched only against smaller shapes and joins only
-  against wider ones, so neither pass can rewrite the other's nodes.
-- **Ops written as tensor methods are included.** `x.mean(dim=(2, 3))` is a
-  call on a local name rather than on `jnp`/`torch`, so a root-based scan skips
-  it and the graph silently drops a real reduction. A whitelist of
-  shape-changing methods (`mean`, `flatten`, `permute`, ...) is admitted;
-  it is deliberately not "every tensor method", since that would draw a node
-  for every `.to(dtype)` and `.detach()` and bury the structure.
+  *PyTorch:* bare ops are observed, not reconstructed. A `TorchFunctionMode`
+  sees every tensor op as it runs, gives the ones worth drawing a node, and
+  tags each result with the node that produced it; the next consumer - op or
+  module - resolves its own inputs through the same producer map. An edge
+  therefore exists because the *same tensor object* left one node and entered
+  another, which is a fact about the run.
+
+  This replaced an AST scan of `forward` that found bare ops in the source,
+  anchored each to a nearby module call, and reconstructed its shapes from
+  whatever neighbour was reachable. That is right only while a value flows
+  straight from one call to the next. Where it does not, the errors were not
+  local: a flow field resized inside a decoder loop is produced levels above,
+  so "the nearest preceding call" was the trunk, and the op ended up carrying
+  the trunk's shapes and - once spliced onto the host's inputs - the trunk's
+  edges, one node with an arrow in from every pyramid level and an arrow out
+  to nearly every module below it. Tagging cannot express that: the op sees
+  the tensors it was actually handed.
+
+  Four things the mode has to get right, each of which otherwise shows up as a
+  wrong node: it is re-entrant (`F.interpolate` dispatches to more torch
+  functions, so only the outermost call becomes a node); an op that *is* its
+  enclosing module (`nn.LeakyReLU` running `leaky_relu`) must tag the module
+  and not draw itself twice; weight math is not dataflow (`EqualLinear`
+  scaling its kernel, `ModulatedConv2d` reshaping one - real ops whose result
+  is a filter, recognised by a 4-D result that does not carry the batch axis);
+  and metadata-only ops like `.expand` pass their producer through rather than
+  severing the chain.
+
+  An observed op that no drawn consumer takes is an interior step of a larger
+  expression - `L2Norm` adds an epsilon, then rsqrts, then multiplies, and only
+  ops on the drawn list become nodes - so it is spliced out rather than left
+  with an arrow going nowhere.
+
+  *JAX:* values that pass through pure `jnp` operations between modules are new
+  arrays, which breaks the chain; those links are recovered from execution
+  order and tagged `inferred`, and the source-scan machinery below still
+  applies.
 - **Op nodes come from the source.** Which array ops a container runs is
   decided by parsing its `__call__`, because array identity alone cannot tell
   a residual add from an ordinary activation - `ConvBlock` also returns a

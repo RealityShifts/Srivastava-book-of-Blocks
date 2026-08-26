@@ -160,6 +160,214 @@ def _input_names(model: nn.Module, args: tuple, kwargs: dict) -> list:
 # Tracing
 # ---------------------------------------------------------------------------
 
+#: Bare ops worth drawing as their own node, mapped to the glyph the renderer
+#: shows. Anything not listed passes through untouched: a graph with a node per
+#: ``__getitem__`` and ``.to(dtype)`` buries the structure it exists to show.
+#: Names are ``func.__name__`` as ``TorchFunctionMode`` reports them.
+_TRACED_OPS = {
+    "interpolate": "⤢", "grid_sample": "⤢", "upsample": "⤢",
+    "cat": "⧺", "concat": "⧺", "concatenate": "⧺", "stack": "⧺",
+    "add": "+", "__add__": "+", "sub": "−", "__sub__": "−",
+    "mul": "×", "__mul__": "×", "div": "÷", "__truediv__": "÷",
+    "matmul": "@", "__matmul__": "@",
+    "mean": "μ", "sum": "∑",
+    "sigmoid": "σ", "tanh": "tanh", "softmax": "σ", "logit": "logit",
+    "relu": "relu", "leaky_relu": "leaky_relu", "gelu": "gelu", "silu": "silu",
+    "reshape": "↳", "view": "↳", "flatten": "↳", "permute": "⇄",
+    "transpose": "⇄", "squeeze": "↓", "unsqueeze": "↑",
+    "chunk": "✂", "split": "✂", "pad": "▣", "clamp": "clamp",
+    "normalize": "norm", "layer_norm": "norm",
+}
+
+#: Ops that only shuffle metadata. They are followed for *edges* - the value
+#: keeps flowing - but never get a node, or every ``.expand`` broadcasting a
+#: style code across a feature map becomes a box.
+_INVISIBLE_OPS = {
+    "expand", "expand_as", "to", "detach", "contiguous", "type_as", "float",
+    "half", "clone", "requires_grad_", "meshgrid", "linspace", "arange",
+    "tensor", "as_tensor", "empty", "zeros", "ones", "full", "zeros_like",
+    "ones_like", "__get__", "size", "dim", "item", "numel",
+}
+
+
+class _OpTracer(torch.overrides.TorchFunctionMode):
+    """Records bare tensor ops as graph nodes, wiring edges by tensor identity.
+
+    Every op's result is tagged with the node that produced it, and every op
+    reads the tags of its arguments to find its own producers. That is the
+    whole mechanism: an edge exists because the *same tensor object* left one
+    node and entered another, which is a fact about the run rather than an
+    inference from source layout.
+
+    The alternative this replaces - parsing ``forward``'s AST to find bare ops,
+    then anchoring each to a nearby module call and reconstructing its shapes
+    from whatever neighbour was reachable - is right only while a value flows
+    straight from one call to the next. Wherever it does not, the graph goes
+    wrong in ways no local fix reaches: a flow field resized inside a decoder
+    loop was produced levels above, so "the nearest preceding call" is the
+    trunk, and the op ends up carrying the trunk's shapes and, once spliced
+    onto the host's inputs, the trunk's edges too - one node with an arrow in
+    from every pyramid level and an arrow out to nearly every module below it.
+
+    Tagging cannot express that error. The op sees the exact tensors it was
+    handed, so its shapes are what it actually resized and its edges lead to
+    whoever actually produced them.
+
+    Module boundaries still come from the forward hooks: ``scope`` is the node
+    id of the innermost module executing, so each op lands inside the module
+    whose body ran it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.nodes: list = []          # op nodes, in call order
+        self.edges: list = []          # (src_node, dst_node, Tensor)
+        self.scope: list = []          # module node ids, innermost last
+        self.enabled = False
+        # Depth guard. ``TorchFunctionMode`` is re-entrant: ``F.interpolate``
+        # dispatches to further torch functions, and the mode sees those too.
+        # Recording them would nest one op inside another and pair an outer
+        # call's input with an inner call's output. Only the outermost call
+        # becomes a node; everything under it runs untraced.
+        self._depth = 0
+        # id(tensor) -> node id that produced it. Keyed by identity, with the
+        # tensors kept alive: CPython reuses addresses, so a freed intermediate
+        # would otherwise hand its id to an unrelated tensor and fabricate an
+        # edge.
+        self.tags: dict = {}
+        self._keepalive: list = []
+        #: Called as ``on_produce(tensor, tmp_id)`` when an op produces a
+        #: value. The tracer points the shared producer map at the op, so a
+        #: module consuming the result resolves to the op rather than to
+        #: whatever module last handled the value.
+        self.on_produce = None
+        #: node id -> class name, leaf modules only. Lets an op recognise that
+        #: it *is* its enclosing module - ``nn.LeakyReLU`` running
+        #: ``leaky_relu`` - rather than a bare op written beside one.
+        self.leaf_cls: dict = {}
+
+    def tag(self, obj: Any, node_id: int) -> None:
+        """Mark every tensor in ``obj`` as produced by ``node_id``."""
+        for leaf in _leaves(obj):
+            if isinstance(leaf, torch.Tensor):
+                self.tags[id(leaf)] = node_id
+                self._keepalive.append(leaf)
+
+    def source_of(self, tensor: torch.Tensor):
+        return self.tags.get(id(tensor))
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        name = getattr(func, "__name__", "")
+        if not self.enabled or name in _INVISIBLE_OPS:
+            out = func(*args, **kwargs)
+            # A metadata-only op still passes the value along, so the result
+            # inherits its input's producer. Without this a ``.expand`` between
+            # two real ops severs the chain.
+            if name in _INVISIBLE_OPS:
+                src = next((self.tags.get(id(a)) for a in _leaves(args)
+                            if isinstance(a, torch.Tensor)
+                            and id(a) in self.tags), None)
+                if src is not None:
+                    self.tag(out, src)
+            return out
+
+        glyph = _TRACED_OPS.get(name)
+        if glyph is None or self._depth:
+            return func(*args, **kwargs)
+
+        # Producers are read *before* the call: an in-place op would otherwise
+        # overwrite the tag on its own input and lose the incoming edge.
+        srcs = []
+        for a in _leaves(args):
+            if not isinstance(a, torch.Tensor):
+                continue
+            src = self.tags.get(id(a))
+            if src is not None:
+                srcs.append((src, Tensor(tuple(a.shape), _dtype(a))))
+
+        first = next((a for a in _leaves(args)
+                      if isinstance(a, torch.Tensor)), None)
+        # Weight math is not dataflow. ``EqualLinear`` scales its weight matrix
+        # by a constant on every call, and ``ModulatedConv2d`` reshapes and
+        # normalizes its kernel - real torch ops on real tensors, but on
+        # *parameters*, so they describe how a layer builds its weights rather
+        # than how activations move. Drawing them adds a node per layer whose
+        # output is a ``(512, 512)`` kernel with nowhere to go. An op none of
+        # whose inputs carry a producer tag is exactly this: every activation
+        # traces back to a module output or the model input.
+        if first is not None and not srcs and not first.requires_grad:
+            pass          # constant folding on plain tensors: still dataflow
+        elif not srcs and any(isinstance(a, torch.nn.Parameter)
+                              for a in _leaves(args)):
+            return func(*args, **kwargs)
+
+        self._depth += 1
+        try:
+            out = func(*args, **kwargs)
+        finally:
+            self._depth -= 1
+        res = next((t for t in _leaves(out)
+                    if isinstance(t, torch.Tensor)), None)
+        if res is None or first is None:
+            return out
+        # A step on the weight path, not the activation path.
+        # ``ModulatedConv2d`` reshapes its kernel to (out, in, kh, kw) and adds
+        # a style bias before convolving; those are real ops on real tensors,
+        # but what they produce is a *filter*, and drawing it puts a node in
+        # the diagram whose value never reaches another module. Activations in
+        # this codebase are NCHW or (N, C) and always carry the batch axis, so
+        # a 4-D result whose leading dim is not the batch is a kernel.
+        if (len(res.shape) == 4 and first.shape
+                and res.shape[0] != first.shape[0]):
+            return out
+
+        # Skip an op that is merely the body of an activation module: the
+        # module already has a node of its own, so recording the call inside
+        # it draws the same step twice - once as ``LeakyReLU``, once as a
+        # ``leaky_relu`` op hanging off it with nothing downstream. Detected by
+        # the scope being a leaf module with no children of its own whose class
+        # name matches the op.
+        scope = self.scope[-1] if self.scope else None
+        if scope is not None and scope in self.leaf_cls:
+            cls_name = self.leaf_cls[scope].lower().replace("_", "")
+            if cls_name == name.lower().replace("_", ""):
+                # The module itself is the producer of this value. Tagging it
+                # here rather than falling through matters: the module hook
+                # that runs on exit only claims tensors nothing has tagged, so
+                # a value left untagged by the skip would reach the next
+                # module with no producer and both sides lose the edge.
+                self.tag(out, scope)
+                if self.on_produce is not None:
+                    for leaf in _leaves(out):
+                        if isinstance(leaf, torch.Tensor):
+                            self.on_produce(leaf, scope)
+                return out
+
+        nid = -(len(self.nodes) + 1)      # provisional; renumbered on merge
+        self.nodes.append({
+            "tmp_id": nid,
+            "op": name,
+            "sym": glyph,
+            "scope": self.scope[-1] if self.scope else None,
+            "in": Tensor(tuple(first.shape), _dtype(first)),
+            "out": Tensor(tuple(res.shape), _dtype(res)),
+            "n_in": len(srcs),
+        })
+        for src, tsr in srcs:
+            self.edges.append((src, nid, tsr))
+        self.tag(out, nid)
+        # Point the *shared* producer map at this op too. The module hooks
+        # resolve their inputs through that map, so without this a module
+        # consuming an op's result finds no producer at all and the op is left
+        # with no consumer - the two halves of the same missing edge.
+        if self.on_produce is not None:
+            for leaf in _leaves(out):
+                if isinstance(leaf, torch.Tensor):
+                    self.on_produce(leaf, nid)
+        return out
+
+
 def trace_model(
     model: nn.Module,
     *args: Any,
@@ -207,6 +415,12 @@ def trace_model(
     # node opened; the delta at exit is that call's cost, children included.
     counter = FlopCounterMode(display=False) if FlopCounterMode else None
     flop_at_entry: dict = {}
+    # Observed shapes for the bare ops, so finalize_graph can label them from
+    # what actually ran instead of inferring from neighbouring modules.
+    # Bare ops become nodes here, wired by tensor identity. The module hooks
+    # below push/pop its scope and tag module outputs, so an op consuming a
+    # module's result finds that module as its producer.
+    op_tracer = _OpTracer()
 
     def _flops_now() -> int:
         if counter is None:
@@ -215,6 +429,19 @@ def trace_model(
             return counter.get_total_flops()
         except Exception:              # pragma: no cover - counter API drift
             return -1
+
+    def _op_produced(leaf, tmp_id: int) -> None:
+        """An op created ``leaf``; record it as the producer for the hooks.
+
+        Writing into the same map the module hooks read is what makes an op a
+        first-class producer: a module consuming the op's result resolves to
+        the op itself, not to whatever module last handled the value, and no
+        edge has to be rewired afterwards.
+        """
+        producer[id(leaf)] = tmp_id
+        keepalive.append(leaf)
+
+    op_tracer.on_produce = _op_produced
 
     def _register(obj: Any, node_id: int, *, claim: bool = True) -> None:
         """Record ``node_id`` as the producer of every tensor leaf in ``obj``.
@@ -251,6 +478,9 @@ def trace_model(
         if node.parent is not None:
             child_of.setdefault(node.parent, []).append(node.id)
         stack.append(node.id)
+        op_tracer.scope.append(node.id)
+        if not list(mod.children()):
+            op_tracer.leaf_cls[node.id] = type(mod).__name__
         flop_at_entry[node.id] = _flops_now()
 
         in_leaves = _leaves((inp, kw))
@@ -280,6 +510,8 @@ def trace_model(
         if id(mod) not in paths or not stack:
             return
         nid = stack.pop()
+        if op_tracer.scope:
+            op_tracer.scope.pop()
         order.append(nid)
         node = nodes[nid]
         node.outputs = _as_tensors(out)
@@ -321,6 +553,13 @@ def trace_model(
         # the child as the producer so edges and output attribution point at
         # the module that actually computed the value.
         _register(out, nid, claim=False)
+        # Same value, tagged for the op tracer: a bare op consuming this
+        # module's result must find the module as its producer. claim=False
+        # applies here too - re-tagging a passthrough would credit the wrapper
+        # instead of the child that computed it.
+        for leaf in _leaves(out):
+            if isinstance(leaf, torch.Tensor) and id(leaf) not in op_tracer.tags:
+                op_tracer.tag(leaf, nid)
 
     # Install hooks on every submodule. ``with_kwargs`` keeps keyword arguments
     # visible; it is a newer addition, so fall back when it is unavailable.
@@ -343,7 +582,9 @@ def trace_model(
     # owned by IN_BASE - i, matching the ids the renderer lays out. Leaf 0 keeps
     # INPUT_NODE so single-input graphs are unchanged.
     for i, leaf in enumerate(_leaves((args, kwargs))):
-        _register(leaf, INPUT_NODE if i == 0 else IN_BASE - i)
+        src = INPUT_NODE if i == 0 else IN_BASE - i
+        _register(leaf, src)
+        op_tracer.tag(leaf, src)
 
     was_training = model.training
     total_flops = -1
@@ -356,11 +597,16 @@ def trace_model(
                 # rather than being retried - a half-built node list cannot be
                 # reused, and silently re-running the model could have side
                 # effects.
-                with counter:
+                with counter, op_tracer:
+                    op_tracer.enabled = True
                     result = model(*args, **kwargs)
+                    op_tracer.enabled = False
                 total_flops = _flops_now()
             else:
-                result = model(*args, **kwargs)
+                with op_tracer:
+                    op_tracer.enabled = True
+                    result = model(*args, **kwargs)
+                    op_tracer.enabled = False
         outputs = _as_tensors(result)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -383,10 +629,76 @@ def trace_model(
                 "src": producer.get(id(leaf)),
             })
 
+    # Fold the traced bare ops in as real nodes. They were numbered negatively
+    # while running - their ids had to exist before the module list was final -
+    # so renumber onto the end and rewrite the edges that referenced them.
+    tmp_to_id: dict = {}
+    for rec in op_tracer.nodes:
+        host = rec["scope"]
+        host_node = nodes[host] if host is not None and host < len(nodes) else None
+        nid = len(nodes)
+        tmp_to_id[rec["tmp_id"]] = nid
+        nodes.append(Node(
+            id=nid,
+            path=(f"{host_node.path}.{rec['sym']}"
+                  if host_node is not None and host_node.path != "<root>"
+                  else rec["sym"]),
+            name=rec["sym"],
+            cls=rec["op"],
+            depth=(host_node.depth + 1) if host_node is not None else 0,
+            parent=host,
+            params=0, own_params=0,
+            inputs=[rec["in"]], outputs=[rec["out"]],
+            config={}, kind="merge", op=rec["op"],
+            # Ops own no parameters, and the FLOP counter already attributes
+            # their cost to the enclosing module, so leaving these empty keeps
+            # the module roll-up exact rather than double-counting.
+            order=nid, flops=-1, own_flops=0,
+        ))
+    # Edges recorded against provisional ids, plus the ones the module hooks
+    # wrote while the producer map still held a provisional id.
+    for src, dst, tsr in op_tracer.edges:
+        s_id = tmp_to_id.get(src, src)
+        d_id = tmp_to_id.get(dst, dst)
+        if s_id != d_id:
+            edges.append(Edge(s_id, d_id, tsr))
+    for e in edges:
+        e.src = tmp_to_id.get(e.src, e.src)
+        e.dst = tmp_to_id.get(e.dst, e.dst)
+    for key, val in list(producer.items()):
+        if val in tmp_to_id:
+            producer[key] = tmp_to_id[val]
+
+    # An op whose result its enclosing module returns has no consumer *inside*
+    # that module, so it reads as a branch that stops - even though the value
+    # very much continues, along the module's own outgoing edge. Hand those
+    # edges over: whatever consumed the module consumed this op's tensor.
+    op_ids = set(tmp_to_id.values())
+    by_src: dict = {}
+    for e in edges:
+        by_src.setdefault(e.src, []).append(e)
+    for op_id in op_ids:
+        node = nodes[op_id]
+        host = node.parent
+        if host is None or any(e.src == op_id for e in edges):
+            continue
+        out_shape = tuple(node.outputs[0].shape) if node.outputs else None
+        for e in by_src.get(host, []):
+            if out_shape is None or tuple(e.tensor.shape) == out_shape:
+                e.src = op_id
+    for o in out_sources:
+        if o["src"] in tmp_to_id:
+            o["src"] = tmp_to_id[o["src"]]
+
     # channel_axis=1: everything here is NCHW, so a concat of two equal-shaped
     # feature maps widens dim 1. The default (-1) is the Flax tracer's NHWC.
+    #
+    # merge_candidates is deliberately empty: it drives finalize_graph's
+    # AST-based op synthesis, which _OpTracer replaces outright. Running both
+    # would draw every bare op twice - once as observed, once as reconstructed.
+    # The JAX tracer still passes its own candidates and keeps that path.
     unique_edges = finalize_graph(nodes, edges, producer, child_of,
-                                  out_sources, merge_candidates,
+                                  out_sources, [],
                                   channel_axis=1)
 
     return Graph(

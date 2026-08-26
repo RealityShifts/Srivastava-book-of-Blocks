@@ -198,6 +198,25 @@ def _scan_ops_deep(fn, cls=None, _seen=None) -> list:
     except (OSError, TypeError, SyntaxError, IndentationError):
         return ops
 
+    # This function's own parameters. An op lifted out of a helper had
+    # ``on_params`` measured against the *helper's* signature, where a local
+    # like ``flow`` is a parameter; re-evaluating against the call site's
+    # arguments is what tells the two cases apart. ``self.resize(x)`` passes
+    # the caller's own ``x``, so the inlined interpolate really does transform
+    # the host's input; ``resize_flow(flow, ...)`` passes a local.
+    _caller_def = next((n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef)), None)
+    _caller_params = ({a.arg for a in _caller_def.args.args}
+                      if _caller_def else set())
+
+    def _reparent(sub, call):
+        """Re-evaluate a lifted op's ``on_params`` at this call site."""
+        names = [a.id for a in call.args if isinstance(a, ast.Name)]
+        on_params = bool(names) and all(nm in _caller_params for nm in names)
+        for op in sub:
+            op.inlined = True
+            op.on_params = on_params
+
     # ``self.<attr>(...)`` where <attr> is a plain method on the class - not a
     # submodule, not a parameter. ``inspect.isfunction`` on the *class*
     # attribute is what separates the two: a submodule is an instance
@@ -219,6 +238,7 @@ def _scan_ops_deep(fn, cls=None, _seen=None) -> list:
         sub = _scan_ops_deep(target, cls, _seen)
         if not sub:
             continue
+        _reparent(sub, call)
         # Order the helper's ops among the caller's: same line as the call,
         # with a fractional column so they stay in their own source order and
         # land just before whatever else sits on that line.
@@ -253,6 +273,7 @@ def _scan_ops_deep(fn, cls=None, _seen=None) -> list:
         sub = _scan_ops_deep(target, cls, _seen)
         if not sub:
             continue
+        _reparent(sub, call)
         base_col = call.col_offset
         for i, op in enumerate(sorted(sub, key=lambda o: (o.lineno, o.col))):
             op.lineno = call.lineno
@@ -433,6 +454,16 @@ class _Op:
     # ``self.fuse(torch.cat([h, g]))`` - so it runs *before* that call and
     # feeds it, rather than consuming its result.
     wrapped: bool = False
+    # True when every named operand is a parameter of ``forward`` itself, so
+    # the op transforms the host's own input rather than a value some child
+    # produced. ``MotionEncoder``'s ``F.interpolate(x, ...)`` is the case; an
+    # op on a local like ``flow`` is not, even when neither has an anchor.
+    on_params: bool = False
+    # True once the op has been lifted out of a helper into its caller. The
+    # flag above was computed against the *helper's* signature - ``resize_flow``
+    # takes ``flow`` as a parameter - so after inlining it no longer says
+    # anything about the caller's own inputs and must not be trusted.
+    inlined: bool = False
 
 
 def _scan_ops(fn: Optional[Callable]) -> list:
@@ -636,6 +667,8 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 attrs.append(prior[-1])
         op.operand_attrs = tuple(attrs)
         op.local_only = bool(op.operand_names) and not attrs and not any(
+            nm in param_names for nm in op.operand_names)
+        op.on_params = bool(op.operand_names) and all(
             nm in param_names for nm in op.operand_names)
         op.wrapped = any(
             c.lineno == op.lineno
@@ -1081,8 +1114,9 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                         tip[b] = node.id
                     merged = True
 
-            if not merged and not anchors and not op_info.after \
-                    and not op_info.prev_call and kids_ids:
+            if (not merged and not anchors and not op_info.after
+                    and not op_info.prev_call and kids_ids
+                    and op_info.on_params):
                 # A unary op applied to the host's own input, before any child
                 # has run: ``x = self.resize(x)`` (an inlined ``F.interpolate``)
                 # or a bare ``x = x.float()`` at the top of a forward. There is
@@ -1090,6 +1124,19 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                 # apply and the op would be dropped - which is what hid the
                 # motion encoder's downscale from the graph entirely. Splice it
                 # between the host's inputs and the first child instead.
+                #
+                # Gated on the operands actually being ``forward``'s own
+                # parameters. "No anchor" alone does not mean "at the top of
+                # forward": an op on a local produced by a child - the flow
+                # field resized inside a decoder loop - also finds no anchor,
+                # and splicing *that* between the host's inputs and its first
+                # child redirects every value the host received into it. The
+                # result is a single node with an arrow from every pyramid
+                # level and an arrow into nearly every module downstream,
+                # labelled with one resize's shapes. For an op lifted out of a
+                # helper, ``on_params`` is re-evaluated at the call site (see
+                # ``_reparent``) - ``self.resize(x)`` forwards the host's own
+                # input, ``resize_flow(flow, ...)`` forwards a local.
                 srcs = []
                 for aid in cand["in_ids"]:
                     src = producer.get(aid)
@@ -1326,6 +1373,8 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # rewired - but the renderer resolves a collapsed container to its
     # descendants' edges at draw time, so nothing is missing on screen. The
     # Flax graph is built the same way.
+    observed: set = set()
+
     # A reducing op (``x.mean(dim=(2, 3))``) emits a different shape than it
     # consumed, and bare ops are never intercepted, so nothing recorded that
     # shape at trace time. It can only be read off the module that received the
@@ -1334,9 +1383,16 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # output edge does not exist yet, so any guess has to fall back on
     # execution order and lands on a skip connection as often as on the true
     # consumer.
-    for n in nodes:
+    # These relabels reconstruct shapes the AST path could not record. A
+    # tracer that observed the ops directly (the PyTorch _OpTracer) supplies
+    # them already, and re-deriving from neighbours would overwrite fact with
+    # inference - so they run only when there were candidates to synthesize
+    # from in the first place.
+    for n in (nodes if merge_candidates else ()):
         if not n.op or n.op in _SHAPE_PRESERVING or not n.outputs:
             continue
+        if n.id in observed:
+            continue                 # already labelled from a real call
         in_shape = tuple(n.outputs[0].shape)
         relabelled = False
         for e in edges:
@@ -1375,8 +1431,8 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # ``a`` alone while the Linear reads the sum. Take the consumer's recorded
     # input, which is the concatenated width. Guarded to widening only, so this
     # never rewrites a reduction handled above.
-    for n in nodes:
-        if n.op not in _JOIN_OPS or not n.outputs:
+    for n in (nodes if merge_candidates else ()):
+        if n.op not in _JOIN_OPS or not n.outputs or n.id in observed:
             continue
         have = tuple(n.outputs[0].shape)
         for e in edges:
@@ -1396,6 +1452,46 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # was never recorded. Running it here rather than beside the producer
     # repair matters: before op synthesis, a leaf feeding a residual add would
     # be linked past the add to whatever came next.
+    # An op that ends its module has no consumer inside it - the value leaves
+    # along the module's own outgoing edge. Hand that edge over: whatever
+    # consumed the module consumed this op's result. Done before the generic
+    # repair below so those nodes are already wired and it has less to guess.
+    _has_out = {e.src for e in edges}
+    _by_src: dict = {}
+    for e in edges:
+        _by_src.setdefault(e.src, []).append(e)
+    for n in nodes:
+        if n.kind != "merge" or n.id in _has_out or n.parent is None:
+            continue
+        if not n.outputs:
+            continue
+        want = tuple(n.outputs[0].shape)
+        for e in _by_src.get(n.parent, []):
+            if tuple(e.tensor.shape) == want and e.dst != n.id:
+                e.src = n.id
+
+    # An observed op whose result nothing drawn consumes is an interior step of
+    # a larger expression: ``L2Norm`` adds an epsilon, then rsqrts, then
+    # multiplies, and only ops on the drawn list become nodes. Splicing it out
+    # - handing its incoming edges to whatever its own consumers were - is
+    # honest about that, and better than leaving a node whose arrow goes
+    # nowhere. Ops with no consumer *and* no incoming edges are dropped
+    # outright; there is nothing to splice.
+    _drop: set = set()
+    for n in nodes:
+        if n.kind != "merge" or n.id in {e.src for e in edges}:
+            continue
+        if any(o["src"] == n.id for o in out_sources):
+            continue                     # the model actually returns this
+        _drop.add(n.id)
+    if _drop:
+        edges[:] = [e for e in edges
+                    if e.dst not in _drop and e.src not in _drop]
+        # The nodes themselves are removed at the very end, with the phantom
+        # joins: ``nodes`` is indexed by id (``nodes[e.src]``) throughout the
+        # rest of this function, so shrinking it here shifts every id past the
+        # first removal.
+
     _link_orphan_consumers(nodes, edges, children, out_sources)
 
     join_ids = {n.id for n in nodes
@@ -1469,8 +1565,9 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
     # Safe here: every id-indexed lookup above is done, and the renderer keys
     # nodes by id rather than by position, so the gaps left behind are fine.
-    if phantom:
-        nodes[:] = [n for n in nodes if n.id not in phantom]
+    if phantom or _drop:
+        gone = phantom | _drop
+        nodes[:] = [n for n in nodes if n.id not in gone]
 
     return unique_edges
 
