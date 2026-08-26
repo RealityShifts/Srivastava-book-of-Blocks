@@ -47,6 +47,7 @@ from ._core import (
     IN_BASE,
     Node,
     Tensor,
+    _op_label,
     _scan_ops_deep,
     finalize_graph,
 )
@@ -178,6 +179,7 @@ _TRACED_OPS = {
     "chunk": "✂", "split": "✂", "pad": "▣", "clamp": "clamp",
     "normalize": "norm", "layer_norm": "norm",
 }
+
 
 #: Ops that only shuffle metadata. They are followed for *edges* - the value
 #: keeps flowing - but never get a node, or every ``.expand`` broadcasting a
@@ -344,11 +346,42 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
                             self.on_produce(leaf, scope)
                 return out
 
+        # Describe operands that have no producer of their own. A binary op
+        # against a constant - ``resize_flow``'s ``resized * scale``, an
+        # epsilon added for numerical safety - otherwise draws a single arrow
+        # in, leaving "multiplied by what?" unanswerable from the diagram. The
+        # value is not on any wire, so it belongs on the card instead.
+        consts = []
+        tagged = {id(a) for a in _leaves(args)
+                  if isinstance(a, torch.Tensor) and id(a) in self.tags}
+        for a in _leaves(args):
+            if id(a) in tagged:
+                continue
+            if a.numel() <= 4:
+                vals = [round(float(v), 4) for v in a.flatten().tolist()]
+                consts.append(vals[0] if len(vals) == 1 else vals)
+            else:
+                consts.append(f"const{tuple(a.shape)}")
+        # ``_leaves`` keeps only tensors, but a bare Python scalar is just as
+        # much an operand - ``2.0 * sx`` in ``warp_bilinear`` normalizing pixel
+        # coordinates - and is the whole answer to "times what?" on that card.
+        try:
+            flat = pytree.tree_leaves(args)
+        except Exception:                  # pragma: no cover - exotic types
+            flat = list(args)
+        for a in flat:
+            if isinstance(a, bool):
+                continue                   # flags, not operands
+            if isinstance(a, (int, float)):
+                consts.append(a)
+
         nid = -(len(self.nodes) + 1)      # provisional; renumbered on merge
         self.nodes.append({
             "tmp_id": nid,
             "op": name,
             "sym": glyph,
+            "label": _op_label(name, glyph),
+            "consts": consts,
             "scope": self.scope[-1] if self.scope else None,
             "in": Tensor(tuple(first.shape), _dtype(first)),
             "out": Tensor(tuple(res.shape), _dtype(res)),
@@ -640,16 +673,23 @@ def trace_model(
         tmp_to_id[rec["tmp_id"]] = nid
         nodes.append(Node(
             id=nid,
-            path=(f"{host_node.path}.{rec['sym']}"
+            # Path keeps the bare op name - it is an identifier, and a space
+            # and a glyph in it read badly in a tooltip or a search. The glyph
+            # rides on ``name``, which is what the card shows.
+            path=(f"{host_node.path}.{rec['op']}"
                   if host_node is not None and host_node.path != "<root>"
-                  else rec["sym"]),
-            name=rec["sym"],
+                  else rec["op"]),
+            name=rec["label"],
             cls=rec["op"],
             depth=(host_node.depth + 1) if host_node is not None else 0,
             parent=host,
             params=0, own_params=0,
             inputs=[rec["in"]], outputs=[rec["out"]],
-            config={}, kind="merge", op=rec["op"],
+            config=({"other operand": rec["consts"][0]}
+                    if len(rec["consts"]) == 1
+                    else {"other operands": rec["consts"]} if rec["consts"]
+                    else {}),
+            kind="merge", op=rec["op"],
             # Ops own no parameters, and the FLOP counter already attributes
             # their cost to the enclosing module, so leaving these empty keeps
             # the module roll-up exact rather than double-counting.

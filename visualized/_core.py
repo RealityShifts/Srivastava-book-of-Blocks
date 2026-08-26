@@ -356,6 +356,19 @@ _OP_SYMBOLS = {
     "interpolate": "⤢", "softmax": "σ",
 }
 
+def _op_label(op: str, glyph: str) -> str:
+    """Card label for an op node: the op's real name, plus its glyph.
+
+    A glyph alone is ambiguous once several ops share one - ``⧺`` is
+    ``concat`` *and* ``stack``, ``↳`` is ``reshape`` *and* ``view`` - and
+    those differ in ways that matter when reading a diagram. The name says
+    what the code called; the glyph stays because it is what makes an op
+    scannable among the module cards. Ops whose glyph is already their name
+    are not doubled up.
+    """
+    return op if glyph == op else f"{op} {glyph}"
+
+
 # Ops that join several values into one. Both spellings live here: JAX writes
 # ``jnp.concatenate``, PyTorch writes ``torch.cat``/``hstack``/``vstack``, and
 # the join logic below must recognise either. Listing only the JAX names left
@@ -566,7 +579,8 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 # shapes instead of its own.
                 operand_names = (node.args[0].id,)
             ops.append(_Op(
-                attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
+                attr, _op_label(attr, _OP_SYMBOLS.get(attr, attr)),
+                _dotted(node.func),
                 node.lineno, node.col_offset, len(node.args),
                 in_loop=id(node) in looped,
                 depth=depth_of.get(id(node), 0),
@@ -1576,6 +1590,6 @@ __all__ = [
     "Tensor", "Node", "Edge", "Graph",
     "INPUT_NODE", "IN_BASE", "finalize_graph",
     "_is_descendant", "_scan_ops", "_scan_ops_deep", "_concat_axis", "_concat_compatible",
-    "_Op", "_BINOPS", "_OP_ROOTS", "_OP_SYMBOLS", "_SHAPE_PRESERVING",
+    "_Op", "_BINOPS", "_op_label", "_OP_ROOTS", "_OP_SYMBOLS", "_SHAPE_PRESERVING",
     "_INTERESTING",
 ]
