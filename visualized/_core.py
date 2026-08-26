@@ -566,7 +566,7 @@ def _scan_ops(fn: Optional[Callable]) -> list:
                 # shapes instead of its own.
                 operand_names = (node.args[0].id,)
             ops.append(_Op(
-                attr, _OP_SYMBOLS.get(attr, attr), _dotted(node.func),
+                attr, attr, _dotted(node.func),
                 node.lineno, node.col_offset, len(node.args),
                 in_loop=id(node) in looped,
                 depth=depth_of.get(id(node), 0),

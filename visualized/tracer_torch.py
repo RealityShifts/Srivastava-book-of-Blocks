@@ -697,9 +697,9 @@ def trace_model(
         tmp_to_id[rec["tmp_id"]] = nid
         nodes.append(Node(
             id=nid,
-            path=(f"{host_node.path}.{rec['sym']}"
+            path=(f"{host_node.path}.{rec['op']}"
                   if host_node is not None and host_node.path != "<root>"
-                  else rec["sym"]),
+                  else rec["op"]),
             name=rec["sym"],
             cls=rec["op"],
             depth=(host_node.depth + 1) if host_node is not None else 0,
