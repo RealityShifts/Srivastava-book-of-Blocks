@@ -180,6 +180,11 @@ _TRACED_OPS = {
     "transpose", "squeeze", "unsqueeze",
     "chunk", "split", "pad", "clamp",
     "normalize", "layer_norm",
+    # Convolution called functionally rather than through nn.Conv2d. A module
+    # that keeps its kernel in a *buffer* - AliasFreeActivation's windowed-sinc
+    # up/down filters - has no child module for the hooks to see, so without
+    # this its entire body is invisible and it renders as a bare constant.
+    "conv1d", "conv2d", "conv3d", "conv_transpose2d",
     # Grid builders. These construct a value rather than transform one, so it
     # is tempting to treat them as invisible - but then whatever consumes the
     # grid shows an operand arriving from an anonymous constant, and the
@@ -196,6 +201,9 @@ _INVISIBLE_OPS = {
     "half", "clone", "requires_grad_",
     "tensor", "as_tensor", "empty", "zeros", "ones", "full", "zeros_like",
     "ones_like", "__get__", "size", "dim", "item", "numel",
+    # Allocation, not computation: never drawn, but must not sever the chain
+    # either - AliasFreeActivation builds its zero-stuffed tensor this way.
+    "new_zeros", "new_ones", "new_empty", "new_full", "new_tensor",
     # Slices and views re-present an existing value rather than computing a new
     # one. Untagged, ``flow[:, 0]`` severs the flow field's provenance and the
     # add that consumes it appears to take an operand from nowhere.
@@ -272,6 +280,27 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         name = getattr(func, "__name__", "")
+        # In-place assignment - ``stuffed[:, :, ::2, ::2] = x``. It does not fit
+        # the passthrough below: those forward a tag from the first argument to
+        # the *result*, but ``__setitem__`` returns None and the value that
+        # matters is the one being assigned. The tag has to move from the
+        # source (args[2]) onto the mutated target (args[0]) instead.
+        #
+        # Without this the target keeps whatever tag its allocation had - none,
+        # for a fresh ``new_zeros`` - so the real input is severed and the
+        # enclosing module traces as a constant with no incoming edge. This is
+        # exactly how AliasFreeActivation's input enters it.
+        if self.enabled and name == "__setitem__" and len(args) >= 3:
+            out = func(*args, **kwargs)
+            target, value = args[0], args[2]
+            if isinstance(target, torch.Tensor) and isinstance(value, torch.Tensor):
+                src = self.tags.get(id(value))
+                if src is not None:
+                    self.tag(target, src)
+                    if self.on_produce is not None:
+                        self.on_produce(target, src)
+            return out
+
         if not self.enabled or name in _INVISIBLE_OPS:
             out = func(*args, **kwargs)
             # A metadata-only op still passes the value along, so the result
