@@ -257,6 +257,11 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
         # edge.
         self.tags: dict = {}
         self._keepalive: list = []
+        #: Set by the tracer to the shared execution counter, so an op's
+        #: recorded position sits on the same timeline as the modules around
+        #: it. ``None`` leaves ``seq`` unset and the caller falls back to id
+        #: ordering.
+        self.next_seq = None
         #: Called as ``on_produce(tensor, tmp_id)`` when an op produces a
         #: value. The tracer points the shared producer map at the op, so a
         #: module consuming the result resolves to the op rather than to
@@ -436,9 +441,15 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
             "op": name,
             "sym": name,
             "scope": self.scope[-1] if self.scope else None,
-            "in": Tensor(tuple(first.shape), _dtype(first)),
+            # Every tensor source, not just the first. Recording one shape
+            # made a 3-input torch.cat render as 1-input, which hid the warped
+            # skip feeding each mixer join and made the per-level flow look
+            # like it fed nothing. The edges were always complete; only this
+            # card was lossy.
+            "ins": [tsr for _, tsr in srcs] or [Tensor(tuple(first.shape),
+                                                       _dtype(first))],
             "out": Tensor(tuple(res.shape), _dtype(res)),
-            "n_in": len(srcs),
+            "seq": self.next_seq() if self.next_seq is not None else None,
         })
         for src, tsr in srcs:
             self.edges.append((src, nid, tsr))
@@ -485,6 +496,16 @@ def trace_model(
     keepalive: list = []
     stack: list = []         # currently-executing node ids
     order: list = []         # completion order, for skip-edge detection
+    # One monotonic counter shared by modules and bare ops, so both land on a
+    # single timeline. ``Node.id`` cannot serve: ops are renumbered onto the end
+    # after tracing, which pushes every op past every module regardless of when
+    # it ran. The renderer sorts on ``order`` and says so at renderer.py:377 -
+    # this is what makes that contract true.
+    exec_seq: list = [0]
+
+    def _next_seq() -> int:
+        exec_seq[0] += 1
+        return exec_seq[0]
     child_of: dict = {}      # node id -> ids of modules it called directly
     produced_by: dict = {}   # node id -> ids of the tensors it returned
     merge_candidates: list = []   # calls that combined values with bare ops
@@ -528,6 +549,7 @@ def trace_model(
         keepalive.append(leaf)
 
     op_tracer.on_produce = _op_produced
+    op_tracer.next_seq = _next_seq
 
     def _register(obj: Any, node_id: int, *, claim: bool = True) -> None:
         """Record ``node_id`` as the producer of every tensor leaf in ``obj``.
@@ -560,6 +582,7 @@ def trace_model(
             outputs=[],
             config=_config_of(mod),
         )
+        node.order = _next_seq()
         nodes.append(node)
         if node.parent is not None:
             child_of.setdefault(node.parent, []).append(node.id)
@@ -734,12 +757,15 @@ def trace_model(
             depth=(host_node.depth + 1) if host_node is not None else 0,
             parent=host,
             params=0, own_params=0,
-            inputs=[rec["in"]], outputs=[rec["out"]],
+            inputs=list(rec["ins"]), outputs=[rec["out"]],
             config={}, kind="merge", op=rec["op"],
             # Ops own no parameters, and the FLOP counter already attributes
             # their cost to the enclosing module, so leaving these empty keeps
             # the module roll-up exact rather than double-counting.
-            order=nid, flops=-1, own_flops=0,
+            # True call position, not the renumbered id: ops are appended
+            # after every module, so `nid` would sort them all to the end.
+            order=rec.get("seq") if rec.get("seq") is not None else nid,
+            flops=-1, own_flops=0,
         ))
     # Edges recorded against provisional ids, plus the ones the module hooks
     # wrote while the producer map still held a provisional id.
@@ -751,6 +777,7 @@ def trace_model(
     for rec in op_tracer.nodes:
         op_id = tmp_to_id[rec["tmp_id"]]
         host = nodes[op_id].parent
+        extras_seen: list = []
         for extra in rec.get("extras", ()):
             kind = extra["kind"]
             val = extra["value"]
@@ -772,9 +799,16 @@ def trace_model(
                 inputs=[], outputs=[extra["tensor"]],
                 config=({} if val is None else {"value": val}),
                 kind="merge", op=kind,
-                order=cid, flops=-1, own_flops=0,
+                # Just ahead of the op that consumes it, so a constant renders
+                # as that op's input rather than at the graph's end. Nudged by
+                # its index within the op so two constants feeding one call do
+                # not collide on the same sort key.
+                order=(nodes[op_id].order - 0.5 + 0.01 * len(extras_seen)
+                       if nodes[op_id].order is not None else cid),
+                flops=-1, own_flops=0,
             ))
             edges.append(Edge(cid, op_id, extra["tensor"]))
+            extras_seen.append(cid)
 
     for src, dst, tsr in op_tracer.edges:
         s_id = tmp_to_id.get(src, src)
