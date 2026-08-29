@@ -18,6 +18,7 @@ import ast
 import dataclasses
 import inspect
 import textwrap
+import warnings
 from typing import Any, Callable, Optional
 
 
@@ -1567,7 +1568,82 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
     # nodes by id rather than by position, so the gaps left behind are fine.
     if phantom or _drop:
         gone = phantom | _drop
+        # The two inferred-edge repairs above (producer-side and consumer-side)
+        # run before ``gone`` is known and can wire an edge to a node that is
+        # about to be pruned - a phantom join, or a _drop. Left alone those
+        # edges point at an id the renderer cannot resolve, so the branch draws
+        # as a dead end: a mean whose consumer simply vanishes. Splice through
+        # the pruned node instead of deleting, so a chain that really does
+        # continue keeps its arrow.
+        gone_in: dict = {}
+        gone_out: dict = {}
+        for e in unique_edges:
+            if e.dst in gone:
+                gone_in.setdefault(e.dst, []).append(e)
+            if e.src in gone:
+                gone_out.setdefault(e.src, []).append(e)
+
+        def _live(start, side, seen):
+            """Nearest live node reachable through a run of pruned ones."""
+            out = []
+            for e in (gone_out if side == "dst" else gone_in).get(start, ()):
+                nxt = e.dst if side == "dst" else e.src
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                if nxt in gone:
+                    out.extend(_live(nxt, side, seen))
+                else:
+                    out.append((nxt, e))
+            return out
+
+        spliced: list = []
+        for e in unique_edges:
+            if e.src in gone and e.dst in gone:
+                continue            # wholly inside a pruned run
+            if e.dst in gone:
+                for dst, _ in _live(e.dst, "dst", {e.dst}):
+                    spliced.append(Edge(e.src, dst, e.tensor,
+                                        skip=e.skip, inferred=True))
+            elif e.src in gone:
+                for src, _ in _live(e.src, "src", {e.src}):
+                    spliced.append(Edge(src, e.dst, e.tensor,
+                                        skip=e.skip, inferred=True))
+            else:
+                spliced.append(e)
+
+        seen_sig = set()
+        unique_edges = []
+        for e in spliced:
+            sig = (e.src, e.dst)
+            if e.src == e.dst or sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            unique_edges.append(e)
+
         nodes[:] = [n for n in nodes if n.id not in gone]
+
+    # A dangling endpoint is always a bug in this function, never a property of
+    # the model: it renders as a branch that stops for no reason. Drop what
+    # survived rather than emitting a graph the renderer will draw wrong, and
+    # say so, so a future regression here is visible instead of silent.
+    # Negative ids are the renderer's input/output pills (INPUT_NODE, the
+    # IN_BASE - i argument pills, the OUT_BASE - i result pills), not nodes -
+    # they resolve fine and must not be mistaken for dangling.
+    live = {n.id for n in nodes}
+    def _resolvable(i: int) -> bool:
+        return i in live or i < 0
+    stray = [e for e in unique_edges
+             if not _resolvable(e.src) or not _resolvable(e.dst)]
+    if stray:
+        warnings.warn(
+            f"graph: dropped {len(stray)} edge(s) with unresolvable endpoints "
+            f"(e.g. {stray[0].src}->{stray[0].dst}); "
+            "the trace is complete but this branch would draw as a dead end.",
+            stacklevel=2,
+        )
+        drop = {id(e) for e in stray}
+        unique_edges = [e for e in unique_edges if id(e) not in drop]
 
     return unique_edges
 
