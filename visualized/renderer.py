@@ -78,6 +78,19 @@ svg { width:100%; height:100%; display:block; }
 .stat span:first-child { color:var(--muted); flex:none; }
 .stat span:last-child { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   text-align:right; word-break:break-word; min-width:0; }
+/* Rows that pan the view to another node. Selection deliberately does not move,
+   so the only feedback is this hover state plus the target's .flash pulse. */
+.stat.link { cursor:pointer; }
+.stat.link:hover span { color:var(--accent); }
+/* Panel heading for the selected node - #title is the model name and is set once
+   at startup, so the node's own identity had nowhere to live. */
+#detail .nodehead { display:flex; justify-content:space-between; gap:10px;
+  align-items:baseline; cursor:pointer; padding:0 0 8px;
+  border-bottom:1px solid var(--line); margin-bottom:4px; }
+#detail .nodehead b { font-size:13px; }
+#detail .nodehead span { color:var(--muted); font-size:10px;
+  text-transform:uppercase; letter-spacing:.08em; flex:none; }
+#detail .nodehead:hover b, #detail .nodehead:hover span { color:var(--accent); }
 h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
   color:var(--muted); margin:18px 0 6px; }
 /* Each detail section is a <details>, so a long sidebar can be folded down to
@@ -150,6 +163,17 @@ button:hover { border-color:var(--accent); }
 .node.sel rect, .outnode.sel rect, .innode.sel rect {
   stroke:var(--hi); stroke-width:2.5px; }
 .node.dim, .outnode.dim, .innode.dim { opacity:.28; }
+/* Pulse for a node panned to from the details panel. Selection stays where it
+   was - deliberately, so the panel keeps describing what you were reading - so
+   this is the only thing that says which node was jumped to. Also overrides
+   .dim, since the target is usually not adjacent to the selection. */
+@keyframes flashpulse {
+  0%, 100% { stroke:var(--hi); stroke-width:2.5px; }
+  50%      { stroke:var(--accent); stroke-width:5px; }
+}
+.node.flash rect, .outnode.flash rect, .innode.flash rect {
+  animation:flashpulse .45s ease-in-out 2; }
+.node.flash, .outnode.flash, .innode.flash { opacity:1 !important; }
 .innode { cursor:pointer; }
 .innode text { pointer-events:none; }
 /* Keyboard focus needs a marker distinct from selection: arrowing through the
@@ -377,6 +401,24 @@ const mergeIds = new Set(
 // Execution position. Merge nodes are appended after tracing, so their raw id
 // is far higher than their siblings'; ``order`` puts them back in sequence.
 const ord = n => (typeof n === 'object' ? n : byId.get(n) || {}).order ?? 0;
+// Neighbours, indexed off DATA.edges rather than layout.edges: the raw list
+// names the true producer even when it is hidden inside a collapsed container,
+// where layout.edges would already have folded it onto the visible ancestor.
+//
+// This is an index over the trace, not a second copy of it - a `sources` field
+// baked into each node by the tracer is exactly the kind of derived-fact
+// duplication that produced the `order`/`inputs` bugs this file has already had.
+//
+// Edges whose endpoints are missing are skipped: 25 dangling edges survive in
+// the current graphs, and byId.get on them returns undefined.
+const inEdges = new Map(), outEdges = new Map();
+DATA.edges.forEach(e => {
+  if (!byId.has(e.src) || !byId.has(e.dst)) return;
+  if (!inEdges.has(e.dst)) inEdges.set(e.dst, []);
+  if (!outEdges.has(e.src)) outEdges.set(e.src, []);
+  inEdges.get(e.dst).push(e);
+  outEdges.get(e.src).push(e);
+});
 const kids = new Map();
 DATA.nodes.forEach(n => {
   if (n.parent !== null) {
@@ -1508,6 +1550,44 @@ function reveal(id) {
   apply();
 }
 
+// Deliberate centring, unlike ``reveal``'s nudge-into-the-margin: a click that
+// asks to go somewhere should land it in the middle rather than just inside the
+// edge. Returns false when the node has no drawn position.
+function centerOn(id) {
+  const p = layout.pos.get(id);
+  if (!p) return false;
+  const r = svg.getBoundingClientRect();
+  tx = r.width / 2 - (p.x + NW / 2) * k;
+  ty = r.height / 2 - (p.y + NH / 2) * k;
+  apply();
+  return true;
+}
+
+let flashTimer = null;
+function flash(id) {
+  root.querySelectorAll('.flash').forEach(g => g.classList.remove('flash'));
+  const g = root.querySelector(`.node[data-id="${id}"], ` +
+                               `.outnode[data-id="${id}"], ` +
+                               `.innode[data-id="${id}"]`);
+  if (!g) return;
+  // Re-adding the class in the same frame would not restart the animation.
+  void g.offsetWidth;
+  g.classList.add('flash');
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => g.classList.remove('flash'), 1000);
+}
+
+// Pan to a node named in the details panel. ``selected`` is left alone on
+// purpose - the panel keeps describing whatever you were reading, so following a
+// link never costs you your place. A target hidden inside a collapsed container
+// resolves to the visible ancestor standing in for it rather than expanding
+// anything, leaving the collapse state as the reader arranged it.
+function gotoNode(id) {
+  if (!byId.has(id)) return;
+  const target = isHidden(id) ? proxy(id) : id;
+  if (centerOn(target)) flash(target);
+}
+
 window.addEventListener('keydown', e => {
   // Never hijack typing, and leave modified keys to the browser.
   const t = e.target;
@@ -1593,6 +1673,37 @@ const secOpen = new Map();
 const sec = (title, body) =>
   `<details class="sec"${secOpen.get(title) === false ? '' : ' open'}>` +
   `<summary>${title}</summary>${body}</details>`;
+
+// Distinct neighbours on one side of a node, as clickable rows.
+//
+// Listed as *nodes* rather than as links on the Inputs/Outputs rows, because a
+// tensor entry carries only {shape, dtype} and cannot say which edge produced
+// it: matching rows to edges by shape is ambiguous for 21% of the inputs in
+// arch_768 (synthesis.cat has two distinct sources both shaped (1, 64)), so a
+// per-row link would silently jump to the wrong node. A node list has no such
+// ambiguity.
+//
+// De-duplicated by id: two tensors can travel the same pair of nodes, and the
+// reader wants the neighbour once.
+const NB_CAP = 12;
+function neighbours(id, edges, key) {
+  const seen = new Map();
+  (edges.get(id) || []).forEach(e => {
+    const other = byId.get(e[key]);
+    if (other && !seen.has(other.id)) seen.set(other.id, other);
+  });
+  const all = [...seen.values()].sort((a, b) => ord(a) - ord(b));
+  if (!all.length)
+    return '<div class="stat"><span>none</span><span></span></div>';
+  const shown = all.slice(0, NB_CAP).map(o =>
+    `<div class="stat link" data-goto="${o.id}">` +
+    `<span>${esc(o.cls)}</span><span>${esc(o.path || '&lt;root&gt;')}</span></div>`
+  ).join('');
+  return all.length > NB_CAP
+    ? shown + `<div class="stat"><span>+${all.length - NB_CAP} more</span>` +
+              `<span></span></div>`
+    : shown;
+}
 
 function detail() {
   const box = document.getElementById('detail');
@@ -1681,15 +1792,21 @@ function detail() {
   }
   const cfg = Object.entries(n.config);
   box.innerHTML =
+    // Clicking the heading pans back to the node the panel describes, for when
+    // following a link or dragging has carried it off screen.
+    `<div class="nodehead" data-goto="${n.id}" title="Center this node">` +
+    `<b>${esc(n.cls)}</b><span>recenter</span></div>` +
     (n.error ? `<div class="err"><code>${esc(n.error)}</code></div>` : '') +
     sec('Module', rows.map(r =>
       `<div class="stat"><span>${r[0]}</span><span>${r[1]}</span></div>`).join('')) +
     sec('Inputs', n.inputs.length ? n.inputs.map(t =>
       `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
       ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
+    sec('Sources', neighbours(n.id, inEdges, 'src')) +
     sec('Outputs', n.outputs.length ? n.outputs.map(t =>
       `<div class="stat"><span>${t.dtype}</span><span>${shp(t)}</span></div>`
       ).join('') : '<div class="stat"><span>none</span><span></span></div>') +
+    sec('Consumers', neighbours(n.id, outEdges, 'dst')) +
     (cfg.length ? sec('Config', cfg.map(([a, b]) =>
       `<div class="stat"><span>${esc(a)}</span><span>${esc(String(b))}</span></div>`
       ).join('')) : '');
@@ -1704,6 +1821,13 @@ document.getElementById('detail').addEventListener('toggle', e => {
   if (d.classList && d.classList.contains('sec'))
     secOpen.set(d.querySelector('summary').textContent, d.open);
 }, true);
+
+// Delegated, because ``detail`` replaces the panel's innerHTML wholesale on every
+// selection change and per-row handlers would not survive it.
+document.getElementById('detail').addEventListener('click', e => {
+  const row = e.target.closest('[data-goto]');
+  if (row) gotoNode(+row.dataset.goto);
+});
 
 // Hiding the panel hands its 310px back to the canvas, so the graph is refit
 // once the width transition has finished rather than against a stale size.
