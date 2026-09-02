@@ -1686,9 +1686,31 @@ const sec = (title, body) =>
 // De-duplicated by id: two tensors can travel the same pair of nodes, and the
 // reader wants the neighbour once.
 const NB_CAP = 12;
+// Every node under `id`, so a container can borrow its children's edges.
+function cardDesc(id) {
+  const out = [];
+  const walk = i => (kids.get(i) || []).forEach(c => { out.push(c); walk(c); });
+  walk(id);
+  return out;
+}
 function neighbours(id, edges, key) {
   const seen = new Map();
-  (edges.get(id) || []).forEach(e => {
+  let own = edges.get(id) || [];
+  // A container records no outgoing edge of its own: the tracer hands each one
+  // down to the child op that actually produced the value (see the reparenting
+  // pass in tracer_torch). The canvas hides that because `proxy` resolves an
+  // edge to its outermost collapsed ancestor, but this panel reads the raw
+  // index and so reported "none" as the Consumers of all 222 module nodes in
+  // arch_768. Fall back to the subtree and keep the edges that leave it, which
+  // is the same set the collapsed box draws.
+  if (!own.length && hasKids(id)) {
+    const inside = new Set([id, ...cardDesc(id)]);
+    own = [];
+    inside.forEach(d => (edges.get(d) || []).forEach(e => {
+      if (!inside.has(e[key])) own.push(e);
+    }));
+  }
+  own.forEach(e => {
     const other = byId.get(e[key]);
     if (other && !seen.has(other.id)) seen.set(other.id, other);
   });
