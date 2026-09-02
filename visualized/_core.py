@@ -718,6 +718,33 @@ def _concat_compatible(a: Tensor, b: Tensor, channel_axis: int = -1) -> bool:
 # Post-trace graph surgery
 # ---------------------------------------------------------------------------
 
+def _flows_forward(nodes, src: int, dst: int) -> bool:
+    """Could a value produced by ``src`` reach ``dst`` in one forward pass?
+
+    Only ``order`` is consulted - the true call sequence recorded while tracing.
+    A value cannot be consumed before it is produced, so an edge whose source
+    ran *later* than its destination is impossible regardless of how well the
+    shapes agree.
+
+    This is the guard the shape heuristics need. Matching a producer to a
+    consumer by shape alone is ambiguous wherever a resolution level repeats a
+    channel count: on arch_768 it wired ``synthesis.res.0.conv2.norm``
+    (order 574) into ``synthesis.to_flows.0.conv.reshape`` (order 512) and did
+    the same at four more pyramid levels, drawing an arrow backwards through
+    time. torchvista never has this class of bug because it keys every edge on
+    ``id(tensor)`` and infers nothing; this project synthesizes edges for bare
+    array ops that lose that identity, so it needs an explicit test instead.
+
+    Unknown order is treated as forward: it means the node predates the
+    sequence counter rather than that the edge is invalid.
+    """
+    a = nodes[src].order if src < len(nodes) else None
+    b = nodes[dst].order if dst < len(nodes) else None
+    if a is None or b is None:
+        return True
+    return a <= b
+
+
 def finalize_graph(nodes, edges, producer, child_of, out_sources,
                    merge_candidates, channel_axis: int = -1):
     """Turn a raw trace into the graph the renderer draws.
@@ -786,7 +813,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
             if not ok and len(gs) == len(ws) and len(gs) >= 2:
                 differing = [i for i in range(len(gs)) if gs[i] != ws[i]]
                 ok = len(differing) == 1 and gs[differing[0]] < ws[differing[0]]
-            if ok:
+            if ok and _flows_forward(nodes, prev_leaf, nid):
                 edges.append(Edge(prev_leaf, nid, want, inferred=True))
         prev_leaf = nid
 
@@ -900,6 +927,8 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
                     nxt = m
                     break
             if nxt is None:
+                continue
+            if not _flows_forward(nodes, nid, nxt):
                 continue
             edges.append(Edge(nid, nxt, out_t, inferred=True))
 
