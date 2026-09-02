@@ -574,7 +574,15 @@ function relayout() {
         // Match by shape first; fall back to any recorded link.
         let linked = tsr ? ds.filter(c => linkTest(c, true)) : [];
         if (!linked.length) linked = ds.filter(c => linkTest(c, false));
-        if (linked.length) pool = linked;
+        // No descendant carries a recorded edge to the far endpoint, so there
+        // is nothing to descend *to*. Falling through to pick() here chose the
+        // subtree's first/last leaf by execution order and drew an arrow that
+        // the trace never recorded - synthesis.to_flows.0.conv (3 out channels)
+        // to synthesis.res.0 (512 in) was one, an edge no tensor could travel.
+        // Stopping at the container is honest: the value does cross this
+        // boundary, and which leaf carries it is exactly what is unknown.
+        if (!linked.length) break;
+        pool = linked;
       }
       cur = pick(pool, wantLast);
     }
