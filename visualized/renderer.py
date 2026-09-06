@@ -1340,16 +1340,48 @@ function zoomBy(f) {
 // Expand a container in place. Its children join the main dagre pass and stay
 // wired to the rest of the model by their real edges; the frame drawn around
 // them is what makes the group readable as one block.
+//
+// Both of these re-anchor the view on the card that was clicked. relayout()
+// re-runs dagre over a different node set, so every position shifts and the
+// normalize step re-origins the whole drawing; the camera, left untouched,
+// then pointed at wherever the old graph happened to sit. A model whose root
+// has a single child - Wrap -> FMGenerator, say - moves far enough on the
+// first expand that the children land outside the viewport, so the canvas
+// looked frozen and the expand looked broken when it had already happened
+// off-screen. Holding the clicked node under the same screen point keeps the
+// gesture legible: the card stays put and its contents unfold around it.
+function recenterOn(id, run) {
+  const before = layout.pos.get(id);
+  // Screen point the card occupied before the relayout, so it can be pinned
+  // back to the same place afterwards.
+  const sx = before ? before.x * k + tx : null;
+  const sy = before ? before.y * k + ty : null;
+  run();
+  // An expanded container stops being a card and becomes a frame, so it leaves
+  // ``pos`` entirely - look it up among the frames before giving up. Anchoring
+  // on the frame's top-left keeps the block visually rooted where the card was.
+  let after = layout.pos.get(id);
+  if (!after) {
+    const f = layout.frames.find(f => f.id === id);
+    if (f) after = { x: f.x, y: f.y };
+  }
+  if (sx === null || !after) { fit(); return; }
+  tx = sx - after.x * k;
+  ty = sy - after.y * k;
+  apply();
+}
+
 function groupOpen(id) {
-  collapsed.delete(id);
-  relayout();
+  recenterOn(id, () => { collapsed.delete(id); relayout(); });
 }
 
 function groupClose(id) {
-  collapsed.add(id);
-  groupDir.delete(id);
-  groupOffset.delete(id);
-  relayout();
+  recenterOn(id, () => {
+    collapsed.add(id);
+    groupDir.delete(id);
+    groupOffset.delete(id);
+    relayout();
+  });
 }
 
 svg.addEventListener('click', e => {
@@ -1958,6 +1990,23 @@ document.getElementById('zi').onclick = () => { k = Math.min(3, k * 1.2); apply(
 document.getElementById('zo').onclick = () => { k = Math.max(.12, k / 1.2); apply(); };
 const MAXD = Math.max(1, ...DATA.nodes.map(n => n.depth));
 let level = 1;
+// The depth buttons step from what is *on screen*, not from a remembered
+// counter. ``level`` only ever tracked its own last value, while the per-card
+// +/- controls write ``collapsed`` directly - so after expanding one card by
+// hand, "Expand a level" recomputed the very depth that was already showing
+// and appeared to do nothing. Deriving the level back from the state makes the
+// two ways of expanding agree.
+//
+// The effective level is the shallowest depth at which a container is still
+// collapsed: that is exactly the next thing an expand would open.
+const currentLevel = () => {
+  let d = Infinity;
+  DATA.nodes.forEach(n => {
+    if (hasKids(n.id) && collapsed.has(n.id) && !isHidden(n.id))
+      d = Math.min(d, n.depth);
+  });
+  return Number.isFinite(d) ? d : MAXD;
+};
 const setLevel = d => {
   level = Math.min(MAXD, Math.max(1, d));
   expandToDepth(level);
@@ -1966,8 +2015,8 @@ const setLevel = d => {
   relayout();
   fit();
 };
-document.getElementById('exp').onclick = () => setLevel(level + 1);
-document.getElementById('col').onclick = () => setLevel(level - 1);
+document.getElementById('exp').onclick = () => setLevel(currentLevel() + 1);
+document.getElementById('col').onclick = () => setLevel(currentLevel() - 1);
 
 // ---------- export --------------------------------------------------------
 const save = (text, name, mime) => {
