@@ -744,7 +744,7 @@ def trace_model(
     tmp_to_id: dict = {}
     for rec in op_tracer.nodes:
         host = rec["scope"]
-        host_node = nodes[host] if host is not None and host < len(nodes) else None
+        host_node = nodes[host] if host is not None and 0 <= host < len(nodes) else None
         nid = len(nodes)
         tmp_to_id[rec["tmp_id"]] = nid
         nodes.append(Node(

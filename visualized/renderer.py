@@ -17,7 +17,7 @@ from typing import Optional
 # ``_core``, not ``.tracer``: this renderer serves both frameworks, and the
 # Flax tracer imports jax at module scope - reaching through it for three
 # framework-free symbols made every torch-only import of this package fail.
-from ._core import Graph, INPUT_NODE, IN_BASE
+from ._core import Graph, INPUT_NODE, IN_BASE, OUT_BASE
 
 
 _TEMPLATE = """<!doctype html>
@@ -505,7 +505,7 @@ const NW = 190, NH = 54, GAPX = 26, GAPY = 92;
 // Output pills take ids below every real node id (which start at 0) and below
 // __INPUT__, so the three id spaces never collide. Extra input pills (argument
 // two onward) sit in the gap between __INPUT__ and OUT_BASE.
-const OUT_BASE = -1000;
+const OUT_BASE = __OUT_BASE__;
 const IN_BASE = __IN_BASE__;
 const isOutput = id => id <= OUT_BASE;
 const isInput = id => id === __INPUT__ || (id <= IN_BASE && id > OUT_BASE);
@@ -2172,6 +2172,7 @@ def render_html(graph: Graph, title: Optional[str] = None) -> str:
     doc = _TEMPLATE.replace("__DATA__", payload)
     doc = doc.replace("__INPUT__", str(INPUT_NODE))
     doc = doc.replace("__IN_BASE__", str(IN_BASE))
+    doc = doc.replace("__OUT_BASE__", str(OUT_BASE))
     # Substituted last: the bundle is ~96KB of minified JS and must not be
     # scanned for the other placeholders.
     doc = doc.replace("/*__DAGRE__*/", _dagre_source())

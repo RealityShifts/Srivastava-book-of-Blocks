@@ -22,11 +22,24 @@ import warnings
 from typing import Any, Callable, Optional
 
 
-# Synthetic node id meaning "the model's own input" (see each tracer).
-INPUT_NODE = -1
+# Synthetic node ids for the renderer's input/output pills. They are NEGATIVE so
+# they can never collide with a real node id, and they are HUGE for a reason
+# that is easy to miss: ``nodes`` is a list indexed by id all through the
+# post-trace surgery, and Python happily indexes a list with a small negative
+# number. With INPUT_NODE = -1, ``nodes[INPUT_NODE]`` returned the LAST node,
+# so every edge out of the first model input was silently re-attributed to
+# whatever op ran last and the input pill rendered with no consumer. IN_BASE =
+# -500 had the same failure on any graph with more than 500 nodes (a real
+# renderer traces ~2,800). Keep all three beyond any plausible node count and
+# well inside JS's safe-integer range; the renderer substitutes them by name.
+INPUT_NODE = -1_000_000_001
 # Arguments after the first get their own input pills, numbered IN_BASE - i.
-# The renderer mirrors both constants - keep them in step.
-IN_BASE = -500
+IN_BASE = -1_000_000_500
+# Result pills are OUT_BASE - i. The renderer classifies ids as
+# ``isInput: id == INPUT_NODE or OUT_BASE < id <= IN_BASE`` and
+# ``isOutput: id <= OUT_BASE``, so OUT_BASE must stay below IN_BASE minus any
+# plausible argument count.
+OUT_BASE = -2_000_000_000
 
 # ---------------------------------------------------------------------------
 # Graph data model
@@ -738,8 +751,13 @@ def _flows_forward(nodes, src: int, dst: int) -> bool:
     Unknown order is treated as forward: it means the node predates the
     sequence counter rather than that the edge is invalid.
     """
-    a = nodes[src].order if src < len(nodes) else None
-    b = nodes[dst].order if dst < len(nodes) else None
+    # ``0 <=``: INPUT_NODE is -1 and the argument pills are IN_BASE - i, so a
+    # bare ``src < len(nodes)`` let them through and ``nodes[-1]`` silently
+    # returned the LAST node. Every edge out of the first model input was then
+    # re-attributed to whatever op happened to run last, and the input pill
+    # rendered with no consumer.
+    a = nodes[src].order if 0 <= src < len(nodes) else None
+    b = nodes[dst].order if 0 <= dst < len(nodes) else None
     if a is None or b is None:
         return True
     return a <= b
@@ -1679,7 +1697,7 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
 
 __all__ = [
     "Tensor", "Node", "Edge", "Graph",
-    "INPUT_NODE", "IN_BASE", "finalize_graph",
+    "INPUT_NODE", "IN_BASE", "OUT_BASE", "finalize_graph",
     "_is_descendant", "_scan_ops", "_scan_ops_deep", "_concat_axis", "_concat_compatible",
     "_Op", "_BINOPS", "_OP_ROOTS", "_OP_SYMBOLS", "_SHAPE_PRESERVING",
     "_INTERESTING",

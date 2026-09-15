@@ -30,10 +30,7 @@ from flax import nnx
 
 
 # Synthetic node id meaning "the model's own input" (see ``trace_model``).
-INPUT_NODE = -1
-# Arguments after the first get their own input pills, numbered IN_BASE - i.
-# The renderer mirrors both constants - keep them in step.
-IN_BASE = -500
+from ._core import INPUT_NODE, IN_BASE  # shared with the torch tracer and the renderer
 
 
 # ---------------------------------------------------------------------------
