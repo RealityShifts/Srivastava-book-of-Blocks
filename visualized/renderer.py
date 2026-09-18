@@ -672,8 +672,22 @@ function relayout() {
       G.setParent(String(n.id), String(p));
   }
 
+  // dagre cannot rank a compound node. asNonCompoundGraph() keeps only leaves,
+  // so an edge landing on a cluster re-creates it in the stripped graph with no
+  // value object, and longestPath() then throws setting `label.rank` -- the
+  // whole layout dies and the page keeps the pre-click render, so expanding
+  // looks like it silently does nothing.
+  //
+  // resolve() returns a container by design: when no descendant carries a
+  // recorded edge to the far endpoint it stops there rather than guessing a
+  // leaf. That is the honest answer, but it cannot be handed to dagre. It fires
+  // for any container whose children are all bare ops -- Direction in LIA-X,
+  // whose four children (matmul, sum, two constants) carry no recorded edge
+  // from the input pill that feeds the module itself.
+  const isCluster = id => G.children(String(id)).length > 0;
   for (const e of eds) {
     if (!G.hasNode(String(e.src)) || !G.hasNode(String(e.dst))) continue;
+    if (isCluster(e.src) || isCluster(e.dst)) continue;
     // weight keeps the main chain straight and lets skips bend around it.
     G.setEdge(String(e.src), String(e.dst),
               { weight: e.skip ? 1 : 8, minlen: 1 });
