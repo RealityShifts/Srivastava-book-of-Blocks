@@ -828,7 +828,20 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
             # of ``torch.cat([out, skip])``, so what it wants is wider than
             # what the preceding leaf emitted, agreeing on every other axis.
             ok = gs == ws
-            if not ok and len(gs) == len(ws) and len(gs) >= 2:
+            # The widening exception only makes sense when joins are
+            # *synthesized* here from the source scan (``merge_candidates``
+            # non-empty): the join node does not exist yet, so its consumer
+            # legitimately has no producer and wants something wider than the
+            # last leaf emitted. The PyTorch tracer observes ``cat`` as a real
+            # node with real edges and passes ``merge_candidates=[]``, so for
+            # it this branch could only ever fabricate: it wired a (.., 256)
+            # ``Linear`` output into a (.., 768) ``Linear`` input two modules
+            # over, purely because 256 < 768 on one axis. ``_accepts`` /
+            # ``_is_join_operand`` below already restrict the same test to
+            # actual join nodes for the consumer-side repair; this keeps the
+            # producer-side repair to the same standard.
+            if (not ok and merge_candidates
+                    and len(gs) == len(ws) and len(gs) >= 2):
                 differing = [i for i in range(len(gs)) if gs[i] != ws[i]]
                 ok = len(differing) == 1 and gs[differing[0]] < ws[differing[0]]
             if ok and _flows_forward(nodes, prev_leaf, nid):
@@ -912,6 +925,13 @@ def finalize_graph(nodes, edges, producer, child_of, out_sources,
         for pos, nid in enumerate(consumers):
             node = nodes[nid]
             if nid in has_consumer or nid in terminal or not node.outputs:
+                continue
+            # Set by the torch tracer's post_hook on a module that returned one
+            # of its input objects unchanged (Identity, eval-mode Dropout). Its
+            # value is already wired from the real producer, so "no consumer"
+            # is correct here, not a broken chain to repair - linking it to the
+            # next leaf drew Dropout -> layers.1.norm1 around the residual add.
+            if node.config.get("identity"):
                 continue
             # Only link where the value actually fits what the candidate
             # consumes. Execution order alone is not enough evidence: a head

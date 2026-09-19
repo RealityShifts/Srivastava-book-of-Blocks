@@ -190,6 +190,13 @@ _TRACED_OPS = {
     # grid shows an operand arriving from an anonymous constant, and the
     # coordinate grid is precisely what makes a warp readable.
     "meshgrid", "linspace", "arange",
+    # Fused attention called functionally (F.scaled_dot_product_attention, as
+    # attention_blocks does). Untraced, its result was a value from nowhere:
+    # the ``transpose`` consuming it had no producer, so finalize_graph's
+    # execution-order fallback wired it to whichever op finished last - one of
+    # the RoPE ``mul``s - and the attention interior drew as a chain of
+    # fabricated arrows. As a node it is the one box a reader wants there.
+    "scaled_dot_product_attention",
 }
 
 
@@ -208,6 +215,13 @@ _INVISIBLE_OPS = {
     # one. Untagged, ``flow[:, 0]`` severs the flow field's provenance and the
     # add that consumes it appears to take an operand from nowhere.
     "__getitem__", "select", "narrow", "index_select", "unbind", "split_with_sizes",
+    # Pointwise re-presentations of a value that own no shape change and no
+    # parameters: unary minus (``torch.cat([-x2, x1])`` in RoPE), dtype casts
+    # beyond the float/half already listed, and rounding. Untagged, each one
+    # severed provenance - ``.round().long()`` on a noise level left the
+    # ``reshape`` after it with no producer, and the execution-order fallback
+    # then skipped the ``mul`` in between and wired ``clamp -> reshape``.
+    "__neg__", "neg", "long", "int", "bool", "double", "round",
 }
 
 
@@ -317,6 +331,17 @@ class _OpTracer(torch.overrides.TorchFunctionMode):
                             and id(a) in self.tags), None)
                 if src is not None:
                     self.tag(out, src)
+                    # Also hand the tag to the module hooks' producer map, as
+                    # the ``__setitem__`` branch above does. Tagging only
+                    # ``self.tags`` left a slice invisible to ``pre_hook``: a
+                    # module fed ``x[..., 0::2, :]`` saw an input with no
+                    # producer, and finalize_graph's execution-order fallback
+                    # then fabricated an edge from whichever leaf finished
+                    # last - ``motion_in -> audio_conditioner.proj`` in the
+                    # lipsync model, with no edge from the real audio input.
+                    if self.on_produce is not None:
+                        for leaf in _leaves(out):
+                            self.on_produce(leaf, src)
             return out
 
         if name not in _TRACED_OPS or self._depth:
@@ -624,6 +649,17 @@ def trace_model(
         order.append(nid)
         node = nodes[nid]
         node.outputs = _as_tensors(out)
+        # A module that hands back one of its own input *objects* unchanged -
+        # ``nn.Identity``, ``nn.Dropout`` in eval mode - computed nothing. The
+        # value keeps its real producer (``claim=False`` below), so this node
+        # never gets an outgoing edge of its own, and finalize_graph's
+        # orphan-consumer repair would otherwise read that as "a leaf whose
+        # result went nowhere" and fabricate ``Dropout -> <next module>``
+        # (surviving prune as ``mlp.net.3 -> layers.1.norm1``, bypassing the
+        # residual add). Flag it so the repair leaves it alone.
+        in_leaf_ids = {id(l) for l in _leaves(inp)}
+        if any(id(l) in in_leaf_ids for l in _leaves(out)):
+            node.config["identity"] = True
         entry = flop_at_entry.pop(nid, -1)
         if entry >= 0:
             now = _flops_now()
