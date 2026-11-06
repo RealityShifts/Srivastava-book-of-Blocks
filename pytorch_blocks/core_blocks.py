@@ -255,12 +255,21 @@ class L2Norm(nn.Module):
             torch.sum(x * x, dim=-1, keepdim=True) + self.epsilon)
 
 
+class LayerGroupNorm(nn.GroupNorm):
+    """GroupNorm(1, C) with a full-GPU reduction; same params/state_dict as nn.GroupNorm(1, C)."""
+    def __init__(self, c): super().__init__(1, c)
+    def forward(self, x):
+        var, mean = torch.var_mean(x.float().flatten(1), dim=1, unbiased=False)
+        y = (x.float() - mean[:, None, None, None]) * torch.rsqrt(var + self.eps)[:, None, None, None]
+        return (y * self.weight[None, :, None, None] + self.bias[None, :, None, None]).to(x.dtype)
+
+
 def _build_norm2d(kind: str, num_features: int) -> nn.Module:
     kind = kind.lower()
     if kind == "batch":
         return nn.BatchNorm2d(num_features)
     if kind == "layer":
-        return nn.GroupNorm(1, num_features)
+        return LayerGroupNorm(num_features)
     if kind == "instance":
         return nn.InstanceNorm2d(num_features, affine=True)
     if kind == "group":
