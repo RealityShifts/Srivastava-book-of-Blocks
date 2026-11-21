@@ -95,6 +95,12 @@ _CSS = """<style>
 .mon-h { display:block; width:100%; height:34px; margin-top:4px; }
 .mon-h rect { fill:var(--accent); }
 .mon-h rect.top { fill:var(--hi); }
+.mon-h line.mean { stroke:var(--out); stroke-width:1.6;
+  vector-effect:non-scaling-stroke; }
+.mon-g i.k-mean { color:var(--out); font-weight:700; }
+.mon-g i.k-mode { color:var(--hi); font-weight:700; }
+.mon-dot.mean { background:var(--out); border-radius:1px; width:3px;
+  height:11px; margin:0 8px 0 3px; vertical-align:-1px; }
 .mon-r { display:flex; justify-content:space-between; color:var(--muted);
   font-size:10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 .mon-g span.l1, .mon-tt td.l1, .mon-r .l1 { color:var(--skip); font-weight:600; }
@@ -228,10 +234,17 @@ const legend = () => { const T = MON.status && MON.status.thresholds;
     `<span style="color:var(--skip)">≥ ${num(T[k].warn)}</span>, ` +
     `<span style="color:var(--err)">≥ ${num(T[k].danger)}</span>`;
   return `<div class="mon-leg">` +
+    `<b>In each histogram</b><br>` +
+    `<i class="mon-dot mean"></i><b>green line</b>: the mean<br>` +
     `<i class="mon-dot mode"></i><b>yellow bar</b>: the mode, the fullest ` +
-    `histogram bin<br>` +
-    `<i class="mon-dot bar"></i><b>blue bars</b>: how many values fall in ` +
-    `each bin, from min (left) to max (right)<br>` +
+    `bin<br>` +
+    `<i class="mon-dot bar"></i><b>lavender bars</b>: how many values fall ` +
+    `in each bin, from min (left) to max (right)<br>` +
+    `The <span style="color:var(--out);font-weight:700">mean</span> and ` +
+    `<span style="color:var(--hi);font-weight:700">mode</span> labels above ` +
+    `the numbers use the same colours. Median, min and max have no mark: ` +
+    `min and max are the two ends of the histogram.<br>` +
+    `<b>On a number, a tensor or a card</b><br>` +
     `<i class="mon-dot l3"></i><b>blue</b>: too small - all zero, constant, ` +
     `a collapsed activation, a vanishing gradient<br>` +
     `<i class="mon-dot l1"></i><b>orange</b>: large<br>` +
@@ -473,7 +486,8 @@ svg.addEventListener('click', () => setTimeout(paint, 0));
 
 // ---------- results in the details panel -----------------------------------
 const stat5 = (r, kind) => `<div class="mon-g">` +
-  ['mean', 'median', 'mode', 'min', 'max'].map(k => `<i>${k}</i>`).join('') +
+  ['mean', 'median', 'mode', 'min', 'max'].map(k =>
+    `<i class="k-${k}">${k}</i>`).join('') +
   ['mean', 'median', 'mode', 'min', 'max'].map(k => {
     const v = r[k];
     if (!v) return '<span>—</span>';
@@ -491,7 +505,13 @@ function hist(r) {
     r.hist.map((c, i) => { const h = top ? Math.max(c ? .6 : 0, c / top * 34) : 0;
       return `<rect${i === at ? ' class="top"' : ''} x="${(i * w).toFixed(3)}" ` +
         `y="${(34 - h).toFixed(2)}" width="${(w * .86).toFixed(3)}" ` +
-        `height="${h.toFixed(2)}"/>`; }).join('') + `</svg>` +
+        `height="${h.toFixed(2)}"/>`; }).join('') +
+    (() => { const m = r.mean ? r.mean.mean : null, [lo, hi] = r.hist_range;
+      if (m === null || !(hi > lo)) return '';
+      const x = Math.min(99.6, Math.max(0.4, (m - lo) / (hi - lo) * 100));
+      return `<line class="mean" x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" ` +
+        `y1="0" y2="34"><title>mean ${full(m)}</title></line>`; })() +
+    `</svg>` +
     `<div class="mon-r"><span>${num(r.hist_range[0])}</span>` +
     `<span>${r.median_sampled ? 'median on a sample · ' : ''}` +
     `${r.nonfinite ? `<b class="l2">${r.nonfinite} non-finite</b> · ` : ''}` +

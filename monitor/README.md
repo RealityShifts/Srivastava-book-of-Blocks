@@ -168,12 +168,15 @@ The CSV does not carry the colour flags; apply your own limits to its
 
 ### Colours and the legend
 
-Every result has a **legend** section in the details panel. In short:
+Every result has a **legend** section in the details panel. The `mean` and
+`mode` labels above each row of numbers are green and yellow to match the
+histogram. In short:
 
 | Mark | Meaning |
 | --- | --- |
+| green line in a histogram | the mean |
 | yellow bar in a histogram | the mode: the fullest bin |
-| blue bars | how many values fall in each bin, min on the left, max on the right |
+| lavender bars | how many values fall in each bin, min on the left, max on the right |
 | blue dot or text | too small: all zero, constant, a collapsed activation, a vanishing gradient |
 | orange dot or text | large |
 | red dot or text | dangerous (a runaway activation, an exploding gradient) or non-finite (NaN / Inf) |
