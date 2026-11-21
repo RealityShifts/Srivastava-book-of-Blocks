@@ -234,6 +234,7 @@ button:hover { border-color:var(--accent); }
   margin:10px 0; font-size:12px; }
 code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
 </style>
+<!--__EXTRA_HEAD__-->
 </head>
 <body>
 <div id="app">
@@ -2158,6 +2159,7 @@ document.getElementById('subtitle').textContent =
 setLevel(1);
 addEventListener('resize', fit);
 </script>
+<!--__EXTRA_BODY__-->
 </body>
 </html>
 """
@@ -2178,8 +2180,17 @@ def _dagre_source() -> str:
         return fh.read()
 
 
-def render_html(graph: Graph, title: Optional[str] = None) -> str:
-    """Return a standalone interactive HTML document for ``graph``."""
+def render_html(graph: Graph, title: Optional[str] = None, *,
+                extra_head: str = "", extra_body: str = "") -> str:
+    """Return a standalone interactive HTML document for ``graph``.
+
+    ``extra_head`` / ``extra_body`` are inserted verbatim before ``</head>``
+    and after the page's own script, for a page that builds on this one
+    (``Blocks.monitor`` adds its controls that way). A script there shares
+    this page's top-level names (``DATA``, ``byId``, ``selected``,
+    ``detail``, ``draw``). Both default to nothing, which leaves the
+    document exactly as before.
+    """
     payload = json.dumps(graph.to_dict(), separators=(",", ":"))
     # Guard against a literal "</script>" inside the JSON ending the block.
     payload = payload.replace("</", "<\\/")
@@ -2190,8 +2201,13 @@ def render_html(graph: Graph, title: Optional[str] = None) -> str:
     # Substituted last: the bundle is ~96KB of minified JS and must not be
     # scanned for the other placeholders.
     doc = doc.replace("/*__DAGRE__*/", _dagre_source())
-    return doc.replace(
+    doc = doc.replace(
         "__TITLE__", html.escape(title or f"{graph.model_name} - visualized"))
+    # Last, so nothing above can rewrite text inside the caller's additions.
+    head, _, rest = doc.partition("<!--__EXTRA_HEAD__-->\n")
+    doc = head + extra_head + rest
+    body, _, rest = doc.rpartition("<!--__EXTRA_BODY__-->\n")
+    return body + extra_body + rest
 
 
 def save_html(graph: Graph, path: str, title: Optional[str] = None) -> str:
