@@ -14,8 +14,8 @@ See ``README.md`` beside this file, and ``python -m Blocks.monitor.demo``.
 """
 
 from .collector import Collector, named_tensors, summarize_iterations
-from .server import Monitor, module_tree
+from .server import Monitor, module_tree, result_csv
 from .stats import tensor_stats
 
 __all__ = ["Monitor", "Collector", "tensor_stats", "summarize_iterations",
-           "named_tensors", "module_tree"]
+           "named_tensors", "module_tree", "result_csv"]

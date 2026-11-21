@@ -7,7 +7,11 @@ CPU is enough. Exits non-zero on the first failure.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
+import math
+import os
 import tempfile
 import time
 import urllib.error
@@ -107,6 +111,9 @@ def test_stats() -> None:
     s = tensor_stats(torch.tensor([1.0, float("nan"), 3.0, float("inf")]))
     check(s["nonfinite"] == 2 and s["mean"] == 2.0,
           "stats: non-finite values counted and left out")
+    check(s["head"] == [1.0, None, 3.0, None]
+          and "NaN" not in json.dumps(s) and "Infinity" not in json.dumps(s),
+          "stats: the value preview is valid JSON (no bare NaN)")
     s = tensor_stats(torch.zeros(0))
     check(s["mean"] is None and s["numel"] == 0, "stats: an empty tensor")
     s = tensor_stats(torch.tensor([True, False, True]))
@@ -130,7 +137,8 @@ def test_collector() -> None:
     with Collector(net, paths) as c:
         with torch.no_grad():
             out = net(x)
-    rec = c.record()
+    full = c.record()
+    rec, table = full["modules"], full["params"]
     hooks_after = sum(len(m._forward_hooks) + len(m._forward_pre_hooks)
                       for m in net.modules())
     check(hooks_before == 0 and hooks_after == 0,
@@ -155,19 +163,32 @@ def test_collector() -> None:
     check(close(rec[""]["calls"][0]["outputs"][0]["mean"], float(out.mean())),
           "collector: the root module (path '') is measured")
 
-    prm = {p["name"]: p for p in rec["pair"]["params"]}
-    check(prm["scale"]["shape"] == [3] and prm["scale"]["mean"] == 2.0
-          and prm["scale"]["grad"] is None,
-          "collector: own parameters, no gradient when none exists")
-    check(rec["inner"]["params"] == []
+    check(rec["pair"]["params"] == ["pair.scale"]
+          and table["pair.scale"]["shape"] == [3]
+          and table["pair.scale"]["mean"] == 2.0
+          and table["pair.scale"]["grad"] is None
+          and table["pair.scale"]["head"] == [2.0, 2.0, 2.0],
+          "collector: a parameter's row, its values, no gradient when none exists")
+    check(rec["inner"]["own_params"] == 0
+          and rec["inner"]["params"] == ["inner.0.lin.weight", "inner.0.lin.bias",
+                                         "inner.2.lin.weight", "inner.2.lin.bias"]
           and rec["inner"]["whole"]["params"] == 40,
-          "collector: a container has no own parameters; whole counts children")
+          "collector: a container owns no parameters and lists every one inside")
+    check(len(rec[""]["params"]) == len(list(net.parameters())) == len(table),
+          "collector: the root lists all parameters, each measured once")
+    with Collector(net, ["inner", "shared"], deep=False) as c:
+        with torch.no_grad():
+            net(x)
+    own = c.record()
+    check(own["modules"]["inner"]["params"] == []
+          and own["modules"]["shared"]["params"] == ["shared.weight", "shared.bias"],
+          "collector: deep=False lists only directly owned parameters")
     net.zero_grad()
     net(x).sum().backward()
     with Collector(net, ["shared"]) as c:
         with torch.no_grad():
             net(x)
-    g = c.record()["shared"]["params"][0]["grad"]
+    g = c.record()["params"]["shared.weight"]["grad"]
     check(g is not None and close(g["mean"], float(net.shared.weight.grad.mean())),
           "collector: gradient statistics when a gradient is present")
 
@@ -189,16 +210,38 @@ def test_collector() -> None:
     with Collector(net, ["inner.0"], stats=False) as c:
         with torch.no_grad():
             net(x)
-    only = c.record()["inner.0"]
+    only = c.record()["modules"]["inner.0"]
     check("params" not in only and only["calls"][0]["inputs"] == []
           and only["calls"][0]["time"] is not None,
           "collector: timing only collects no statistics")
 
-    summ = summarize_iterations([rec, rec])
-    row = summ["inner.0"]["calls"][0]["inputs"][0]
+    sick = Net()
+    with torch.no_grad():
+        sick.shared.bias[0] = float("nan")
+        sick.shared.weight[0, 0] = float("inf")
+    with Collector(sick, ["", "shared"]) as c:
+        with torch.no_grad():
+            sick(x)
+    bad = c.record()
+    w = bad["modules"][""]["whole"]
+    check(w["nonfinite"] == 2 and w["mean"] is not None
+          and math.isfinite(w["mean"])
+          and bad["params"]["shared.bias"]["nonfinite"] == 1,
+          "collector: NaN/Inf parameters are counted, the roll-up stays finite")
+    from .server import clean
+    text = json.dumps(clean({"it": [bad], "s": summarize_iterations([bad])}),
+                      allow_nan=False)
+    check("NaN" not in text and "Infinity" not in text,
+          "server: a model with NaN in it still yields valid JSON")
+
+    summ = summarize_iterations([full, full])
+    row = summ["modules"]["inner.0"]["calls"][0]["inputs"][0]
     check(row["mean"]["mean"] == rec["inner.0"]["calls"][0]["inputs"][0]["mean"]
-          and summ["shared"]["calls"][1]["seen"] == 2,
+          and summ["modules"]["shared"]["calls"][1]["seen"] == 2,
           "summary: per-call rows across iterations")
+    check(summ["params"]["pair.scale"]["mean"]["mean"] == 2.0
+          and summ["modules"]["pair"]["params"] == ["pair.scale"],
+          "summary: one shared parameter table, modules refer to it by name")
 
 
 def test_server() -> None:
@@ -257,13 +300,42 @@ def test_server() -> None:
               "server: the request closed itself after n iterations")
         code, res = get(base + "api/results/r00001")
         check(code == 200 and len(res["iterations"]) == 4
-              and set(res["summary"]) == {"", "inner", "inner.0", "shared"}
-              and len(res["summary"]["shared"]["calls"]) == 2,
+              and set(res["summary"]["modules"]) == {"", "inner", "inner.0", "shared"}
+              and len(res["summary"]["modules"]["shared"]["calls"]) == 2
+              and "inner.2.lin.weight" in res["summary"]["params"],
               "server: the result has every module and both calls of the shared one")
         with torch.no_grad():
             want = float(net(x).mean())
-        got = res["summary"][""]["calls"][0]["outputs"][0]["mean"]["mean"]
+        got = res["summary"]["modules"][""]["calls"][0]["outputs"][0]["mean"]["mean"]
         check(close(got, want), "server: result numbers match a direct forward")
+        fwd = res["header"]["forward_seconds"]
+        root = res["summary"]["modules"][""]["calls"][0]["time"]["inclusive"]["mean"]
+        check(fwd is not None and root <= fwd * 1.05 and root > fwd * 0.5,
+              f"server: total forward time reported ({fwd * 1e3:.2f} ms), "
+              f"the root's inclusive time is within it ({root * 1e3:.2f} ms)")
+        with urllib.request.urlopen(base + "api/results/r00001.csv") as r:
+            disp, text = r.headers.get("Content-Disposition", ""), r.read().decode()
+        rows = list(csv.DictReader(io.StringIO(text)))
+        kinds = {r["kind"] for r in rows}
+        root_out = [r for r in rows if r["module"] == "<root>" and r["kind"] == "output"]
+        check("attachment" in disp and disp.endswith('_r00001.csv"')
+              and {"time", "input", "output", "parameter"} <= kinds
+              and close(float(root_out[0]["mean"]), want)
+              and root_out[0]["shape"] == "5x4",
+              f"export: the CSV download has {len(rows)} rows and the right numbers")
+        with urllib.request.urlopen(base + "api/results/r00001.json") as r:
+            dl = json.loads(r.read())
+            check("attachment" in r.headers.get("Content-Disposition", "")
+                  and dl["header"]["id"] == "r00001" and len(dl["iterations"]) == 4,
+                  "export: the JSON download is the full result")
+        saved = mon.export("r00001", os.path.join(out, "copy.csv"))
+        check(open(saved).read() == text,
+              "export: Monitor.export writes the same table to a path")
+        try:
+            code = get(base + "api/results/r00001.exe")[0]
+        except urllib.error.HTTPError as err:
+            code = err.code
+        check(code == 404, "export: an unknown download format is refused")
         check(get(base + "api/results/r00001")[0] == 200
               and post(base + "api/nothing", {})[0] == 404,
               "server: only the listed endpoints exist")
@@ -287,6 +359,48 @@ def test_server() -> None:
               "server: without a graph the page draws the module tree")
         mon2.stop()
 
+    solo = Monitor(net, port=0, start=False)
+    mine = torch.full((2, 4), 3.0)
+    seen = [0]
+
+    def on_mine():
+        seen[0] += 1
+        return net(mine)
+    res = solo.measure(on_mine)
+    every = {p for p, _ in net.named_modules()}
+    check(seen[0] == 1 and set(res["summary"]["modules"]) == every
+          and res["summary"]["modules"][""]["calls"][0]["inputs"][0]["mean"]["mean"] == 3.0
+          and res["summary"]["modules"][""]["calls"][0]["inputs"][0]["shape"] == [2, 4]
+          and solo.status()["results"][0]["id"] == res["header"]["id"]
+          and solo.status()["active"] is None,
+          "measure: one pass on a custom input, every module, without a server")
+    two = solo.measure(on_mine, ["inner", "shared"], n=2, timing=False)
+    check(seen[0] == 3 and two["header"]["done"] == 2
+          and set(two["summary"]["modules"]) == {"inner", "shared"},
+          "measure: chosen modules, n passes")
+    try:
+        solo.measure(lambda: 1 / 0, ["inner"])
+        raised = False
+    except RuntimeError:
+        raised = True
+    check(raised and solo.status()["active"] is None,
+          "measure: a failing probe raises and leaves no request behind")
+    hooks = sum(len(m._forward_hooks) + len(m._forward_pre_hooks)
+                for m in net.modules())
+    check(hooks == 0, "measure: no hooks left")
+
+    custom = Monitor(net, port=0, start=False,
+                     thresholds={"activation": {"warn": 5}})
+    th = custom.status()["thresholds"]
+    check(th["activation"] == {"warn": 5.0, "danger": 1e4, "tiny": 1e-6}
+          and th["gradient"]["tiny"] == 1e-8,
+          "thresholds: an override changes one limit and keeps the rest")
+    try:
+        Monitor(net, port=0, start=False, thresholds={"activations": {}})
+        bad = False
+    except ValueError:
+        bad = True
+    check(bad, "thresholds: an unknown kind is rejected")
     off = Monitor(net, port=0, start=False)
     off.step(0, probe)
     check(off._server is None and probes[0] == 4,

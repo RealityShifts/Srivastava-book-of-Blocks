@@ -27,6 +27,8 @@ from torch import Tensor
 
 BINS = 64
 MEDIAN_CAP = 1_000_000
+#: How many of the tensor's first values (flattened) are kept as a preview.
+HEAD = 16
 
 
 def _sample(x: Tensor, cap: int) -> Tensor:
@@ -46,6 +48,10 @@ def tensor_stats(t: Tensor, bins: int = BINS,
     if x.is_complex():
         x = torch.view_as_real(x)
     x = x.reshape(-1).to(torch.float32)
+    # The values themselves, as far as a preview goes: the first HEAD of the
+    # flattened tensor - all of it for a small vector.
+    out["head"] = [v if math.isfinite(v) else None
+                   for v in x[:HEAD].tolist()]
     finite = torch.isfinite(x)
     nonfinite = int((~finite).sum())
     out["nonfinite"] = nonfinite

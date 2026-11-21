@@ -17,7 +17,10 @@ lock, so no forward pass ever races the training step.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
+import math
 import os
 import re
 import sys
@@ -33,8 +36,93 @@ import torch.nn as nn
 from .collector import Collector, summarize_iterations
 
 MAX_ITERATIONS = 1000
+#: Magnitudes (largest absolute value in the tensor) at which the page marks
+#: it. Too big: ``warn`` in orange, ``danger`` in red. Too small: below
+#: ``tiny`` in blue - a collapsed activation, a weight that has shrunk away, a
+#: vanishing gradient. All-zero and constant tensors are blue too; non-finite
+#: values are always red. Rules of thumb, not laws - override with
+#: ``Monitor(thresholds=...)``.
+THRESHOLDS = {
+    "activation": {"warn": 1e2, "danger": 1e4, "tiny": 1e-6},
+    "parameter": {"warn": 1e1, "danger": 1e2, "tiny": 1e-8},
+    "gradient": {"warn": 1e0, "danger": 1e2, "tiny": 1e-8},
+}
 MAX_BODY = 1 << 20
 _RESULT = re.compile(r"^r\d{5}$")
+
+
+def clean(obj: Any) -> Any:
+    """``obj`` with every non-finite float replaced by ``None``. Python's
+    json writes NaN and Infinity as bare words, which no browser parses - and
+    a model with a NaN in it is exactly when the page has to load."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean(v) for v in obj]
+    return obj
+
+
+CSV_COLUMNS = ("result", "module", "class", "call", "kind", "tensor", "shape",
+               "dtype", "numel", "nonfinite", "mean", "median", "mode", "min",
+               "max", "std", "lowest", "highest", "time_self_s",
+               "time_inclusive_s", "share_of_forward")
+
+
+def result_csv(result: dict) -> str:
+    """One finished request as a flat table, a row per tensor and per timing.
+
+    ``kind`` is ``time``, ``input``, ``output``, ``parameter`` or
+    ``gradient``. ``mean`` .. ``std`` are each statistic's mean over the
+    request's iterations; ``lowest`` / ``highest`` are the smallest min and
+    the largest max any iteration saw. A parameter appears once per picked
+    module that contains it.
+    """
+    header, summary = result["header"], result["summary"]
+    forward = header.get("forward_seconds")
+    out = io.StringIO()
+    writer = csv.DictWriter(out, CSV_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+
+    def mid(row: dict, key: str):
+        return row[key]["mean"] if row.get(key) else ""
+
+    def tensor(base: dict, kind: str, name: str, row: dict) -> None:
+        writer.writerow({
+            **base, "kind": kind, "tensor": name,
+            "shape": "x".join(map(str, row["shape"])), "dtype": row["dtype"],
+            "numel": row["numel"], "nonfinite": row["nonfinite"],
+            **{k: mid(row, k) for k in ("mean", "median", "mode", "min",
+                                        "max", "std")},
+            "lowest": row["min"]["min"] if row.get("min") else "",
+            "highest": row["max"]["max"] if row.get("max") else ""})
+
+    params = summary.get("params", {})
+    for path, module in summary["modules"].items():
+        base = {"result": header["id"], "module": path or "<root>",
+                "class": module["cls"]}
+        for k, call in enumerate(module["calls"]):
+            at = {**base, "call": k}
+            if call["time"]:
+                inclusive = call["time"]["inclusive"]["mean"]
+                writer.writerow({
+                    **at, "kind": "time",
+                    "time_self_s": call["time"]["self"]["mean"],
+                    "time_inclusive_s": inclusive,
+                    "share_of_forward": inclusive / forward if forward else ""})
+            for row in call["inputs"]:
+                tensor(at, "input", row["name"], row)
+            for row in call["outputs"]:
+                tensor(at, "output", row["name"], row)
+        for name in module.get("params", []):
+            row = params.get(name)
+            if row is None:
+                continue
+            tensor(base, "parameter", name, row)
+            if row.get("grad"):
+                tensor(base, "gradient", name, row["grad"])
+    return out.getvalue()
 
 
 def module_tree(model: nn.Module) -> list:
@@ -65,14 +153,28 @@ class Monitor:
     thread, the first time the page is opened - without it the page draws the
     module tree with no connections. ``start=False`` builds an inert monitor
     (:meth:`step` does nothing) until :meth:`start` - for the ranks of a
-    distributed run that should not serve.
+    distributed run that should not serve. ``thresholds`` overrides entries
+    of :data:`THRESHOLDS`, the magnitudes the page colours orange and red,
+    e.g. ``{"activation": {"warn": 50}}``.
     """
 
     def __init__(self, model: nn.Module, *, port: int = 8891,
                  host: str = "127.0.0.1", out_dir: Optional[str] = None,
                  graph: Any = None, title: Optional[str] = None,
+                 thresholds: Optional[dict] = None,
                  start: bool = True) -> None:
         self.model = model
+        self.thresholds = {k: dict(v) for k, v in THRESHOLDS.items()}
+        for kind, limits in (thresholds or {}).items():
+            if kind not in self.thresholds:
+                raise ValueError(f"thresholds: unknown kind {kind!r}; one of "
+                                 f"{sorted(self.thresholds)}")
+            unknown = set(limits) - set(self.thresholds[kind])
+            if unknown:
+                raise ValueError(f"thresholds[{kind!r}]: unknown "
+                                 f"{sorted(unknown)}")
+            self.thresholds[kind].update(
+                {k: float(v) for k, v in limits.items()})
         self.host, self._port = host, port
         self.out_dir = out_dir
         self.title = title or type(model).__name__
@@ -151,6 +253,39 @@ class Monitor:
             if not self._busy:
                 self._last_call = None
 
+    def measure(self, probe: Callable[[], Any], paths: Optional[list] = None,
+                *, n: int = 1, step: Optional[int] = None, stats: bool = True,
+                timing: bool = True, deep: bool = True) -> dict:
+        """Measure now, from code, and return the result.
+
+        Runs ``probe`` ``n`` times (once by default) with hooks on ``paths``
+        - every module of the model when ``paths`` is ``None`` - without
+        waiting for the page or for :meth:`step`. ``probe`` can run anything:
+        the current batch, or an input of your own::
+
+            result = monitor.measure(lambda: model(my_input))
+
+        The result is stored like any other, so it also appears on the page
+        and can be downloaded. Call it from the thread that owns the model.
+        Raises ``RuntimeError`` if a request from the page is still
+        collecting, and if ``probe`` fails.
+        """
+        rid = self.request(sorted(self._paths) if paths is None else paths,
+                           n, stats=stats, timing=timing, deep=deep)["id"]
+        req = self._active
+        base = step if step is not None else (self._last_step or 0)
+        for i in range(n):
+            if self._active is not req:           # the probe failed
+                break
+            self._collect(req, base + i, probe, None)
+        with self._lock:
+            self._busy = self._active is not None or self._want_graph
+        result = self.result(rid)
+        if result["header"]["error"]:
+            raise RuntimeError(f"measure: the probe failed\n"
+                               f"{result['header']['error']}")
+        return result
+
     def _trace(self) -> None:
         try:
             self._graph = self._graph_source()
@@ -166,9 +301,16 @@ class Monitor:
         t0 = time.perf_counter()
         try:
             with Collector(self.model, req["paths"], stats=req["stats"],
-                           timing=req["timing"]) as collector:
+                           timing=req["timing"],
+                           deep=req["deep"]) as collector:
+                collector.sync()
+                f0 = time.perf_counter()
                 with torch.no_grad():
                     probe()
+                collector.sync()
+                # The whole probe forward, the monitor's own work taken out:
+                # the total the per-module times are shares of.
+                forward = time.perf_counter() - f0 - collector.overhead
             record = collector.record()
         except Exception:                                   # noqa: BLE001
             # Monitoring must not take the training run down with it, and
@@ -182,6 +324,7 @@ class Monitor:
         req["iterations"].append(record)
         req["steps"].append(step)
         req["probe_seconds"].append(time.perf_counter() - t0)
+        req["forward_seconds"].append(forward)
         # Time between two step() calls with the previous probe taken out:
         # what one training iteration costs without the monitor.
         if interval is not None and len(req["steps"]) > 1:
@@ -192,20 +335,22 @@ class Monitor:
     def _finish(self, req: dict) -> None:
         iterations = req.pop("iterations")
         header = {k: req[k] for k in ("id", "paths", "n", "stats", "timing",
-                                      "steps", "error", "requested_at")}
+                                      "deep", "steps", "error",
+                                      "requested_at")}
         header["finished_at"] = time.time()
         header["done"] = len(iterations)
-        for key in ("probe_seconds", "train_seconds"):
+        for key in ("probe_seconds", "train_seconds", "forward_seconds"):
             vals = req[key]
             header[key] = sum(vals) / len(vals) if vals else None
-        result = {"header": header,
-                  "summary": summarize_iterations(iterations),
-                  "iterations": iterations}
+        result = clean({"header": header,
+                        "summary": summarize_iterations(iterations),
+                        "iterations": iterations})
+        header = result["header"]
         if self.out_dir:
             path = os.path.join(self.out_dir, req["id"] + ".json")
             tmp = path + ".tmp"
             with open(tmp, "w") as fh:
-                json.dump(result, fh)
+                json.dump(result, fh, allow_nan=False)
             os.replace(tmp, path)
         else:
             self._payloads[req["id"]] = result
@@ -215,9 +360,10 @@ class Monitor:
 
     # ------------------------------------------------------------ server side
     def request(self, paths: list, n: int, *, stats: bool = True,
-                timing: bool = True) -> dict:
+                timing: bool = True, deep: bool = True) -> dict:
         """Queue a request (what ``POST api/request`` does). Raises
-        ``ValueError`` on anything invalid."""
+        ``ValueError`` on anything invalid. ``deep``: list every parameter
+        inside each module, not only the ones it owns directly."""
         if not isinstance(paths, list) or not paths or not all(
                 isinstance(p, str) for p in paths):
             raise ValueError("paths: a non-empty list of module paths")
@@ -236,7 +382,7 @@ class Monitor:
             last = max((int(r[1:]) for r in self._results), default=0)
             req = {"id": f"r{last + 1:05d}", "paths": list(dict.fromkeys(paths)),
                    "n": n, "stats": bool(stats), "timing": bool(timing),
-                   "steps": [], "iterations": [], "probe_seconds": [],
+                   "deep": bool(deep), "steps": [], "forward_seconds": [], "iterations": [], "probe_seconds": [],
                    "train_seconds": [], "error": None,
                    "requested_at": time.time()}
             self._active = req
@@ -249,6 +395,7 @@ class Monitor:
             active = self._active
             return {
                 "title": self.title,
+                "thresholds": self.thresholds,
                 "step": self._last_step,
                 "active": None if active is None else {
                     "id": active["id"], "n": active["n"],
@@ -269,6 +416,20 @@ class Monitor:
         with open(os.path.join(self.out_dir, rid + ".json")) as fh:
             return json.load(fh)
 
+    def export(self, rid: str, path: str) -> str:
+        """Write result ``rid`` to ``path``: a ``.csv`` path gets the flat
+        table (:func:`result_csv`), anything else the full JSON. Returns the
+        path. For results kept in memory only (no ``out_dir``) this is how to
+        keep one."""
+        result = self.result(rid)
+        if result is None:
+            raise KeyError(f"no result {rid!r}")
+        text = (result_csv(result) if path.endswith(".csv") else
+                json.dumps(clean(result), allow_nan=False, indent=1))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
     def page(self) -> str:
         from .page import build_page
         if (self._graph is None and callable(self._graph_source)
@@ -286,16 +447,21 @@ def _handler(monitor: Monitor):
         def log_message(self, *args) -> None:       # keep the training log clean
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str,
+                  filename: Optional[str] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if filename:
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
         def _json(self, code: int, obj: Any) -> None:
-            self._send(code, json.dumps(obj).encode(), "application/json")
+            self._send(code, json.dumps(clean(obj), allow_nan=False).encode(),
+                       "application/json")
 
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
@@ -308,9 +474,22 @@ def _handler(monitor: Monitor):
                 elif path == "/api/tree":
                     self._json(200, monitor._tree)
                 elif path.startswith("/api/results/"):
-                    result = monitor.result(path[len("/api/results/"):])
+                    # <id> for the page; <id>.json / <id>.csv as downloads.
+                    rid, _, ext = path[len("/api/results/"):].partition(".")
+                    result = (monitor.result(rid)
+                              if ext in ("", "json", "csv") else None)
+                    name = re.sub(r"[^\w.-]+", "_", monitor.title)
                     if result is None:
                         self._json(404, {"error": "no such result"})
+                    elif ext == "csv":
+                        self._send(200, result_csv(result).encode(),
+                                   "text/csv; charset=utf-8",
+                                   f"{name}_{rid}.csv")
+                    elif ext == "json":
+                        self._send(
+                            200, json.dumps(clean(result), allow_nan=False,
+                                            indent=1).encode(),
+                            "application/json", f"{name}_{rid}.json")
                     else:
                         self._json(200, result)
                 else:
@@ -331,7 +510,8 @@ def _handler(monitor: Monitor):
                 self._json(200, monitor.request(
                     body.get("paths"), body.get("n"),
                     stats=bool(body.get("stats", True)),
-                    timing=bool(body.get("timing", True))))
+                    timing=bool(body.get("timing", True)),
+                    deep=bool(body.get("deep", True))))
             except RuntimeError as exc:
                 self._json(409, {"error": str(exc)})
             except ValueError as exc:

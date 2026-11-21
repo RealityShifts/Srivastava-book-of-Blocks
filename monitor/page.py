@@ -65,6 +65,11 @@ _CSS = """<style>
 #mon-pop button.go { background:var(--accent); color:var(--bg);
   border-color:var(--accent); font-weight:600; }
 #mon-pop button:disabled { opacity:.45; cursor:default; }
+#mon-pop a.dl { background:var(--card); color:var(--fg); text-decoration:none;
+  border:1px solid var(--cardln); border-radius:5px; padding:4px 9px;
+  cursor:pointer; }
+#mon-pop a.dl:hover { border-color:var(--accent); }
+#mon-pop a.dl.off { opacity:.45; pointer-events:none; }
 #mon-pop hr { border:0; border-top:1px solid var(--line); margin:9px 0; }
 #mon-status { color:var(--muted); line-height:1.45; }
 #mon-status b { color:var(--fg); font-weight:600; }
@@ -83,11 +88,32 @@ _CSS = """<style>
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; }
 .mon-g i { font-style:normal; color:var(--muted); font-size:10px; }
 .mon-g span { color:var(--fg); white-space:nowrap; }
+.mon-v { margin-top:3px; font-size:10.5px; color:var(--fg); overflow:hidden;
+  white-space:nowrap; text-overflow:ellipsis;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+.mon-v i { font-style:normal; color:var(--muted); }
 .mon-h { display:block; width:100%; height:34px; margin-top:4px; }
 .mon-h rect { fill:var(--accent); }
 .mon-h rect.top { fill:var(--hi); }
 .mon-r { display:flex; justify-content:space-between; color:var(--muted);
   font-size:10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+.mon-g span.l1, .mon-tt td.l1, .mon-r .l1 { color:var(--skip); font-weight:600; }
+.mon-g span.l2, .mon-tt td.l2, .mon-r .l2 { color:var(--err); font-weight:700; }
+.mon-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+  margin-right:6px; vertical-align:baseline; }
+.mon-dot.l1 { background:var(--skip); }
+.mon-dot.l2 { background:var(--err); }
+.mon-dot.l3 { background:#4cc9f0; }
+.mon-g span.l3, .mon-tt td.l3, .mon-r .l3 { color:#4cc9f0; font-weight:600; }
+.monflag.l3 { fill:#4cc9f0; }
+.mon-dot.mode { background:var(--hi); border-radius:2px; }
+.mon-dot.bar { background:var(--accent); border-radius:2px; }
+.mon-leg { font-size:11px; line-height:1.7; color:var(--muted); }
+.mon-leg b { color:var(--fg); font-weight:600; }
+.mon-leg code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--fg); }
+.monflag.l1 { fill:var(--skip); }
+.monflag.l2 { fill:var(--err); }
 .mon-note { color:var(--muted); font-size:11px; line-height:1.4;
   margin:4px 0 8px; }
 .mon-err { color:var(--err); font-size:11px; white-space:pre-wrap;
@@ -95,8 +121,8 @@ _CSS = """<style>
 .mon-tt { width:100%; border-collapse:collapse; font-size:11px;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 .mon-tt td { padding:2px 0; }
-.mon-tt td:first-child { color:var(--fg); word-break:break-all;
-  cursor:pointer; }
+.mon-tt td:first-child { color:var(--fg); overflow-wrap:anywhere;
+  width:44%; cursor:pointer; }
 .mon-tt td:first-child:hover { color:var(--accent); }
 .mon-tt td + td { text-align:right; color:var(--muted); padding-left:8px;
   white-space:nowrap; }
@@ -129,6 +155,96 @@ const num = v => v === null || v === undefined ? '—'
   : (Math.abs(v) >= 1e4 || Math.abs(v) < 1e-3) ? v.toExponential(1)
   : (+v.toPrecision(3)).toString();
 const full = v => v === null || v === undefined ? '' : String(v);
+// ---------- which values are too big --------------------------------------
+// level 0 fine, 1 large (orange), 2 dangerous (red), 3 too small (blue).
+// Judged on the extremes across the request's iterations, against the
+// server's thresholds. ``RANK`` orders them worst first.
+const RANK = { 2: 3, 1: 2, 3: 1, 0: 0 };
+const worse = (a, b) => RANK[a] >= RANK[b] ? a : b;
+const KINDS = { act: 'activation', param: 'parameter', grad: 'gradient' };
+const limits = kind => (MON.status && MON.status.thresholds || {})[KINDS[kind]]
+  || {};
+const levelOf = (v, kind) => { const T = limits(kind), a = Math.abs(v);
+  return v === null || v === undefined ? 0
+    : a >= T.danger ? 2 : a >= T.warn ? 1 : 0; };
+function flag(r, kind) {
+  if (!r) return { level: 0, why: '' };
+  if (r.nonfinite) return { level: 2,
+    why: r.nonfinite + ' non-finite value' + (r.nonfinite > 1 ? 's' : '') };
+  if (!r.min || !r.max) return { level: 0, why: '' };
+  const T = limits(kind);
+  const big = Math.max(Math.abs(r.min.min), Math.abs(r.max.max));
+  if (big >= T.danger) return { level: 2,
+    why: `largest magnitude ${num(big)} ≥ ${num(T.danger)}` };
+  if (big >= T.warn) return { level: 1,
+    why: `largest magnitude ${num(big)} ≥ ${num(T.warn)}` };
+  if (big === 0 && r.numel > 1) return { level: 3, why: kind === 'grad'
+    ? 'all zero: no gradient reaches this parameter' : 'all zero' };
+  if (T.tiny !== undefined && big < T.tiny) return { level: 3,
+    why: `largest magnitude ${num(big)} < ${num(T.tiny)}` +
+      (kind === 'grad' ? ' (vanishing gradient)' : ' (too small)') };
+  if (r.numel > 1 && r.std && r.std.max === 0) return { level: 3,
+    why: 'constant: every value is the same' };
+  return { level: 0, why: '' };
+}
+const dot = f => f.level ? `<i class="mon-dot l${f.level}" ` +
+  `title="${esc(f.why)}"></i>` : '';
+function findFlags(res) {
+  const list = [], per = new Map(), owner = new Map();
+  // A parameter sits inside every picked module around it: each of those
+  // cards gets the mark, but the list names it once, under the innermost.
+  const add = (path, call, name, f) => {
+    if (!f.level) return;
+    per.set(path, worse(per.get(path) || 0, f.level));
+    if (call === null) {
+      const seen = owner.get(name);
+      if (seen) { if (path.length > seen.path.length) seen.path = path; return; }
+      const item = { path, call, name, level: f.level, why: f.why, param: true };
+      owner.set(name, item);
+      list.push(item);
+      return;
+    }
+    list.push({ path, call, name, level: f.level, why: f.why });
+  };
+  const P = res.summary.params || {};
+  Object.entries(res.summary.modules).forEach(([path, m]) => {
+    m.calls.forEach((c, k) => {
+      c.inputs.forEach(r => add(path, k, 'input ' + r.name, flag(r, 'act')));
+      c.outputs.forEach(r => add(path, k, 'output ' + r.name, flag(r, 'act')));
+    });
+    (m.params || []).forEach(name => { const r = P[name]; if (!r) return;
+      add(path, null, name, flag(r, 'param'));
+      if (r.grad) add(path, null, name + ' · grad', flag(r.grad, 'grad'));
+    });
+  });
+  list.forEach(f => { if (f.param && f.path && f.name.startsWith(f.path + '.'))
+    f.name = f.name.slice(f.path.length + 1); });
+  list.sort((a, b) => RANK[b.level] - RANK[a.level]);
+  return { list, per };
+}
+const legend = () => { const T = MON.status && MON.status.thresholds;
+  const row = (k, name) => !T ? '' : `<br>${name}: ` +
+    `<span style="color:#4cc9f0">&lt; ${num(T[k].tiny)}</span>, ` +
+    `<span style="color:var(--skip)">≥ ${num(T[k].warn)}</span>, ` +
+    `<span style="color:var(--err)">≥ ${num(T[k].danger)}</span>`;
+  return `<div class="mon-leg">` +
+    `<i class="mon-dot mode"></i><b>yellow bar</b>: the mode, the fullest ` +
+    `histogram bin<br>` +
+    `<i class="mon-dot bar"></i><b>blue bars</b>: how many values fall in ` +
+    `each bin, from min (left) to max (right)<br>` +
+    `<i class="mon-dot l3"></i><b>blue</b>: too small - all zero, constant, ` +
+    `a collapsed activation, a vanishing gradient<br>` +
+    `<i class="mon-dot l1"></i><b>orange</b>: large<br>` +
+    `<i class="mon-dot l2"></i><b>red</b>: dangerous (an exploding ` +
+    `gradient, a runaway activation), or non-finite (NaN / Inf)<br>` +
+    `Judged on the largest magnitude over the request's iterations:` +
+    row('activation', 'inputs and outputs') + row('parameter', 'parameters') +
+    row('gradient', 'gradients') +
+    `<br>These limits are rules of thumb, set by <code>Monitor(thresholds=` +
+    `…)</code>. A dot on a card marks a module with a flagged tensor.` +
+    `</div>`; };
+const pct = (t, total) => !total || t === null || t === undefined ? '—'
+  : (100 * t / total).toFixed(t / total < 0.1 ? 1 : 0) + '%';
 const ms = s => s === null || s === undefined ? '—'
   : s >= 1 ? s.toFixed(2) + ' s'
   : s >= 1e-3 ? (s * 1e3).toFixed(2) + ' ms'
@@ -145,6 +261,8 @@ wrap.innerHTML = `
     <div class="row"><span>All modules at depth</span>
       <input id="mon-depth" type="number" min="0" value="1">
       <button id="mon-depth-go">Add</button></div>
+    <div class="row"><span>Every module of the model</span>
+      <button id="mon-all" title="Pick all modules, at every depth. On a large model this makes the measurement forward and the result large.">Add all</button></div>
     <div class="row"><span id="mon-count">0 selected</span>
       <button id="mon-clear">Clear</button></div>
     <hr>
@@ -154,9 +272,15 @@ wrap.innerHTML = `
       statistics</label>
       <label><input id="mon-time" type="checkbox" checked> timing</label>
       <span></span><button id="mon-go" class="go">Collect</button></div>
+    <div class="row"><label title="List every parameter inside each picked module. Off: only the ones the module owns directly (a container owns none).">
+      <input id="mon-deep" type="checkbox" checked>
+      parameters of everything inside</label></div>
     <hr>
     <div id="mon-status">connecting&hellip;</div>
     <div class="row"><span>Result</span><select id="mon-results"></select></div>
+    <div class="row"><span>Download</span>
+      <a id="mon-dl-csv" class="dl" title="One row per tensor and per timing: module, kind, shape, mean, median, mode, min, max, time">Table (CSV)</a>
+      <a id="mon-dl-json" class="dl" title="Everything: the summary and every iteration's numbers and histograms">Full (JSON)</a></div>
   </div>`;
 const bar = document.getElementById('toolbar');
 bar.insertBefore(wrap, document.getElementById('lvl'));
@@ -179,7 +303,21 @@ function marks() {
     g.classList.toggle('monsel', !!n && isMod(n) && MON.sel.has(pathOf(n)));
   });
   $('mon-count').textContent = MON.sel.size + ' selected';
-  root.querySelectorAll('.montime').forEach(t => t.remove());
+  root.querySelectorAll('.montime, .monflag').forEach(t => t.remove());
+  if (MON.flags) root.querySelectorAll('.node').forEach(g => {
+    const n = byId.get(+g.dataset.id);
+    const lv = n && isMod(n) ? MON.flags.per.get(pathOf(n)) : 0;
+    if (!lv) return;
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('class', 'monflag l' + lv);
+    c.setAttribute('cx', 0); c.setAttribute('cy', 0); c.setAttribute('r', 6);
+    const t = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    t.textContent = { 2: 'a dangerous or non-finite value in this module',
+      1: 'a large value in this module',
+      3: 'a too-small, all-zero or constant value in this module' }[lv];
+    c.appendChild(t);
+    g.appendChild(c);
+  });
   const times = MON.times;
   if (!times) return;
   root.querySelectorAll('.node').forEach(g => {
@@ -216,7 +354,8 @@ svg.addEventListener('click', e => {
   if (!g) return;
   const n = byId.get(+g.dataset.id);
   if (!isMod(n)) return;
-  e.stopImmediatePropagation();
+  // Not stopped: the page's own click still runs, so picking a module also
+  // opens its details.
   toggle(pathOf(n));
 }, true);
 $('mon-mode').onclick = () => {
@@ -229,6 +368,10 @@ $('mon-depth-go').onclick = () => {
   const d = +$('mon-depth').value;
   DATA.nodes.filter(n => isMod(n) && n.depth === d)
     .forEach(n => MON.sel.add(pathOf(n)));
+  marks();
+};
+$('mon-all').onclick = () => {
+  DATA.nodes.filter(isMod).forEach(n => MON.sel.add(pathOf(n)));
   marks();
 };
 $('mon-clear').onclick = () => { MON.sel.clear(); marks(); };
@@ -245,7 +388,8 @@ async function api(path, body) {
 $('mon-go').onclick = async () => {
   try {
     await api('api/request', { paths: [...MON.sel], n: +$('mon-n').value,
-      stats: $('mon-stats').checked, timing: $('mon-time').checked });
+      stats: $('mon-stats').checked, timing: $('mon-time').checked,
+      deep: $('mon-deep').checked });
     MON.follow = true;
     MON.note = null;
     poll();
@@ -261,12 +405,13 @@ async function load(id) {
     MON.loaded = id;
     const per = new Map();
     let max = 0;
-    Object.entries(MON.result.summary).forEach(([path, m]) => {
+    Object.entries(MON.result.summary.modules).forEach(([path, m]) => {
       const ts = m.calls.map(c => c.time ? c.time.self.mean : null);
       if (ts.some(t => t !== null)) per.set(path, ts);
       ts.forEach(t => { if (t !== null && t > max) max = t; });
     });
     MON.times = per.size ? { per, max } : null;
+    MON.flags = findFlags(MON.result);
     marks(); detail();
   } catch (err) { MON.note = String(err.message || err); }
   paint();
@@ -297,6 +442,13 @@ function paint() {
       ).join('') : '<option value="">none yet</option>';
   }
   if (MON.loaded) sel.value = MON.loaded;
+  // Plain links to the server's own files, so a download is the saved result
+  // itself and works for a result of any size.
+  ['csv', 'json'].forEach(ext => { const a = $('mon-dl-' + ext);
+    a.classList.toggle('off', !MON.loaded);
+    if (MON.loaded) { a.href = `api/results/${MON.loaded}.${ext}`;
+                      a.setAttribute('download', ''); }
+    else a.removeAttribute('href'); });
 }
 
 let wasGraph = null;
@@ -315,16 +467,21 @@ async function poll() {
 }
 setInterval(poll, 1000);
 $('mon-count').parentElement.addEventListener('click', paint);
+$('mon-all').addEventListener('click', paint);
+$('mon-depth-go').addEventListener('click', paint);
 svg.addEventListener('click', () => setTimeout(paint, 0));
 
 // ---------- results in the details panel -----------------------------------
-const stat5 = r => `<div class="mon-g">` +
+const stat5 = (r, kind) => `<div class="mon-g">` +
   ['mean', 'median', 'mode', 'min', 'max'].map(k => `<i>${k}</i>`).join('') +
   ['mean', 'median', 'mode', 'min', 'max'].map(k => {
     const v = r[k];
-    return v ? `<span title="${full(v.mean)}  (across iterations: ` +
-               `${full(v.min)} .. ${full(v.max)})">${num(v.mean)}</span>`
-             : '<span>—</span>';
+    if (!v) return '<span>—</span>';
+    // Coloured by the worst this number reached in any iteration.
+    const lv = Math.max(levelOf(v.min, kind), levelOf(v.max, kind));
+    return `<span${lv ? ` class="l${lv}"` : ''} title="${full(v.mean)}  ` +
+      `(across iterations: ${full(v.min)} .. ${full(v.max)})">` +
+      `${num(v.mean)}</span>`;
   }).join('') + `</div>`;
 function hist(r) {
   if (!r.hist || !r.hist.length || !r.hist_range) return '';
@@ -337,12 +494,29 @@ function hist(r) {
         `height="${h.toFixed(2)}"/>`; }).join('') + `</svg>` +
     `<div class="mon-r"><span>${num(r.hist_range[0])}</span>` +
     `<span>${r.median_sampled ? 'median on a sample · ' : ''}` +
-    `${r.nonfinite ? r.nonfinite + ' non-finite · ' : ''}` +
+    `${r.nonfinite ? `<b class="l2">${r.nonfinite} non-finite</b> · ` : ''}` +
     `${n} bins</span><span>${num(r.hist_range[1])}</span></div>`;
 }
-const tensor = (title, r) => `<div class="mon-t"><div class="hd">` +
-  `<b>${esc(title)}</b><span>(${r.shape.join(', ')}) ${esc(r.dtype)}` +
-  `${r.shapes_vary ? ' *' : ''}</span></div>${stat5(r)}${hist(r)}</div>`;
+const values = r => {
+  if (!r.head || !r.head.length) return '';
+  const all = r.numel <= r.head.length, n = all ? r.head.length : 8;
+  return `<div class="mon-v" title="${all ? 'every value' :
+    'the first ' + r.head.length + ' of ' + r.numel + ' values, flattened'}` +
+    `: ${r.head.map(full).join(', ')}"><i>values</i> ` +
+    r.head.slice(0, n).map(num).join(', ') + (all ? '' : ', …') + `</div>`;
+};
+const tensor = (title, r, kind) => { const f = flag(r, kind);
+  return `<div class="mon-t"><div class="hd">` +
+  `<b>${dot(f)}${esc(title)}</b><span>(${r.shape.join(', ')}) ${esc(r.dtype)}` +
+  `${r.shapes_vary ? ' *' : ''}</span></div>${stat5(r, kind)}${values(r)}` +
+  `${hist(r)}` + (f.level ? `<div class="mon-r"><span class="l${f.level}">` +
+    `${esc(f.why)}</span></div>` : '') + `</div>`; };
+const range = r => r && r.min ? `${num(r.min.mean)} .. ${num(r.max.mean)}`
+                              : '—';
+const rangeCell = r => { const f = flag(r, 'act');
+  return `<td${f.level ? ` class="l${f.level}" title="${esc(f.why)}"` : ''}>` +
+    `${range(r)}</td>`; };
+const PARAM_ROWS = 40;
 
 function monDetail() {
   const res = MON.result;
@@ -352,28 +526,72 @@ function monDetail() {
     h.steps[h.steps.length - 1] : '—'} &middot; ${h.done}/${h.n} iterations`;
   let html = '';
   if (selected === null) {
-    const rows = [];
-    Object.entries(res.summary).forEach(([path, m]) => m.calls.forEach((c, k) => {
-      if (c.time) rows.push([path, k, m.calls.length, c.time]); }));
+    const rows = [], io = [];
+    Object.entries(res.summary.modules).forEach(([path, m]) =>
+      m.calls.forEach((c, k) => {
+        if (c.time) rows.push([path, k, m.calls.length, c.time]);
+        if (c.inputs.length || c.outputs.length)
+          io.push([path, k, m.calls.length, c.inputs[0], c.outputs[0]]);
+      }));
     rows.sort((a, b) => b[3].self.mean - a[3].self.mean);
     html = sec('Monitor ' + h.id,
       `<div class="mon-note">${head}<br>` +
-      `probe forward ${ms(h.probe_seconds)} per iteration` +
-      (h.train_seconds !== null
-        ? ` &middot; training step ${ms(h.train_seconds)}` : '') +
-      `<br>Times are from an uncompiled, synchronised, no-gradient forward.` +
+      `Times are from an uncompiled, synchronised, no-gradient forward.` +
       `</div>` +
+      `<div class="stat"><span>Total forward, per iteration</span>` +
+      `<span>${ms(h.forward_seconds)}</span></div>` +
+      `<div class="stat"><span>Total forward, all ${h.done} iterations</span>` +
+      `<span>${ms(h.forward_seconds === null ? null
+                  : h.forward_seconds * h.done)}</span></div>` +
+      `<div class="stat" title="The forward plus computing the statistics">` +
+      `<span>Probe incl. statistics, per iteration</span>` +
+      `<span>${ms(h.probe_seconds)}</span></div>` +
+      (h.train_seconds !== null
+        ? `<div class="stat"><span>Training step, per iteration</span>` +
+          `<span>${ms(h.train_seconds)}</span></div>` : '') +
       (h.error ? `<div class="mon-err">${esc(h.error)}</div>` : '') +
-      (rows.length ? `<table class="mon-tt"><tr><td><i>module</i></td>` +
-        `<td>self</td><td>inclusive</td></tr>` + rows.map(r =>
+      (rows.length ? `<table class="mon-tt" style="margin-top:8px"><tr>` +
+        `<td><i>module</i></td><td>self</td><td>inclusive</td>` +
+        `<td title="inclusive time as a share of the total forward">%</td></tr>` +
+        rows.map(r =>
         `<tr><td data-mon="${esc(r[0])}">${esc(label(r[0]))}` +
         `${r[2] > 1 ? ' #' + r[1] : ''}</td><td>${ms(r[3].self.mean)}</td>` +
-        `<td>${ms(r[3].inclusive.mean)}</td></tr>`).join('') + `</table>`
-        : `<div class="mon-note">${Object.keys(res.summary).length} modules ` +
-          `measured. Click one on the graph.</div>`));
+        `<td>${ms(r[3].inclusive.mean)}</td>` +
+        `<td>${pct(r[3].inclusive.mean, h.forward_seconds)}</td></tr>`).join('') +
+        `<tr><td style="cursor:default"><i>picked, sum of self</i></td>` +
+        `<td>${ms(rows.reduce((a, r) => a + r[3].self.mean, 0))}</td><td></td>` +
+        `<td>${pct(rows.reduce((a, r) => a + r[3].self.mean, 0),
+                   h.forward_seconds)}</td></tr></table>` +
+        `<div class="mon-note">The sum of self times is the part of the ` +
+        `forward spent in the picked modules, counted once; the rest is in ` +
+        `modules that were not picked.</div>`
+        : '') +
+      `<div class="mon-note" style="margin-top:8px">Click a module on the ` +
+      `graph, or a name here, for its inputs, outputs, parameters and ` +
+      `histograms.</div>`);
+    const fl = MON.flags ? MON.flags.list : [];
+    html += sec('Monitor: flagged values', (fl.length
+      ? `<table class="mon-tt">` + fl.slice(0, 60).map(f =>
+          `<tr><td data-mon="${esc(f.path)}"><i class="mon-dot l${f.level}">` +
+          `</i>${esc(label(f.path))}${f.call ? ' #' + f.call : ''}</td>` +
+          `<td class="l${f.level}" style="white-space:normal">` +
+          `${esc(f.name)}<br>${esc(f.why)}</td></tr>`).join('') + `</table>` +
+        (fl.length > 60 ? `<div class="mon-note">${fl.length - 60} more ` +
+          `not shown.</div>` : '')
+      : `<div class="mon-note">Nothing over the limits in the measured ` +
+        `modules.</div>`));
+    html += sec('Monitor: legend', legend());
+    if (io.length) html += sec('Monitor: value ranges',
+      `<table class="mon-tt"><tr><td><i>module</i></td>` +
+      `<td>input</td><td>output</td></tr>` +
+      io.map(r => `<tr><td data-mon="${esc(r[0])}">${esc(label(r[0]))}` +
+        `${r[2] > 1 ? ' #' + r[1] : ''}</td>${rangeCell(r[3])}` +
+        `${rangeCell(r[4])}</tr>`).join('') + `</table>` +
+      `<div class="mon-note">min .. max of the first input and the first ` +
+      `output of each module; the module's own page lists every tensor.</div>`);
   } else {
     const n = byId.get(selected);
-    const m = isMod(n) ? res.summary[pathOf(n)] : null;
+    const m = isMod(n) ? res.summary.modules[pathOf(n)] : null;
     if (!m) return;
     const k = callOf.get(n.id) || 0, c = m.calls[k];
     let body = `<div class="mon-note">${h.id} &middot; ${head}` +
@@ -382,7 +600,15 @@ function monDetail() {
     if (!c) body += `<div class="mon-note">This module's forward was not ` +
       `called in the probe pass (it may be used through another method, or ` +
       `sit inside compiled code).</div>`;
-    if (c && c.time) body += `<div class="stat"><span>Time, self</span>` +
+    if (c && c.time) body += `<div class="stat"><span>Share of the forward</span>` +
+      `<span>${pct(c.time.inclusive.mean, h.forward_seconds)} of ` +
+      `${ms(h.forward_seconds)}</span></div>` +
+      `<div class="stat"><span>Total over ${h.done} iterations</span>` +
+      `<span>${ms(c.time.inclusive.mean * c.seen)}</span></div>` +
+      (m.calls.length > 1 ? `<div class="stat"><span>All ${m.calls.length} ` +
+        `calls, per forward</span><span>${ms(m.calls.reduce((a, x) =>
+          a + (x.time ? x.time.inclusive.mean : 0), 0))}</span></div>` : '') +
+      `<div class="stat"><span>Time, self</span>` +
       `<span title="${ms(c.time.self.min)} .. ${ms(c.time.self.max)}">` +
       `${ms(c.time.self.mean)}</span></div>` +
       `<div class="stat"><span>Time, inclusive</span>` +
@@ -390,17 +616,36 @@ function monDetail() {
       `${ms(c.time.inclusive.mean)}</span></div>`;
     if (m.whole) body += `<div class="stat"><span>All parameters</span>` +
       `<span>${fmt(m.whole.params)}</span></div>` +
+      (m.whole.nonfinite ? `<div class="stat"><span>Non-finite parameters` +
+        `</span><span style="color:var(--err);font-weight:700">` +
+        `${m.whole.nonfinite}</span></div>` : '') +
       (m.whole.mean ? `<div class="stat"><span>mean / min / max</span><span>` +
         `${num(m.whole.mean.mean)} / ${num(m.whole.min.mean)} / ` +
         `${num(m.whole.max.mean)}</span></div>` : '');
     html = sec('Monitor', body);
     if (c && c.inputs.length) html += sec('Monitor: inputs',
-      c.inputs.map(r => tensor('input ' + r.name, r)).join(''));
+      c.inputs.map(r => tensor('input ' + r.name, r, 'act')).join(''));
     if (c && c.outputs.length) html += sec('Monitor: outputs',
-      c.outputs.map(r => tensor('output ' + r.name, r)).join(''));
-    if (m.params && m.params.length) html += sec('Monitor: parameters',
-      m.params.map(r => tensor(r.name, r) +
-        (r.grad ? tensor(r.name + ' · grad', r.grad) : '')).join(''));
+      c.outputs.map(r => tensor('output ' + r.name, r, 'act')).join(''));
+    if (m.params) {
+      const base = pathOf(n), P = res.summary.params;
+      const short = name => base && name.startsWith(base + '.')
+        ? name.slice(base.length + 1) : name;
+      const shown = m.params.slice(0, PARAM_ROWS);
+      html += sec('Monitor: parameters',
+        `<div class="mon-note">${m.params.length} tensor` +
+        `${m.params.length === 1 ? '' : 's'}` +
+        (h.deep ? ` inside this module, ${m.own_params} owned directly`
+                : ` owned directly (parameters inside were not requested)`) +
+        (m.params.length > shown.length ? `. Showing the first ` +
+          `${shown.length}; pick a smaller module for the rest` : '') +
+        `.</div>` +
+        shown.map(name => { const r = P[name]; return !r ? '' :
+          tensor(short(name), r, 'param') +
+          (r.grad ? tensor(short(name) + ' · grad', r.grad, 'grad') : ''); }
+        ).join(''));
+    }
+    html += sec('Monitor: legend', legend());
   }
   box.insertAdjacentHTML('afterbegin', html);
 }

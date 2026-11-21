@@ -102,12 +102,48 @@ Open `http://127.0.0.1:8891/`, pick modules on the graph, ask for N
 iterations. For those iterations the monitor runs one extra forward with hooks
 on the picked modules and reports, per module, the mean, median, mode, min and
 max of every input, output and parameter, and the time its forward takes.
+Values that are too big, too small or non-finite are colour-marked.
 When nothing is requested it does nothing.
 
 ![The monitor page](monitor/docs/monitor-overview.png)
 
-Try it with `python -m Blocks.monitor.demo`. Details and limits:
-[monitor/README.md](monitor/README.md).
+On the page:
+
+- **Pick modules** on the graph at any depth, every module at one depth, or
+  all of them, then **Collect** for N iterations.
+- **Per module**: time (self, inclusive, share of the whole forward), every
+  input and output, and every parameter inside it with its gradient. Each
+  tensor has mean, median, mode, min, max, a preview of its values and a
+  histogram.
+- **Colour marks** for problem values, with a legend: blue for too small (all
+  zero, constant, vanishing gradient), orange for large, red for dangerous or
+  NaN / Inf. The limits are yours to set.
+- **Download** any result as a CSV table or as full JSON.
+
+The same from code, without touching the page:
+
+```python
+# one pass on an input of your own, every module, right now
+result = monitor.measure(lambda: model(my_input))
+
+# chosen modules, three passes
+result = monitor.measure(lambda: model(my_input), ["encoder", "decoder.1"], n=3)
+
+# ask for the next 5 training iterations, e.g. every 1,000 steps
+if step % 1000 == 0:
+    monitor.request(["encoder", "decoder"], n=5)
+
+# keep a result as a file
+monitor.export(result["header"]["id"], "runs/monitor/check.csv")
+```
+
+`monitor.step(step, probe)` takes a new `probe` on every call, so what is
+measured (this batch, a fixed input, part of the model) is decided where you
+call it. `Monitor(model, start=False)` gives all of this with no server.
+
+Try it with `python -m Blocks.monitor.demo`. Everything else (how a request
+runs, what each number means, the colour limits, the HTTP endpoints, and the
+limits of the tool): [monitor/README.md](monitor/README.md).
 
 ## Checks
 
@@ -117,7 +153,7 @@ Each package has a smoke test that runs on CPU:
 python -m Blocks.pytorch_blocks._smoke_test    # every PyTorch block, one forward
 python -m Blocks.flax_blocks._smoke_test       # every Flax block (needs jax, flax)
 python -m Blocks.visualized._smoke_test        # the torch tracer on a small model
-python -m Blocks.monitor._smoke_test           # the monitor, 46 checks
+python -m Blocks.monitor._smoke_test           # the monitor, 63 checks
 ```
 
 ## Diagrams

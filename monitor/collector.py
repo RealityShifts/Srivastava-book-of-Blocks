@@ -8,8 +8,12 @@ it records, for every call of its ``forward`` in that pass:
 * wall time, with the device synchronised at entry and exit so asynchronous
   GPU work is charged to the module that queued it.
 
-and, once per pass, statistics of the module's own parameters (and their
-gradients, when present) and of all its parameters together.
+and, once per pass, statistics of its parameters (and their gradients, when
+present): each tensor on its own, plus count, mean, min and max over all of
+them together. ``deep=True`` (default) lists every parameter inside the
+module, children included - a container such as a ``Sequential`` owns none
+itself; ``deep=False`` lists only the ones it owns directly. A parameter is
+measured once per pass however many selected modules contain it.
 
 Timing excludes the monitor's own work: the time spent computing statistics
 inside a module's window is accumulated and subtracted, for that module and
@@ -72,11 +76,15 @@ class Collector:
     """
 
     def __init__(self, model: nn.Module, paths: list, *, stats: bool = True,
-                 timing: bool = True, bins: int = BINS,
+                 timing: bool = True, deep: bool = True, bins: int = BINS,
                  median_cap: int = MEDIAN_CAP) -> None:
         self.model = model
         self.modules = {p: resolve(model, p) for p in paths}
-        self.stats, self.timing = stats, timing
+        self.stats, self.timing, self.deep = stats, timing, deep
+        # One name per parameter tensor: its path from the model's root.
+        self._names: dict = {}
+        for name, p in model.named_parameters():
+            self._names.setdefault(id(p), name)
         self.bins, self.median_cap = bins, median_cap
         first = next(model.parameters(), None)
         self.device = first.device if first is not None else torch.device("cpu")
@@ -127,6 +135,15 @@ class Collector:
             self._overhead += time.perf_counter() - t1
         return hook
 
+    @property
+    def overhead(self) -> float:
+        """Seconds this pass spent inside the collector's own hooks."""
+        return self._overhead
+
+    def sync(self) -> None:
+        """Wait for the device's queued work (before reading a clock)."""
+        _sync(self.device)
+
     def __enter__(self) -> "Collector":
         for path, module in self.modules.items():
             self._handles.append(module.register_forward_pre_hook(
@@ -142,38 +159,59 @@ class Collector:
         self._stack.clear()
 
     # ----------------------------------------------------------------- record
-    def _params(self, module: nn.Module) -> tuple[list, dict]:
-        rows = []
-        for name, p in module._parameters.items():
-            if p is None:
+    def _params(self, module: nn.Module, table: dict) -> tuple[list, int, dict]:
+        """Names (from the model's root) of the module's parameters, how many
+        of them it owns directly, and the roll-up; their rows go in ``table``
+        once each."""
+        own = [p for p in module._parameters.values() if p is not None]
+        listed = list(module.parameters()) if self.deep else own
+        names = []
+        for p in listed:
+            name = self._names.get(id(p))
+            if name is None:
                 continue
-            row = {"name": name, **tensor_stats(p, self.bins, self.median_cap)}
-            row["grad"] = (tensor_stats(p.grad, self.bins, self.median_cap)
-                           if p.grad is not None else None)
-            rows.append(row)
-        count, total, lo, hi = 0, 0.0, None, None
+            names.append(name)
+            if name not in table:
+                row = {"name": name,
+                       **tensor_stats(p, self.bins, self.median_cap)}
+                row["grad"] = (tensor_stats(p.grad, self.bins, self.median_cap)
+                               if p.grad is not None else None)
+                table[name] = row
+        count, finite, bad, total, lo, hi = 0, 0, 0, 0.0, None, None
         for p in module.parameters():
             if p.numel() == 0:
                 continue
-            x = p.detach().float()
+            x = p.detach().float().reshape(-1)
             count += x.numel()
+            ok = torch.isfinite(x)
+            n_ok = int(ok.sum())
+            bad += x.numel() - n_ok
+            if n_ok < x.numel():        # one NaN must not blank the roll-up
+                x = x[ok]
+            if n_ok == 0:
+                continue
+            finite += n_ok
             total += float(x.sum())
             a, b = float(x.min()), float(x.max())
             lo = a if lo is None else min(lo, a)
             hi = b if hi is None else max(hi, b)
-        whole = {"params": count, "mean": total / count if count else None,
+        whole = {"params": count, "nonfinite": bad,
+                 "mean": total / finite if finite else None,
                  "min": lo, "max": hi}
-        return rows, whole
+        return names, len(own), whole
 
     def record(self) -> dict:
-        """This pass's measurements, JSON-ready: ``{path: {...}}``."""
-        out = {}
+        """This pass's measurements, JSON-ready:
+        ``{"modules": {path: {...}}, "params": {name: row}}``. A module's
+        ``params`` is a list of names into the shared ``params`` table."""
+        modules, table = {}, {}
         for path, module in self.modules.items():
             entry = {"cls": type(module).__name__, "calls": self._calls[path]}
             if self.stats:
-                entry["params"], entry["whole"] = self._params(module)
-            out[path] = entry
-        return out
+                entry["params"], entry["own_params"], entry["whole"] = \
+                    self._params(module, table)
+            modules[path] = entry
+        return {"modules": modules, "params": table}
 
 
 def _summ_rows(per_iter: list) -> list:
@@ -189,7 +227,8 @@ def _summ_rows(per_iter: list) -> list:
         seen = [r for rows in per_iter for r in rows if r["name"] == name]
         last = seen[-1]
         row = {"name": name, "shape": last["shape"], "dtype": last["dtype"],
-               "numel": last["numel"], "hist": last["hist"],
+               "numel": last["numel"], "head": last.get("head", []),
+               "hist": last["hist"],
                "hist_range": last["hist_range"],
                "median_sampled": last["median_sampled"],
                "nonfinite": max(r["nonfinite"] for r in seen),
@@ -205,11 +244,14 @@ def _summ_rows(per_iter: list) -> list:
 
 
 def summarize_iterations(iterations: list) -> dict:
-    """Roll per-iteration ``Collector.record()`` dicts up to one summary per
-    module: ``{path: {cls, calls: [...], params: [...], whole: {...}}}``."""
+    """Roll per-iteration ``Collector.record()`` dicts up to one summary:
+    ``{"modules": {path: {cls, calls, params: [names], own_params, whole}},
+    "params": {name: row}}``."""
     out: dict = {}
-    for path in (iterations[0] if iterations else {}):
-        mods = [it[path] for it in iterations if path in it]
+    first = iterations[0]["modules"] if iterations else {}
+    for path in first:
+        mods = [it["modules"][path] for it in iterations
+                if path in it["modules"]]
         ncalls = max((len(m["calls"]) for m in mods), default=0)
         calls = []
         for k in range(ncalls):
@@ -224,11 +266,14 @@ def summarize_iterations(iterations: list) -> dict:
                 "outputs": _summ_rows([c["outputs"] for c in ks])})
         entry = {"cls": mods[0]["cls"], "calls": calls}
         if "params" in mods[0]:
-            entry["params"] = _summ_rows([m["params"] for m in mods])
+            entry["params"] = mods[-1]["params"]
+            entry["own_params"] = mods[-1]["own_params"]
             wholes = [m["whole"] for m in mods]
             entry["whole"] = {
                 "params": wholes[-1]["params"],
+                "nonfinite": max(w.get("nonfinite", 0) for w in wholes),
                 **{k: summarize([w[k] for w in wholes])
                    for k in ("mean", "min", "max")}}
         out[path] = entry
-    return out
+    rows = _summ_rows([list(it["params"].values()) for it in iterations])
+    return {"modules": out, "params": {row["name"]: row for row in rows}}
