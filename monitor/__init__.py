@@ -14,8 +14,10 @@ See ``README.md`` beside this file, and ``python -m Blocks.monitor.demo``.
 """
 
 from .collector import Collector, named_tensors, summarize_iterations
-from .server import Monitor, module_tree, result_csv
+from .scalars import Alert, ScalarBoard, format_alerts
+from .server import Monitor, module_tree, result_csv, serve_scalars
 from .stats import tensor_stats
 
 __all__ = ["Monitor", "Collector", "tensor_stats", "summarize_iterations",
-           "named_tensors", "module_tree", "result_csv"]
+           "named_tensors", "module_tree", "result_csv", "ScalarBoard",
+           "Alert", "format_alerts", "serve_scalars"]

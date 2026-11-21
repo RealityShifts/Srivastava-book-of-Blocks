@@ -21,11 +21,14 @@ Blocks/monitor/
     collector.py  hooks, per-module timing, per-iteration records, summaries
     stats.py      mean / median / mode / min / max / histogram of one tensor
     page.py       the page: Blocks.visualized's graph plus the monitor controls
+    scalars.py    TensorBoard logs and live scalars, and the alert rules
+    scalars_page.py   the scalars page: charts, filters, alert list
     demo.py       a small training loop with the monitor attached
     _smoke_test.py
 ```
 
-PyTorch only. No dependencies beyond `torch` and the standard library.
+PyTorch only. No dependencies beyond `torch` and the standard library, except
+that reading TensorBoard logs needs the `tensorboard` package.
 
 ## Quick start
 
@@ -96,6 +99,119 @@ monitor.step(step, probe=lambda: model(x))
 
 No server is needed for any of this: `Monitor(model, start=False)` measures
 and stores without serving a page.
+
+## Scalars and alerts
+
+A second page, `scalars`, reads a **TensorBoard log directory** and watches
+every scalar in it for trouble. Type the directory into the page, or give it
+in code. It needs the `tensorboard` package to read the files.
+
+![Scalar charts sorted by severity, with the alert list and legend](docs/scalars-alerts.png)
+
+```python
+monitor = Monitor(model, port=8891, logdir="runs/exp1/logs")
+# then open http://127.0.0.1:8891/scalars  (or Monitor menu -> Scalars & alerts)
+```
+
+Without a model or a training loop, on any log directory:
+
+```bash
+python -m Blocks.monitor.scalars runs/exp1/logs            # print the alerts, exit 2 if any is critical
+python -m Blocks.monitor.scalars runs/exp1/logs --serve    # and serve the page on port 8892
+```
+
+### What raises an alert
+
+| Rule | Level | Fires when | Looks at |
+| --- | --- | --- | --- |
+| `nonfinite` | critical | a NaN or Inf was logged | every series |
+| `growing` | warning at 10x, critical at 100x | recent magnitude over early magnitude, and still rising | tags named like `act`, `weight`, `norm`, `grad`, `max` |
+| `vanishing` | warning (critical at exactly 0) | magnitude below 1e-8, or fallen 1,000x | tags named like `grad` |
+| `spike` | warning | a point more than 12 robust deviations from the 50 points before it | every series |
+| `diverging` | warning | recent mean 50% above the best earlier mean, and rising | tags named like `loss`, `total`, `recon`, `lpips` |
+| `flat` | info | the last 30 points are identical | every series |
+| `stale` | info | a run's newest point is over 15 minutes old | each run |
+
+A rule decides from the **name** of a series whether it applies, so growth is
+judged on an activation or a gradient norm and not on a step counter. Tags
+such as `lr/...`, `progress/...` and `epoch` are skipped. The patterns and
+every limit are in `Blocks.monitor.scalars.DEFAULTS`:
+
+```python
+Monitor(model, scalar_limits={"grow_factor": 5, "loss_tags": r"loss|nll",
+                              "grad_tags": r"grad|gnorm"})
+```
+
+These are rules of thumb. They read curves, not your model: a loss that rises
+because you switched a loss term on will be flagged as `diverging`, and a
+healthy run can have a spike. Treat an alert as "look here".
+
+### On the page
+
+- **Path box**: any TensorBoard log directory on the machine the server runs
+  on. Every sub-folder with event files is a run. It re-reads every 10
+  seconds and picks up only what was appended.
+- **Alerts list**, worst first. Click one to jump to its chart.
+- **Level chips** (critical / warning / info / clear) switch each level on
+  and off for the list and the charts.
+- **Look up tags**: plain words (all must match), or `/regex/`.
+- **Only with alerts**, smoothing, log scale, run selector.
+- **Charts**: sorted worst first, border coloured by level, the reason under
+  the chart, a dashed line at the step where the alert was seen, red squares
+  for NaN / Inf points. Hover for the value at a step. A long curve is drawn
+  from the minimum and maximum of each stretch, so a one-step spike is not
+  smoothed away by the drawing.
+- The module page shows the alert count on its Monitor button.
+
+### Being told
+
+`on_alert` is called once for each new alert, and again if it gets worse. By
+default it prints a line to stderr, so it lands in the training log:
+
+```
+Blocks.monitor ALERT CRITICAL grad_norm/id_encoder [nonfinite] 1 non-finite value(s); the latest is NaN at step 25000
+```
+
+Send it anywhere else by passing your own function:
+
+```python
+def notify(alert):                 # alert.level, .run, .tag, .rule, .step, .message
+    if alert.level == "critical":
+        requests.post(WEBHOOK, json={"text": alert.message})
+
+monitor = Monitor(model, logdir="runs/exp1/logs", on_alert=notify)
+```
+
+The log directory is re-read, and the rules re-run, whenever the page is open
+or the module page polls. With no page open, call `monitor.alerts()` from the
+loop every so often to get the same check:
+
+```python
+if step % 500 == 0:
+    for alert in monitor.alerts():      # also triggers on_alert for new ones
+        ...
+```
+
+### Without TensorBoard
+
+Give the rules numbers straight from the loop; they show on the page as run
+`live`:
+
+```python
+monitor.log(step, {"loss": loss.item(), "grad_norm": float(total_norm)})
+```
+
+`ScalarBoard` is the same thing without a model: `ScalarBoard().open(path)`,
+`.check()`, `.series(run, tag)`, and `serve_scalars(board, port=8892)`.
+
+### Limits of the scalars page
+
+- It reads scalars only: no images, histograms or text from the logs.
+- The path box reads any directory the server process can read. Pass
+  `logdir_root="/workspace/runs"` to confine it. There is no login.
+- A very large log (millions of points per tag) is held in memory in full, so
+  that no NaN is sampled away.
+- `stale` cannot tell a stalled run from one that finished or logs rarely.
 
 ## How a request runs
 
@@ -274,7 +390,8 @@ across them. The histogram is the last iteration's.
 
 ```python
 Monitor(model, *, port=8891, host="127.0.0.1", out_dir=None,
-        graph=None, title=None, thresholds=None, start=True)
+        graph=None, title=None, thresholds=None, logdir=None,
+        scalar_limits=None, on_alert=None, logdir_root=None, start=True)
 ```
 
 | Member | |
@@ -285,12 +402,16 @@ Monitor(model, *, port=8891, host="127.0.0.1", out_dir=None,
 | `measure(probe, paths=None, n=1, ...)` | measure now and return the result; all modules by default |
 | `request(paths, n, stats=True, timing=True, deep=True)` | queue a request for the next `n` calls of `step` |
 | `export(id, path)` | write a result to a `.csv` or `.json` file |
+| `log(step, values)` | give the alert rules scalars from the loop |
+| `alerts()` | the current alerts, worst first |
+| `scalars` | the `ScalarBoard` behind the scalars page |
 | `status()`, `result(id)` | what the page reads |
 
 A failing `probe` does not stop the loop: the request ends, the traceback is
 printed to stderr and shown on the page.
 
-HTTP: `GET /`, `GET /api/status`, `GET /api/tree`, `GET /api/results/<id>`
+HTTP: `GET /scalars`, `GET /api/scalars`, `GET /api/scalars/series?run=&tag=`,
+`POST /api/scalars/open` with `{"path": "..."}`, and `GET /`, `GET /api/status`, `GET /api/tree`, `GET /api/results/<id>`
 (also `<id>.csv` and `<id>.json` as downloads),
 `POST /api/request` with
 `{"paths": [...], "n": 10, "stats": true, "timing": true, "deep": true}`.
@@ -313,7 +434,7 @@ data = c.record()
 python -m Blocks.monitor._smoke_test
 ```
 
-63 checks with known answers: statistics on constructed tensors, hooks removed
+87 checks with known answers: statistics on constructed tensors, hooks removed
 afterwards, tuple/keyword/dict inputs and outputs, a module called twice,
 timing of modules with a known sleep, exactly N probe forwards per request and
 none while idle, rejected requests, a failing probe, and results surviving a

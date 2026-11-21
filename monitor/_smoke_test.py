@@ -412,10 +412,161 @@ def test_server() -> None:
     check("mon-pop" in build_page(None, tree, "Net"), "page: builds from a tree")
 
 
+def test_scalars() -> None:
+    from .scalars import ScalarBoard, format_alerts
+    from .scalars import main as scalars_main
+    from .server import serve_scalars
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as exc:
+        print(f"SKIPPED  scalars: the TensorBoard checks need the "
+              f"'tensorboard' package ({exc})", flush=True)
+        return
+    import numpy as np
+    rng = np.random.default_rng(0)
+    n = 400
+    with tempfile.TemporaryDirectory() as root:
+        logdir = os.path.join(root, "logs")
+        w = SummaryWriter(os.path.join(logdir, "runA"))
+        for i in range(n):
+            t = i / n
+            # healthy: a noisy decaying loss, a noisy stationary metric
+            w.add_scalar("train/recon_loss", 1.0 * np.exp(-3 * t) + 0.02 * rng.normal(), i)
+            w.add_scalar("val/accuracy", 0.8 + 0.01 * rng.normal(), i)
+            # faults
+            w.add_scalar("train/total_loss", (1 - t) if t < .5 else .5 + 3 * (t - .5), i)
+            w.add_scalar("grad_norm/encoder", 1e-2 * 10 ** (-9 * t), i)
+            w.add_scalar("act_max/decoder", 2.0 * 10 ** (3 * t), i)
+            w.add_scalar("weight_norm/head", 5.0 + 0.01 * rng.normal()
+                         + (400.0 if i == 300 else 0.0), i)
+            w.add_scalar("train/lpips_loss", float("nan") if i == 250 else 0.3, i)
+            w.add_scalar("misc/constant", 7.0, i)
+            w.add_scalar("progress/steps_per_sec", 2.0 * 10 ** (3 * t), i)
+        w.close()
+
+        fired = []
+        board = ScalarBoard(on_alert=fired.append)
+        info = board.open(logdir)
+        check(info["runs"] == ["runA"] and len(info["tags"]) == 9,
+              "scalars: a TensorBoard directory is read, run and tags found")
+        alerts = board.check()
+        got = {(a.tag, a.rule): a for a in alerts}
+        text = format_alerts(alerts)
+
+        def has(tag, rule, level=None):
+            a = got.get((tag, rule))
+            return a is not None and (level is None or a.level == level)
+        check(has("train/lpips_loss", "nonfinite", "critical")
+              and got[("train/lpips_loss", "nonfinite")].step == 250,
+              "alert: a NaN is critical and reported at its step")
+        check(has("act_max/decoder", "growing", "critical"),
+              "alert: an activation growing 1000x is critical")
+        check(has("grad_norm/encoder", "vanishing"),
+              "alert: a gradient norm shrinking away")
+        check(has("train/total_loss", "diverging", "warning"),
+              "alert: a loss that turned upward")
+        check(has("weight_norm/head", "spike", "warning")
+              and got[("weight_norm/head", "spike")].step == 300,
+              "alert: a one-step spike, at its step")
+        check(has("misc/constant", "flat", "info"), "alert: a constant value is info")
+        clean_tags = {"train/recon_loss", "val/accuracy"}
+        noisy = sorted({a.tag for a in alerts} & clean_tags)
+        check(not noisy, f"alert: the healthy curves raise nothing {noisy}")
+        check(not any(a.tag.startswith("progress/") for a in alerts),
+              "alert: ignored tags are not judged")
+        check(_rank_sorted(alerts) and "CRITICAL" in text,
+              "alert: listed worst first")
+        check(len(fired) == len(alerts) and not board.check() != alerts,
+              "notify: on_alert got each alert once")
+        board.check()
+        check(len(fired) == len(alerts), "notify: nothing is announced twice")
+
+        d = board.series("runA", "weight_norm/head", max_points=60)
+        check(len(d["steps"]) <= 60 and max(d["values"]) > 400,
+              f"series: downsampled to {len(d['steps'])} points, the spike kept")
+        d = board.series("runA", "train/lpips_loss")
+        check(d["bad"] == [250] and len(d["values"]) == n - 1,
+              "series: the NaN is returned as a marked step, not drawn")
+
+        w = SummaryWriter(os.path.join(logdir, "runA"))
+        for i in range(n, n + 30):
+            w.add_scalar("val/accuracy", float("inf") if i == n + 5 else 0.8, i)
+        w.close()
+        board.refresh()
+        after = {(a.tag, a.rule) for a in board.check()}
+        check(("val/accuracy", "nonfinite") in after
+              and board.summary()["tags"][-1]["points"] >= n
+              and len(fired) == len(alerts) + 1,
+              "refresh: appended points are picked up and the new alert announced")
+
+        board.log(0, {"live_grad": 1.0})
+        for i in range(1, 60):
+            board.log(i, {"live_grad": float("nan") if i == 40 else 1.0})
+        check(("live_grad", "nonfinite") in {(a.tag, a.rule) for a in board.check()
+                                             if a.run == "live"},
+              "log: values from the loop are judged without TensorBoard")
+
+        fenced = ScalarBoard(root=logdir)
+        try:
+            fenced.open(root)
+            escaped = True
+        except ValueError:
+            escaped = False
+        check(not escaped and fenced.open(os.path.join(logdir, "runA"))["tags"],
+              "open: a root restricts which directories can be read")
+        try:
+            ScalarBoard().open(os.path.join(root, "nope"))
+            missing = False
+        except ValueError:
+            missing = True
+        check(missing, "open: a missing directory is an error, not an empty page")
+
+        server = serve_scalars(board, port=0)
+        base = f"http://127.0.0.1:{server.server_address[1]}/"
+        code, page = get(base + "scalars")
+        check(code == 200 and "api/scalars/open" in page, "page: served")
+        code, summ = get(base + "api/scalars")
+        check(code == 200 and summ["counts"]["critical"] >= 2
+              and any(t["level"] == "critical" for t in summ["tags"]),
+              "page: the summary lists tags with their alert level")
+        code, ser = get(base + "api/scalars/series?run=runA&tag=act_max%2Fdecoder&max=100")
+        check(code == 200 and ser["tag"] == "act_max/decoder" and len(ser["steps"]) <= 100,
+              "page: a series by run and tag")
+        code, opened = post(base + "api/scalars/open", {"path": logdir})
+        bad_code, bad = post(base + "api/scalars/open", {"path": "/no/such/dir"})
+        check(code == 200 and opened["logdir"] and bad_code == 400 and "error" in bad,
+              "page: a directory typed in the page is opened; a wrong one is refused")
+        server.shutdown()
+
+        code = scalars_main([logdir])
+        check(code == 2, "cli: exits 2 when something critical is found")
+
+    net = Net()
+    seen = []
+    mon = Monitor(net, port=0, on_alert=seen.append)
+    for i in range(60):
+        mon.log(i, {"grad_norm": 1e-2 * 10 ** (-9 * i / 60)})
+    found = mon.alerts()
+    code, st = get(mon.url + "api/status")
+    code2, page = get(mon.url + "scalars")
+    check(any(a.rule == "vanishing" for a in found) and seen
+          and st["alerts"]["warning"] + st["alerts"]["critical"] >= 1
+          and code2 == 200,
+          "monitor: log() feeds the alerts, the status counts them, the page is served")
+    mon.stop()
+
+
+def _rank_sorted(alerts: list) -> bool:
+    order = {"critical": 0, "warning": 1, "info": 2}
+    ranks = [order[a.level] for a in alerts]
+    return ranks == sorted(ranks)
+
+
 def main() -> int:
     test_stats()
     test_collector()
     test_server()
+    test_scalars()
     print("all monitor checks passed")
     return 0
 

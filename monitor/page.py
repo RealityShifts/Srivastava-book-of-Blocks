@@ -290,6 +290,8 @@ wrap.innerHTML = `
       parameters of everything inside</label></div>
     <hr>
     <div id="mon-status">connecting&hellip;</div>
+    <div class="row"><span id="mon-alerts">Alerts on the run's scalars</span>
+      <a class="dl" href="scalars" title="Curves from a TensorBoard log directory, with alerts: growing activations, vanishing gradients, NaN, spikes, a loss turning upward">Scalars &amp; alerts</a></div>
     <div class="row"><span>Result</span><select id="mon-results"></select></div>
     <div class="row"><span>Download</span>
       <a id="mon-dl-csv" class="dl" title="One row per tensor and per timing: module, kind, shape, mean, median, mode, min, max, time">Table (CSV)</a>
@@ -446,6 +448,16 @@ function paint() {
     (g ? `<br>${g}` : '') +
     (MON.note ? `<br><span class="bad">${esc(MON.note)}</span>` : '');
   $('mon-go').disabled = !!s.active || MON.sel.size === 0;
+  // Alerts from the scalars page, counted on the menu button itself so they
+  // are seen without opening anything.
+  const al = s.alerts || { critical: 0, warning: 0, info: 0 };
+  const lv = al.critical ? 'l2' : al.warning ? 'l1' : null;
+  $('mon-btn').innerHTML = 'Monitor &#9662;' + (lv ? ` <i class="mon-dot ${lv}" ` +
+    `style="margin:0 0 0 4px"></i>${al.critical || al.warning}` : '');
+  $('mon-alerts').innerHTML = (al.critical || al.warning || al.info)
+    ? `<b class="l2" style="color:var(--err)">${al.critical}</b> critical, ` +
+      `<b style="color:var(--skip)">${al.warning}</b> warning, ${al.info} info`
+    : 'No alerts on the scalars';
   const sel = $('mon-results'), want = s.results.map(r => r.id).join();
   if (sel.dataset.ids !== want) {
     sel.dataset.ids = want;

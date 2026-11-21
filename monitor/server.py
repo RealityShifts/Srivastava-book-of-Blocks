@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,7 @@ import torch
 import torch.nn as nn
 
 from .collector import Collector, summarize_iterations
+from .scalars import Alert, ScalarBoard
 
 MAX_ITERATIONS = 1000
 #: Magnitudes (largest absolute value in the tensor) at which the page marks
@@ -156,14 +158,29 @@ class Monitor:
     distributed run that should not serve. ``thresholds`` overrides entries
     of :data:`THRESHOLDS`, the magnitudes the page colours orange and red,
     e.g. ``{"activation": {"warn": 50}}``.
+
+    Scalars and alerts (the ``scalars`` page): ``logdir`` opens a TensorBoard
+    log directory at start (one can also be typed into the page);
+    ``scalar_limits`` overrides :data:`Blocks.monitor.scalars.DEFAULTS`;
+    ``on_alert(alert)`` is called for every new alert - by default it is
+    printed to stderr; ``logdir_root`` restricts which directories the page
+    may open. :meth:`log` feeds values from the loop without TensorBoard.
     """
 
     def __init__(self, model: nn.Module, *, port: int = 8891,
                  host: str = "127.0.0.1", out_dir: Optional[str] = None,
                  graph: Any = None, title: Optional[str] = None,
                  thresholds: Optional[dict] = None,
+                 logdir: Optional[str] = None,
+                 scalar_limits: Optional[dict] = None,
+                 on_alert: Optional[Callable[[Alert], None]] = None,
+                 logdir_root: Optional[str] = None,
                  start: bool = True) -> None:
         self.model = model
+        self.scalars = ScalarBoard(limits=scalar_limits, root=logdir_root,
+                                   on_alert=on_alert or print_alert)
+        if logdir:
+            self.scalars.open(logdir)
         self.thresholds = {k: dict(v) for k, v in THRESHOLDS.items()}
         for kind, limits in (thresholds or {}).items():
             if kind not in self.thresholds:
@@ -229,6 +246,20 @@ class Monitor:
             self._server.shutdown()
             self._server.server_close()
             self._server = None
+
+    # ------------------------------------------------------------- scalars
+    def log(self, step: int, values: dict) -> None:
+        """Give the alert rules numbers straight from the loop:
+        ``monitor.log(step, {"loss": loss.item(), "grad_norm": g})``. They
+        appear on the scalars page as run ``live``. Not needed when the same
+        values are already in an opened TensorBoard log directory."""
+        self.scalars.log(step, values)
+
+    def alerts(self) -> list:
+        """The current alerts, worst first (re-reading the log directory
+        if it is due). Each is a :class:`Blocks.monitor.scalars.Alert`."""
+        self.scalars.refresh_if_due()
+        return self.scalars.check()
 
     # ------------------------------------------------------------- the loop
     def step(self, step: int, probe: Callable[[], Any]) -> None:
@@ -391,10 +422,18 @@ class Monitor:
         return {"id": req["id"]}
 
     def status(self) -> dict:
+        try:
+            self.scalars.refresh_if_due()
+            found = self.scalars.check()
+            alert_counts = {lv: sum(1 for a in found if a.level == lv)
+                            for lv in ("critical", "warning", "info")}
+        except Exception:                                   # noqa: BLE001
+            alert_counts = None
         with self._lock:
             active = self._active
             return {
                 "title": self.title,
+                "alerts": alert_counts,
                 "thresholds": self.thresholds,
                 "step": self._last_step,
                 "active": None if active is None else {
@@ -440,33 +479,125 @@ class Monitor:
         return build_page(self._graph, self._tree, self.title)
 
 
-def _handler(monitor: Monitor):
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "BlocksMonitor/1"
+def print_alert(alert: Alert) -> None:
+    """The default ``on_alert``: one line on stderr per new alert."""
+    where = (alert.run + "/" if alert.run not in (".", "") else "") + (
+        alert.tag or "(run)")
+    print(f"Blocks.monitor ALERT {alert.level.upper()} {where} "
+          f"[{alert.rule}] {alert.message}", file=sys.stderr, flush=True)
 
-        def log_message(self, *args) -> None:       # keep the training log clean
-            pass
 
-        def _send(self, code: int, body: bytes, ctype: str,
-                  filename: Optional[str] = None) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            if filename:
-                self.send_header("Content-Disposition",
-                                 f'attachment; filename="{filename}"')
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+class _Base(BaseHTTPRequestHandler):
+    """What every handler here shares: quiet logging, sending, and the
+    scalars routes (``board`` is set by the subclass)."""
+    server_version = "BlocksMonitor/1"
+    board: ScalarBoard
 
-        def _json(self, code: int, obj: Any) -> None:
-            self._send(code, json.dumps(clean(obj), allow_nan=False).encode(),
-                       "application/json")
+    def log_message(self, *args) -> None:           # keep the training log clean
+        pass
 
+    def _send(self, code: int, body: bytes, ctype: str,
+              filename: Optional[str] = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        if filename:
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code: int, obj: Any) -> None:
+        self._send(code, json.dumps(clean(obj), allow_nan=False).encode(),
+                   "application/json")
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= MAX_BODY:
+            raise ValueError("a JSON body is required")
+        body = json.loads(self.rfile.read(length))
+        if not isinstance(body, dict):
+            raise ValueError("a JSON object is required")
+        return body
+
+    def scalars_get(self, path: str) -> bool:
+        """Serve a scalars GET route; False when ``path`` is not one."""
+        if path in ("/scalars", "/scalars/"):
+            from .scalars_page import PAGE
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/api/scalars":
+            try:
+                self.board.refresh_if_due()
+            except RuntimeError:
+                pass                                # reported in the summary
+            self._json(200, self.board.summary())
+        elif path == "/api/scalars/series":
+            query = urllib.parse.parse_qs(self.path.partition("?")[2])
+            try:
+                data = self.board.series(
+                    query.get("run", [""])[0], query.get("tag", [""])[0],
+                    max(50, min(20000, int(query.get("max", ["1500"])[0]))))
+            except (KeyError, ValueError) as exc:
+                self._json(404, {"error": str(exc)})
+            else:
+                self._json(200, data)
+        else:
+            return False
+        return True
+
+    def scalars_post(self, path: str) -> bool:
+        if path != "/api/scalars/open":
+            return False
+        try:
+            self._json(200, self.board.open(str(self._body().get("path", ""))))
+        except (ValueError, RuntimeError) as exc:
+            self._json(400, {"error": str(exc)})
+        return True
+
+
+def serve_scalars(board: ScalarBoard, *, host: str = "127.0.0.1",
+                  port: int = 8892) -> ThreadingHTTPServer:
+    """Serve only the scalars page for ``board`` - no model needed. Returns
+    the running server (``.shutdown()`` stops it)."""
+    class Handler(_Base):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             try:
                 if path == "/":
+                    self.send_response(302)
+                    self.send_header("Location", "scalars")
+                    self.end_headers()
+                elif not self.scalars_get(path):
+                    self._json(404, {"error": "not found"})
+            except Exception:                               # noqa: BLE001
+                self._json(500, {"error": traceback.format_exc(limit=4)})
+
+        def do_POST(self) -> None:
+            try:
+                if not self.scalars_post(self.path.split("?", 1)[0]):
+                    self._json(404, {"error": "not found"})
+            except Exception:                               # noqa: BLE001
+                self._json(500, {"error": traceback.format_exc(limit=4)})
+
+    Handler.board = board
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="blocks-scalars",
+                     daemon=True).start()
+    return server
+
+
+def _handler(monitor: Monitor):
+    class Handler(_Base):
+        board = monitor.scalars
+
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            try:
+                if self.scalars_get(path):
+                    pass
+                elif path == "/":
                     self._send(200, monitor.page().encode(),
                                "text/html; charset=utf-8")
                 elif path == "/api/status":
@@ -498,15 +629,16 @@ def _handler(monitor: Monitor):
                 self._json(500, {"error": traceback.format_exc(limit=4)})
 
         def do_POST(self) -> None:
-            if self.path.split("?", 1)[0] != "/api/request":
+            path = self.path.split("?", 1)[0]
+            try:
+                if self.scalars_post(path):
+                    return None
+            except Exception:                               # noqa: BLE001
+                return self._json(500, {"error": traceback.format_exc(limit=4)})
+            if path != "/api/request":
                 return self._json(404, {"error": "not found"})
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                if not 0 < length <= MAX_BODY:
-                    raise ValueError("a JSON body is required")
-                body = json.loads(self.rfile.read(length))
-                if not isinstance(body, dict):
-                    raise ValueError("a JSON object is required")
+                body = self._body()
                 self._json(200, monitor.request(
                     body.get("paths"), body.get("n"),
                     stats=bool(body.get("stats", True)),

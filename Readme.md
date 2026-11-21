@@ -119,6 +119,11 @@ On the page:
   zero, constant, vanishing gradient), orange for large, red for dangerous or
   NaN / Inf. The limits are yours to set.
 - **Download** any result as a CSV table or as full JSON.
+- **Scalars and alerts**: a second page that reads a TensorBoard log
+  directory you type in, draws every scalar, and flags NaN / Inf, growing
+  activations and weights, vanishing gradients, spikes and a loss turning
+  upward. Filter by name or by alert level; new alerts are also printed to
+  the training log or sent to a function of yours.
 
 The same from code, without touching the page:
 
@@ -137,6 +142,13 @@ if step % 1000 == 0:
 monitor.export(result["header"]["id"], "runs/monitor/check.csv")
 ```
 
+Alerts on any TensorBoard log directory, with no model and no training loop:
+
+```bash
+python -m Blocks.monitor.scalars runs/exp1/logs            # print the alerts
+python -m Blocks.monitor.scalars runs/exp1/logs --serve    # and serve the charts
+```
+
 `monitor.step(step, probe)` takes a new `probe` on every call, so what is
 measured (this batch, a fixed input, part of the model) is decided where you
 call it. `Monitor(model, start=False)` gives all of this with no server.
@@ -153,7 +165,7 @@ Each package has a smoke test that runs on CPU:
 python -m Blocks.pytorch_blocks._smoke_test    # every PyTorch block, one forward
 python -m Blocks.flax_blocks._smoke_test       # every Flax block (needs jax, flax)
 python -m Blocks.visualized._smoke_test        # the torch tracer on a small model
-python -m Blocks.monitor._smoke_test           # the monitor, 63 checks
+python -m Blocks.monitor._smoke_test           # the monitor, 87 checks
 ```
 
 ## Diagrams
